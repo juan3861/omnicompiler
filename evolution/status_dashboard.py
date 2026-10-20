@@ -17,7 +17,8 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-GENERATIONS_ROOT = r"F:\repository-compiler-generations"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GENERATIONS_ROOT = os.environ.get("GENERATIONS_ROOT", os.path.join(os.path.dirname(BASE_DIR), "repository-compiler-generations"))
 CHAIN_STATUS_FILE = os.path.join(GENERATIONS_ROOT, "recursive_chain_status.json")
 LINEAGE_TREE_FILE = os.path.join(GENERATIONS_ROOT, "lineage_tree.json")
 PID_FILE = os.path.join(GENERATIONS_ROOT, "recursive_chain.pid")

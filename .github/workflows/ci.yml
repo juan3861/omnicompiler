@@ -38,10 +38,10 @@ jobs:
       run: |
         python test_empirical_audit.py
 
-    - name: 3. Run OmniMutator 8-Category AST Superoptimizer & Z3 SMT Proofs
+    - name: 3. Test Recursive Bootstrap Cycle (Gen N compiles Gen N+1)
+      run: |
+        python evolution/recursive_bootstrap_loop.py --steps 3 --interval 0.5
+
+    - name: 4. Run OmniMutator 8-Category AST Superoptimizer & Z3 SMT Proofs
       run: |
         python test_empirical_evolution_audit.py
-
-    - name: 4. Test Recursive Bootstrap Cycle (Gen N compiles Gen N+1)
-      run: |
-        python evolution/recursive_bootstrap_loop.py --steps 2 --interval 0.5

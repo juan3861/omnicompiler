@@ -8,7 +8,10 @@ and Tree-sitter grammars.
 import os
 import hashlib
 from typing import Dict, List, Any
-from ast_grep_py import SgRoot
+try:
+    from ast_grep_py import SgRoot
+except ImportError:
+    SgRoot = None
 from contracts.models import FactBundle, RepoSnapshot
 from frontends.python_frontend import PythonFrontend
 

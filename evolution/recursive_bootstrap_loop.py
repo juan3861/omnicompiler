@@ -38,7 +38,7 @@ from crypto.blake3_engine import blake3_digest
 from evolution.self_evolution_engine import CasimirLangevinTunneling
 from evolution.omni_mutator import OmniMutator
 
-GENERATIONS_ROOT = r"F:\repository-compiler-generations"
+GENERATIONS_ROOT = os.environ.get("GENERATIONS_ROOT", os.path.join(os.path.dirname(BASE_DIR), "repository-compiler-generations"))
 CHAIN_STATUS_FILE = os.path.join(GENERATIONS_ROOT, "recursive_chain_status.json")
 LINEAGE_TREE_FILE = os.path.join(GENERATIONS_ROOT, "lineage_tree.json")
 PID_FILE = os.path.join(GENERATIONS_ROOT, "recursive_chain.pid")

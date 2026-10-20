@@ -17,7 +17,7 @@ import time
 import subprocess
 import unittest
 
-BASE_DIR = r"F:\repository-compiler"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
@@ -26,7 +26,7 @@ from validation.smt_refinement import SmtRefinementVerifier
 from evolution.recursive_bootstrap_loop import TARGET_ORGANS, RecursiveBootstrapChain
 from crypto.blake3_engine import blake3_digest
 
-GENERATIONS_ROOT = r"F:\repository-compiler-generations"
+GENERATIONS_ROOT = os.environ.get("GENERATIONS_ROOT", os.path.join(os.path.dirname(BASE_DIR), "repository-compiler-generations"))
 LINEAGE_TREE_FILE = os.path.join(GENERATIONS_ROOT, "lineage_tree.json")
 
 

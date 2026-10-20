@@ -11,7 +11,10 @@ import hashlib
 from typing import Dict, List, Any, Set
 import networkx as nx
 import libcst as cst
-from ast_grep_py import SgRoot
+try:
+    from ast_grep_py import SgRoot
+except ImportError:
+    SgRoot = None
 from contracts.models import FactBundle, RepoSnapshot
 
 
@@ -74,15 +77,16 @@ class PythonFrontend:
                 structural_calls = self._SG_CALLS_CACHE[current_hash]
             else:
                 structural_calls = []
-                try:
-                    sg_root = SgRoot(content, "python")
-                    sg_node = sg_root.root()
-                    for match in sg_node.find_all(pattern="$FUNC($$$ARGS)"):
-                        fn_node = match.get_match("FUNC")
-                        if fn_node:
-                            structural_calls.append(fn_node.text())
-                except Exception:
-                    pass
+                if SgRoot is not None:
+                    try:
+                        sg_root = SgRoot(content, "python")
+                        sg_node = sg_root.root()
+                        for match in sg_node.find_all(pattern="$FUNC($$$ARGS)"):
+                            fn_node = match.get_match("FUNC")
+                            if fn_node:
+                                structural_calls.append(fn_node.text())
+                    except Exception:
+                        pass
                 self._SG_CALLS_CACHE[current_hash] = structural_calls
 
             self._extract_from_ast(
