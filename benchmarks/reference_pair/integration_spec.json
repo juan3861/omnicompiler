@@ -3,12 +3,12 @@
   "spec_id": "doc_search_integration_v1",
   "source_refs": {
     "repo_a_docs": {
-      "path": "F:/repository-compiler/benchmarks/reference_pair/repo_a_docs",
+      "path": "benchmarks/reference_pair/repo_a_docs",
       "revision": "HEAD",
       "role": "document_management"
     },
     "repo_b_search": {
-      "path": "F:/repository-compiler/benchmarks/reference_pair/repo_b_search",
+      "path": "benchmarks/reference_pair/repo_b_search",
       "revision": "HEAD",
       "role": "search_indexing"
     }

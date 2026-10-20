@@ -165,7 +165,20 @@ class RunController:
             # 1. SNAPSHOTTED (Content-addressed frozen store)
             snapshots: Dict[str, RepoSnapshot] = {}
             for repo_id, rinfo in spec.source_refs.items():
-                snap = self.snapshot_engine.take_snapshot(repo_id, rinfo["path"])
+                repo_path = rinfo["path"]
+                if not os.path.exists(repo_path):
+                    # Check relative to repo root, current working dir, or benchmarks pair dir
+                    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    for candidate_base in (repo_root, os.getcwd()):
+                        alt_path = os.path.normpath(os.path.join(candidate_base, repo_path))
+                        if os.path.exists(alt_path):
+                            repo_path = alt_path
+                            break
+                        alt_pair = os.path.normpath(os.path.join(candidate_base, "benchmarks", "reference_pair", os.path.basename(repo_path)))
+                        if os.path.exists(alt_pair):
+                            repo_path = alt_pair
+                            break
+                snap = self.snapshot_engine.take_snapshot(repo_id, repo_path)
                 snapshots[repo_id] = snap
             self._record_event(run_id, "SNAPSHOTTED", {r: s.tree_digest for r, s in snapshots.items()})
 

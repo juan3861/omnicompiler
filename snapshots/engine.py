@@ -38,6 +38,18 @@ class SnapshotEngine:
 
     def take_snapshot(self, repo_id: str, root_path: str, storage_dir: Optional[str] = None) -> RepoSnapshot:
         if not os.path.exists(root_path):
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for candidate_base in (repo_root, os.getcwd()):
+                alt_path = os.path.normpath(os.path.join(candidate_base, root_path))
+                if os.path.exists(alt_path):
+                    root_path = alt_path
+                    break
+                alt_pair = os.path.normpath(os.path.join(candidate_base, "benchmarks", "reference_pair", os.path.basename(root_path)))
+                if os.path.exists(alt_pair):
+                    root_path = alt_pair
+                    break
+
+        if not os.path.exists(root_path):
             raise FileNotFoundError(f"Repository path does not exist: {root_path}")
         if not os.path.isdir(root_path):
             raise ValueError(f"Repository path must be a directory, not a file: {root_path}")

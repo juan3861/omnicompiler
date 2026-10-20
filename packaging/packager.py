@@ -39,6 +39,14 @@ class PackagerEngine:
         with open(cmd_wrapper, "w", encoding="utf-8") as f:
             f.write(f"@echo off\n\"{py_bin}\" \"%~dp0app\\main.py\" %*\n")
 
+        sh_wrapper = os.path.join(workspace, "run.sh")
+        with open(sh_wrapper, "w", encoding="utf-8") as f:
+            f.write(f"#!/bin/sh\nexec \"{py_bin}\" \"$(dirname \"$0\")/app/main.py\" \"$@\"\n")
+        try:
+            os.chmod(sh_wrapper, 0o755)
+        except Exception:
+            pass
+
         manifest_file = os.path.join(workspace, "manifests", "composition.lock.json")
         evidence_file = os.path.join(workspace, "evidence", "evidence_bundle.json")
 
