@@ -1,0 +1,290 @@
+{
+  "corpus_version": "P4-20-Tasks-1.0",
+  "total_tasks": 20,
+  "dev_tasks_count": 12,
+  "holdout_tasks_count": 8,
+  "total_matched": 20,
+  "positive_acceptance_rate": "18/18 (100.0%)",
+  "negative_rejection_rate": "2/2 (100.0%)",
+  "false_acceptance_rate": 0.0,
+  "by_split": {
+    "dev": {
+      "total": 12,
+      "passed": 12,
+      "positive_accepted": 10,
+      "negative_rejected": 2,
+      "false_acceptances": 0
+    },
+    "holdout": {
+      "total": 8,
+      "passed": 8,
+      "positive_accepted": 8,
+      "negative_rejected": 0,
+      "false_acceptances": 0
+    }
+  },
+  "by_category": {
+    "same_lang_lib_app": {
+      "total": 4,
+      "matched": 4
+    },
+    "frontend_to_api": {
+      "total": 2,
+      "matched": 2
+    },
+    "data_pipeline": {
+      "total": 4,
+      "matched": 4
+    },
+    "plugin_extension": {
+      "total": 2,
+      "matched": 2
+    },
+    "stateful_init_component": {
+      "total": 2,
+      "matched": 2
+    },
+    "persistent_state_component": {
+      "total": 2,
+      "matched": 2
+    },
+    "dependency_conflict": {
+      "total": 2,
+      "matched": 2
+    },
+    "polyglot_bridge": {
+      "total": 2,
+      "matched": 2
+    }
+  },
+  "experiment_e6_cache": {
+    "cold_ms": 4819.39,
+    "warm_ms": 16.11,
+    "warm_cache_hit": true,
+    "stale_cache_invalidated_on_1byte_drift": true,
+    "speedup_x": 299.16
+  },
+  "total_benchmark_seconds": 32.17,
+  "tasks": [
+    {
+      "task_id": "T01_dev_ref_doc_search",
+      "split": "dev",
+      "category": "same_lang_lib_app",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 3461.25
+    },
+    {
+      "task_id": "T02_dev_markdown_sanitizer",
+      "split": "dev",
+      "category": "same_lang_lib_app",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 4819.39
+    },
+    {
+      "task_id": "T03_dev_frontend_metrics_api",
+      "split": "dev",
+      "category": "frontend_to_api",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1010.56
+    },
+    {
+      "task_id": "T04_dev_telemetry_pipeline",
+      "split": "dev",
+      "category": "data_pipeline",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 782.1
+    },
+    {
+      "task_id": "T05_dev_pii_scrubber_sink",
+      "split": "dev",
+      "category": "data_pipeline",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1260.41
+    },
+    {
+      "task_id": "T06_dev_workflow_crypto_plugin",
+      "split": "dev",
+      "category": "plugin_extension",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1073.01
+    },
+    {
+      "task_id": "T07_dev_stateful_pool_init",
+      "split": "dev",
+      "category": "stateful_init_component",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1548.65
+    },
+    {
+      "task_id": "T08_dev_persistent_disk_audit",
+      "split": "dev",
+      "category": "persistent_state_component",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 586.19
+    },
+    {
+      "task_id": "T09_dev_dependency_conflict_v1_v2",
+      "split": "dev",
+      "category": "dependency_conflict",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 923.1
+    },
+    {
+      "task_id": "T10_dev_polyglot_python_nodejs",
+      "split": "dev",
+      "category": "polyglot_bridge",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1049.93
+    },
+    {
+      "task_id": "T11_dev_neg_forbidden_side_effect",
+      "split": "dev",
+      "category": "same_lang_lib_app",
+      "expected_verdict": "FAILED",
+      "observed_verdict": "FAILED",
+      "error_code": "no_plan_in_model",
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 67.68
+    },
+    {
+      "task_id": "T12_dev_neg_compiles_but_wrong_behavior",
+      "split": "dev",
+      "category": "data_pipeline",
+      "expected_verdict": "REJECTED",
+      "observed_verdict": "REJECTED",
+      "error_code": "verification_failed",
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1569.1
+    },
+    {
+      "task_id": "T13_holdout_ledger_tax_calculator",
+      "split": "holdout",
+      "category": "same_lang_lib_app",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 2384.01
+    },
+    {
+      "task_id": "T14_holdout_invoice_payment_api",
+      "split": "holdout",
+      "category": "frontend_to_api",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1267.08
+    },
+    {
+      "task_id": "T15_holdout_iot_timeseries_pipeline",
+      "split": "holdout",
+      "category": "data_pipeline",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1751.96
+    },
+    {
+      "task_id": "T16_holdout_webhook_hmac_plugin",
+      "split": "holdout",
+      "category": "plugin_extension",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 854.1
+    },
+    {
+      "task_id": "T17_holdout_stateful_gpu_buffer",
+      "split": "holdout",
+      "category": "stateful_init_component",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1387.31
+    },
+    {
+      "task_id": "T18_holdout_persistent_sqlite_inventory",
+      "split": "holdout",
+      "category": "persistent_state_component",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 799.85
+    },
+    {
+      "task_id": "T19_holdout_dependency_conflict_crypto_abi",
+      "split": "holdout",
+      "category": "dependency_conflict",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 1333.7
+    },
+    {
+      "task_id": "T20_holdout_polyglot_python_typescript",
+      "split": "holdout",
+      "category": "polyglot_bridge",
+      "expected_verdict": "ACCEPTED_FOR_SPEC",
+      "observed_verdict": "ACCEPTED_FOR_SPEC",
+      "error_code": null,
+      "verdict_matched": true,
+      "false_acceptance": false,
+      "cold_duration_ms": 3734.0
+    }
+  ]
+}

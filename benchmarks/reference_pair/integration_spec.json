@@ -1,0 +1,97 @@
+{
+  "schema_version": "0.1",
+  "spec_id": "doc_search_integration_v1",
+  "source_refs": {
+    "repo_a_docs": {
+      "path": "F:/repository-compiler/benchmarks/reference_pair/repo_a_docs",
+      "revision": "HEAD",
+      "role": "document_management"
+    },
+    "repo_b_search": {
+      "path": "F:/repository-compiler/benchmarks/reference_pair/repo_b_search",
+      "revision": "HEAD",
+      "role": "search_indexing"
+    }
+  },
+  "objective": "Integrate Document Store (Repo A) with Inverted Index Search (Repo B). Ingesting a document into Repo A automatically triggers indexing in Repo B, enabling instant search query by tenant.",
+  "target_profile": {
+    "language": "python",
+    "runtime": "cpython-3.11",
+    "platform": "windows"
+  },
+  "required_capabilities": [
+    "ingest_document",
+    "index_text",
+    "search_index",
+    "get_document"
+  ],
+  "acceptance_scenarios": [
+    {
+      "id": "scenario_ingest_auto_indexed",
+      "capability_name": "ingest_document",
+      "description": "Ingest document into A, which automatically propagates to B for indexing via synthesized dataflow",
+      "inputs": {
+        "doc_id": "doc_101",
+        "title": "AetherMind Architecture",
+        "content": "Repository Compiler enables automatic program synthesis and composition across repositories.",
+        "tenant_id": "omega_tenant"
+      },
+      "expected_outputs": {
+        "status": "INGESTED"
+      }
+    },
+    {
+      "id": "scenario_search_without_manual_index",
+      "capability_name": "search_index",
+      "description": "Query index for keyword Compiler without manual indexing call; proves automatic dataflow connection",
+      "inputs": {
+        "query": "Compiler",
+        "tenant_id": "omega_tenant"
+      },
+      "expected_outputs": {
+        "result": ["doc_101"]
+      }
+    },
+    {
+      "id": "scenario_get_document_tenant",
+      "capability_name": "get_document",
+      "description": "Retrieve document by ID within tenant boundary",
+      "inputs": {
+        "doc_id": "doc_101",
+        "tenant_id": "omega_tenant"
+      },
+      "expected_outputs": {
+        "doc_id": "doc_101",
+        "title": "AetherMind Architecture"
+      }
+    },
+    {
+      "id": "scenario_tenant_isolation_distinct",
+      "capability_name": "ingest_document",
+      "description": "Ingest same doc_id for different tenant to verify composite key non-collision",
+      "inputs": {
+        "doc_id": "doc_101",
+        "title": "Beta Independent Doc",
+        "content": "Beta tenant unique body text.",
+        "tenant_id": "beta_tenant"
+      },
+      "expected_outputs": {
+        "status": "INGESTED"
+      }
+    }
+  ],
+  "invariants": [
+    "tenant_isolation_preserved"
+  ],
+  "allowed_side_effects": [
+    "write:storage",
+    "read:storage"
+  ],
+  "dependency_policy": "strict_isolation",
+  "release_policy": "gated_verification",
+  "budget": {
+    "max_plans": 3,
+    "max_repair_attempts": 3,
+    "timeout_seconds": 30
+  }
+}

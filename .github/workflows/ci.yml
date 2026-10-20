@@ -1,0 +1,47 @@
+name: CI / Formal Verification & Benchmarks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify:
+    name: SMT Translation Validation & Multi-Organ Audit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[dev]
+
+    - name: 1. Run 24 Adversarial Security & Compiler Fixtures
+      run: |
+        python benchmarks/adversarial_fixtures.py
+
+    - name: 2. Run OMEGA Multi-Repo Empirical Synthesis Audit (14 Gates)
+      run: |
+        python test_empirical_audit.py
+
+    - name: 3. Run OmniMutator 8-Category AST Superoptimizer & Z3 SMT Proofs
+      run: |
+        python test_empirical_evolution_audit.py
+
+    - name: 4. Test Recursive Bootstrap Cycle (Gen N compiles Gen N+1)
+      run: |
+        python evolution/recursive_bootstrap_loop.py --steps 2 --interval 0.5

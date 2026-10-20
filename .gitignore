@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Workspaces & Compiler Cache
+.rc_workspace/
+.rc_evolution_workspace/
+HEAD/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs & Runtime State
+*.log
+*.pid
+powershell_transcript.log
+
+# Generation outputs (kept separate in generations store)
+repository-compiler-generations/
+gen_*/
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

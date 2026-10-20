@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnicompiler"
+version = "1.0.0"
+description = "SMT-Verified Recursive Self-Evolving Superoptimizing Compiler & Multi-Repository Synthesizer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Ruan", email = "juan3861@gmail.com" }
+]
+keywords = [
+    "compiler",
+    "superoptimizer",
+    "smt-solver",
+    "z3",
+    "alive2",
+    "self-evolving",
+    "darwinian-evolution",
+    "e-graphs",
+    "polyhedral-compilation",
+    "repository-compiler"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Security :: Cryptography"
+]
+dependencies = [
+    "z3-solver>=4.12.0",
+    "libcst>=1.1.0",
+    "networkx>=3.1",
+    "pydantic>=2.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.7.0",
+    "flake8>=6.1.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/juan3861/omnicompiler"
+Repository = "https://github.com/juan3861/omnicompiler.git"
+Documentation = "https://github.com/juan3861/omnicompiler#readme"
+Issues = "https://github.com/juan3861/omnicompiler/issues"
+
+[project.scripts]
+omnicompiler = "cli:main"
+omnicompiler-evolver = "evolution.recursive_bootstrap_loop:main"
+omnicompiler-status = "evolution.status_dashboard:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "compiler*",
+    "crypto*",
+    "orchestrator*",
+    "validation*",
+    "runtime*",
+    "storage*",
+    "evolution*",
+    "contracts*",
+    "controller*",
+    "discovery*",
+    "frontends*",
+    "materializers*",
+    "packaging*",
+    "planner*",
+    "recipes*",
+    "slicer*",
+    "snapshots*",
+    "adapters*",
+    "benchmarks*"
+]
