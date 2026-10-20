@@ -43,7 +43,8 @@ dependencies = [
     "libcst>=1.1.0",
     "networkx>=3.1",
     "pydantic>=2.0.0",
-    "ast-grep-py>=0.20.0"
+    "ast-grep-py>=0.20.0",
+    "clingo>=5.6.0"
 ]
 
 [project.optional-dependencies]

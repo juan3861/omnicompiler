@@ -7,7 +7,10 @@ to formally verify and synthesize cross-repository dataflows (A -> B).
 """
 
 from typing import List, Dict, Any, Optional, Tuple
-import clingo
+try:
+    import clingo
+except ImportError:
+    clingo = None
 import z3
 from contracts.models import IntegrationSpec, CapabilityContract, CompositionPlan, sha256_digest
 
@@ -30,6 +33,23 @@ class CompositionPlanner:
         """
         if not spec.required_capabilities:
             return {}
+
+        if clingo is None:
+            # Resilient ASP fallback when clingo is not installed
+            chosen_map: Dict[str, CapabilityContract] = {}
+            for req in spec.required_capabilities:
+                req_clean = req.strip().lower().replace("-", "_")
+                for c in capabilities:
+                    if any(eff not in spec.allowed_side_effects for eff in c.effects):
+                        continue
+                    op_name = str(c.entrypoint.get("operation", "")).lower()
+                    cap_id_clean = c.capability_id.split(":")[-1].lower().replace("-", "_")
+                    if req_clean in op_name or req_clean in cap_id_clean:
+                        chosen_map[req] = c
+                        break
+            if len(chosen_map) == len(spec.required_capabilities):
+                return chosen_map
+            return None
 
         cap_by_idx: Dict[int, CapabilityContract] = {}
         req_by_idx: Dict[int, str] = {}
