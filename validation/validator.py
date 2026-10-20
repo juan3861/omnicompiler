@@ -581,7 +581,6 @@ try:
     app = UnifiedProduct()
     _ad_map = getattr(app, "adapters", None)
     if _ad_map is None or "ingest_document" in _ad_map:
-        from hypothesis import given, settings, strategies as st
         # 1. Deterministic cross-tenant isolation probe
         app.execute_capability("ingest_document",
             doc_id="isolated_doc_alpha",
@@ -620,38 +619,65 @@ try:
             sys.exit(1)
 
         # 3. Hypothesis Property-Based Oracle: Randomized tenant isolation & permutation invariance
-        @settings(max_examples=8, deadline=None, database=None)
-        @given(suffix=st.text(alphabet="abcdef0123456789", min_size=4, max_size=8))
-        def prop_randomized_tenant_isolation(suffix: str):
-            t_a = f"hyp_tenant_a_{{suffix}}"
-            t_b = f"hyp_tenant_b_{{suffix}}"
-            kw = f"hyptoken{{suffix}}"
-            d1 = f"doc1_{{suffix}}"
-            d2 = f"doc2_{{suffix}}"
-            app.execute_capability("ingest_document", doc_id=d1, title="T1", content=f"{{kw}} alpha", tenant_id=t_a)
-            app.execute_capability("ingest_document", doc_id=d2, title="T2", content=f"{{kw}} beta", tenant_id=t_a)
-            assert app.execute_capability("search_index", query=kw, tenant_id=t_b) == []
-            res_a = app.execute_capability("search_index", query=kw, tenant_id=t_a)
-            assert set(res_a) == {{d1, d2}}
-
-        prop_randomized_tenant_isolation()
+        try:
+            from hypothesis import given, settings, strategies as st
+            @settings(max_examples=8, deadline=None, database=None)
+            @given(suffix=st.text(alphabet="abcdef0123456789", min_size=4, max_size=8))
+            def prop_randomized_tenant_isolation(suffix: str):
+                t_a = f"hyp_tenant_a_{{suffix}}"
+                t_b = f"hyp_tenant_b_{{suffix}}"
+                kw = f"hyptoken{{suffix}}"
+                d1 = f"doc1_{{suffix}}"
+                d2 = f"doc2_{{suffix}}"
+                app.execute_capability("ingest_document", doc_id=d1, title="T1", content=f"{{kw}} alpha", tenant_id=t_a)
+                app.execute_capability("ingest_document", doc_id=d2, title="T2", content=f"{{kw}} beta", tenant_id=t_a)
+                assert app.execute_capability("search_index", query=kw, tenant_id=t_b) == []
+                res_a = app.execute_capability("search_index", query=kw, tenant_id=t_a)
+                assert set(res_a) == {{d1, d2}}
+            prop_randomized_tenant_isolation()
+        except ImportError:
+            for suffix in ["run1", "run2", "run3"]:
+                t_a = f"hyp_tenant_a_{{suffix}}"
+                t_b = f"hyp_tenant_b_{{suffix}}"
+                kw = f"hyptoken{{suffix}}"
+                d1 = f"doc1_{{suffix}}"
+                d2 = f"doc2_{{suffix}}"
+                app.execute_capability("ingest_document", doc_id=d1, title="T1", content=f"{{kw}} alpha", tenant_id=t_a)
+                app.execute_capability("ingest_document", doc_id=d2, title="T2", content=f"{{kw}} beta", tenant_id=t_a)
+                assert app.execute_capability("search_index", query=kw, tenant_id=t_b) == []
+                res_a = app.execute_capability("search_index", query=kw, tenant_id=t_a)
+                assert set(res_a) == {{d1, d2}}
     elif "compile_and_slice_capsule" in _ad_map:
-        from hypothesis import given, settings, strategies as st
-        @settings(max_examples=6, deadline=None, database=None)
-        @given(suffix=st.text(alphabet="abcdef0123456789", min_size=4, max_size=8))
-        def prop_compiler_v2_tenant_isolation(suffix: str):
-            t_a = f"compiler_tenant_a_{{suffix}}"
-            t_b = f"compiler_tenant_b_{{suffix}}"
-            cid = f"cap_{{suffix}}"
-            src = f"def active_entry(x):\\n    return x + 1\\ndef dead_fn_{{suffix}}():\\n    return 999\\n"
-            res = app.execute_capability("compile_and_slice_capsule", doc_id=cid, content=src, tenant_id=t_a)
-            assert res["tenant_id"] == t_a
-            try:
-                app.execute_capability("get_v2_compilation_report", doc_id=cid, tenant_id=t_b)
-                raise AssertionError("Cross-tenant capsule leak!")
-            except (KeyError, RuntimeError):
-                pass
-        prop_compiler_v2_tenant_isolation()
+        try:
+            from hypothesis import given, settings, strategies as st
+            @settings(max_examples=6, deadline=None, database=None)
+            @given(suffix=st.text(alphabet="abcdef0123456789", min_size=4, max_size=8))
+            def prop_compiler_v2_tenant_isolation(suffix: str):
+                t_a = f"compiler_tenant_a_{{suffix}}"
+                t_b = f"compiler_tenant_b_{{suffix}}"
+                cid = f"cap_{{suffix}}"
+                src = f"def active_entry(x):\\n    return x + 1\\ndef dead_fn_{{suffix}}():\\n    return 999\\n"
+                res = app.execute_capability("compile_and_slice_capsule", doc_id=cid, content=src, tenant_id=t_a)
+                assert res["tenant_id"] == t_a
+                try:
+                    app.execute_capability("get_v2_compilation_report", doc_id=cid, tenant_id=t_b)
+                    raise AssertionError("Cross-tenant capsule leak!")
+                except (KeyError, RuntimeError):
+                    pass
+            prop_compiler_v2_tenant_isolation()
+        except ImportError:
+            for suffix in ["run1", "run2", "run3"]:
+                t_a = f"compiler_tenant_a_{{suffix}}"
+                t_b = f"compiler_tenant_b_{{suffix}}"
+                cid = f"cap_{{suffix}}"
+                src = f"def active_entry(x):\\n    return x + 1\\ndef dead_fn_{{suffix}}():\\n    return 999\\n"
+                res = app.execute_capability("compile_and_slice_capsule", doc_id=cid, content=src, tenant_id=t_a)
+                assert res["tenant_id"] == t_a
+                try:
+                    app.execute_capability("get_v2_compilation_report", doc_id=cid, tenant_id=t_b)
+                    raise AssertionError("Cross-tenant capsule leak!")
+                except (KeyError, RuntimeError):
+                    pass
     else:
         # Generalized active cross-tenant leak probe across acceptance scenarios
         scenarios = {repr(list(spec.acceptance_scenarios))}

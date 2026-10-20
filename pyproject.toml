@@ -44,7 +44,8 @@ dependencies = [
     "networkx>=3.1",
     "pydantic>=2.0.0",
     "ast-grep-py>=0.20.0",
-    "clingo>=5.6.0"
+    "clingo>=5.6.0",
+    "hypothesis>=6.80.0"
 ]
 
 [project.optional-dependencies]
