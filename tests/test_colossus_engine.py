@@ -161,6 +161,31 @@ class TestColossusEngine(unittest.TestCase):
             del lib
             ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(h))
 
+    def test_08_colossus_standalone_executable_process_execution(self):
+        import subprocess
+        repos = [
+            os.path.join(self.sat_dir, d)
+            for d in sorted(os.listdir(self.sat_dir))
+            if os.path.isdir(os.path.join(self.sat_dir, d))
+        ]
+        out_exe = os.path.join(self.base_dir, "dist", "colossus_standalone.exe" if sys.platform == "win32" else "colossus_standalone")
+        res = self.compiler.compile_repositories(
+            repo_paths=repos,
+            output_path=out_exe,
+            target_format="executable",
+            entry_export="colossus_entrypoint"
+        )
+        self.assertTrue(res["success"])
+        self.assertTrue(os.path.exists(out_exe))
+
+        # Make executable on Linux
+        if sys.platform != "win32":
+            os.chmod(out_exe, 0o755)
+
+        # Run as a freestanding process
+        proc = subprocess.run([out_exe], capture_output=True)
+        self.assertEqual(proc.returncode, 175)
+
 
 if __name__ == "__main__":
     unittest.main()

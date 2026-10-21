@@ -181,14 +181,19 @@ class NativeObjectLinker:
     def emit_linked_executable(
         self,
         output_path: str,
+        entry_symbol: Optional[str] = None,
         target_format: str = "auto"
     ) -> str:
         """Links modules and emits a standalone executable."""
         link_res = self.link()
         code = link_res["combined_code"]
+        global_syms = link_res["global_symbols"]
+        entry_offset = global_syms.get(entry_symbol) if entry_symbol else 0
+
         return self.emitter.emit_standalone_binary(
             output_path=output_path,
             custom_code=code,
+            entry_offset=entry_offset,
             target_format=target_format
         )
 

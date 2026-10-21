@@ -210,7 +210,8 @@ class OmniRepoCompiler:
             )
         else:
             artifact_path = self.linker.emit_linked_executable(
-                output_path=output_path
+                output_path=output_path,
+                entry_symbol=entry_export
             )
 
         # Stage 8: Formal Binary Specification Audit (pefile / pyelftools)

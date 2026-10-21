@@ -42,27 +42,48 @@ class StandaloneBinaryEmitter:
     # 1. WINDOWS PE32+ (AMD64) EXECUTABLE
     # =========================================================================
 
-    def build_pe64(self, custom_code: Optional[bytes] = None, exit_code: int = 0) -> bytes:
+    def build_pe64(
+        self,
+        custom_code: Optional[bytes] = None,
+        exit_code: int = 0,
+        entry_offset: Optional[int] = None
+    ) -> bytes:
         """Builds a compliant Windows PE32+ (AMD64) console executable calling ExitProcess."""
         file_align = self.FILE_ALIGN
         sec_align = self.SEC_ALIGN
         image_base = self.IMAGE_BASE_PE
 
         text_code = bytearray()
-        text_code.extend(b"\x48\x83\xec\x28")  # sub rsp, 40
-
-        if custom_code:
+        if entry_offset is not None and custom_code:
+            # Startup stub calling entry_offset and passing return value to ExitProcess
+            startup = bytearray()
+            startup.extend(b"\x48\x83\xec\x28")       # 0: sub rsp, 40 (4)
+            startup.extend(b"\xb9\x0a\x00\x00\x00")   # 4: mov ecx, 10 (5)
+            disp32_call = 13 + entry_offset           # 9: call entry_function in custom_code
+            startup.extend(b"\xe8" + struct.pack("<i", disp32_call)) # 9: call (5)
+            startup.extend(b"\x89\xc1")               # 14: mov ecx, eax (2)
+            next_rip = 0x1000 + 16 + 6                # 22
+            disp32_iat = 0x2040 - next_rip
+            startup.extend(b"\xff\x15" + struct.pack("<i", disp32_iat)) # 16: call [ExitProcess] (6)
+            startup.extend(b"\x48\x83\xc4\x28\xc3")   # 22: add rsp, 40; ret (5)
+            text_code = startup + bytearray(custom_code)
+        elif custom_code:
+            text_code.extend(b"\x48\x83\xec\x28")  # sub rsp, 40
             text_code.extend(custom_code)
             text_code.extend(b"\x89\xc1")       # mov ecx, eax
+            next_rip = 0x1000 + len(text_code) + 6
+            iat_rva = 0x2040
+            disp32 = iat_rva - next_rip
+            text_code.extend(b"\xff\x15" + struct.pack("<i", disp32))
+            text_code.extend(b"\x48\x83\xc4\x28\xc3")  # add rsp, 40; ret
         else:
+            text_code.extend(b"\x48\x83\xec\x28")  # sub rsp, 40
             text_code.extend(b"\xb9" + struct.pack("<I", exit_code & 0xFFFFFFFF))  # mov ecx, exit_code
-
-        next_rip = 0x1000 + len(text_code) + 6
-        iat_rva = 0x2040
-        disp32 = iat_rva - next_rip
-
-        text_code.extend(b"\xff\x15" + struct.pack("<i", disp32))
-        text_code.extend(b"\x48\x83\xc4\x28\xc3")  # add rsp, 40; ret
+            next_rip = 0x1000 + len(text_code) + 6
+            iat_rva = 0x2040
+            disp32 = iat_rva - next_rip
+            text_code.extend(b"\xff\x15" + struct.pack("<i", disp32))
+            text_code.extend(b"\x48\x83\xc4\x28\xc3")  # add rsp, 40; ret
 
         raw_text_len = len(text_code)
         aligned_text_len = ((raw_text_len + file_align - 1) // file_align) * file_align
@@ -256,23 +277,38 @@ class StandaloneBinaryEmitter:
     # 3. LINUX ELF64 (x86-64) STANDALONE EXECUTABLE
     # =========================================================================
 
-    def build_elf64(self, custom_code: Optional[bytes] = None, exit_code: int = 0) -> bytes:
+    def build_elf64(
+        self,
+        custom_code: Optional[bytes] = None,
+        exit_code: int = 0,
+        entry_offset: Optional[int] = None
+    ) -> bytes:
         """Builds a compliant Linux ELF64 (x86-64) standalone executable via sys_exit."""
         vaddr = self.VADDR_ELF
-        entry_offset = 120
-        entry_addr = vaddr + entry_offset
+        entry_offset_hdr = 120
+        entry_addr = vaddr + entry_offset_hdr
 
         code = bytearray()
-        if custom_code:
+        if entry_offset is not None and custom_code:
+            startup = bytearray()
+            startup.extend(b"\xbf\x0a\x00\x00\x00")  # mov edi, 10
+            disp32_call = 9 + entry_offset
+            startup.extend(b"\xe8" + struct.pack("<i", disp32_call))
+            startup.extend(b"\x89\xc7")              # mov edi, eax
+            startup.extend(b"\xb8\x3c\x00\x00\x00")  # mov eax, 60 (sys_exit)
+            startup.extend(b"\x0f\x05")              # syscall
+            code = startup + bytearray(custom_code)
+        elif custom_code:
             code.extend(custom_code)
             code.extend(b"\x89\xc7")  # mov edi, eax
+            code.extend(b"\xb8\x3c\x00\x00\x00")  # mov eax, 60 (sys_exit)
+            code.extend(b"\x0f\x05")              # syscall
         else:
             code.extend(b"\xbf" + struct.pack("<I", exit_code & 0xFFFFFFFF))
+            code.extend(b"\xb8\x3c\x00\x00\x00")  # mov eax, 60 (sys_exit)
+            code.extend(b"\x0f\x05")              # syscall
 
-        code.extend(b"\xb8\x3c\x00\x00\x00")  # mov eax, 60 (sys_exit)
-        code.extend(b"\x0f\x05")              # syscall
-
-        total_size = entry_offset + len(code)
+        total_size = entry_offset_hdr + len(code)
         elf_ident = b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 8)
         elf_header = struct.pack(
             "<16sHHIQQQIHHHHHH",
@@ -473,7 +509,8 @@ class StandaloneBinaryEmitter:
         output_path: str,
         target_format: str = "auto",
         custom_code: Optional[bytes] = None,
-        exit_code: int = 0
+        exit_code: int = 0,
+        entry_offset: Optional[int] = None
     ) -> str:
         """
         Emits a standalone executable file to `output_path`.
@@ -489,9 +526,9 @@ class StandaloneBinaryEmitter:
 
         if target_format == "pe64":
             if not output_path.endswith(".exe"): output_path += ".exe"
-            data = self.build_pe64(custom_code=custom_code, exit_code=exit_code)
+            data = self.build_pe64(custom_code=custom_code, exit_code=exit_code, entry_offset=entry_offset)
         elif target_format == "elf64":
-            data = self.build_elf64(custom_code=custom_code, exit_code=exit_code)
+            data = self.build_elf64(custom_code=custom_code, exit_code=exit_code, entry_offset=entry_offset)
         elif target_format == "arm64_elf":
             data = self.build_arm64_elf(exit_code=exit_code, custom_code=custom_code)
         elif target_format == "arm64_pe":
