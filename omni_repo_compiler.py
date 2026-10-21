@@ -23,6 +23,8 @@ from compiler.ssa_ir import lower_ast_to_ssa
 from evolution.mcts_hardware_optimizer import AlphaDevMCTSOptimizer
 from validation.binary_structure_auditor import BinaryStructureAuditor
 from validation.silicon_safety_sandbox import SiliconSafetySandbox
+from validation.assembly_invariant_auditor import AssemblyInvariantAuditor
+from slicer.inter_repo_slicer import InterRepoSlicer
 from compiler.llvm_backend import LLVMBackend
 from compiler.wasm_backend import WasmBackend
 
@@ -44,6 +46,8 @@ class OmniRepoCompiler:
         self.regalloc = ChaitinBriggsAllocator()
         self.auditor = BinaryStructureAuditor()
         self.sandbox = SiliconSafetySandbox()
+        self.asm_auditor = AssemblyInvariantAuditor()
+        self.slicer = InterRepoSlicer()
         self.llvm = LLVMBackend(opt_level=3)
         self.wasm = WasmBackend()
 
@@ -74,6 +78,26 @@ class OmniRepoCompiler:
         results["stages"]["topology"] = {
             "compile_order": topo["compile_order"],
             "resolved_bindings_count": len(topo["resolved_bindings"])
+        }
+
+        # Stage 2.5: Inter-Repository Dead-Code Slicing (ThinLTO-style)
+        call_map: Dict[str, List[str]] = {}
+        for b in topo["resolved_bindings"]:
+            cons = b["consumer_repo"]
+            if cons not in call_map:
+                call_map[cons] = []
+            call_map[cons].append(b["symbol"])
+
+        slice_res = self.slicer.slice_repositories(
+            manifests=manifests,
+            root_symbols=[entry_export],
+            call_graph=call_map
+        )
+        results["stages"]["dead_code_slicing"] = {
+            "total_before": slice_res["total_before"],
+            "total_after": slice_res["total_after"],
+            "pruned_count": slice_res["pruned_count"],
+            "pruned_symbols": slice_res["pruned_symbols"]
         }
 
         # Stage 3: Persistent CPG Construction & Inter-Repo Taint Security Check
@@ -151,6 +175,12 @@ class OmniRepoCompiler:
             if sys.platform == "win32"
             else b"\x48\x89\xf8\x48\xc1\xe0\x04\x48\x83\xc0\x0f\xc3"
         )
+
+        # Audit assembly invariants (stack balance, ret termination)
+        asm_rep = self.asm_auditor.audit_function_code(test_kernel, "omni_kernel")
+        if not asm_rep.is_valid:
+            raise RuntimeError(f"Assembly invariant audit failed: {asm_rep.errors}")
+
         preflight_res = self.sandbox.emulate_x86_64(
             test_kernel,
             args=[10],
@@ -159,7 +189,8 @@ class OmniRepoCompiler:
         results["stages"]["preflight_safety"] = {
             "is_safe_for_silicon": preflight_res.is_safe_for_silicon,
             "simulated_return_value": preflight_res.return_value,
-            "steps_executed": preflight_res.steps_executed
+            "steps_executed": preflight_res.steps_executed,
+            "assembly_invariants_valid": asm_rep.is_valid
         }
 
         # Stage 6: Native Object Linking & Relocation

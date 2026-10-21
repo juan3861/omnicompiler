@@ -56,12 +56,15 @@ def run_e2e_multi_repo_test():
         assert res["success"] is True
         print("[+] Stage 1: Ingested Repositories:    ", res["stages"]["ingestion"]["manifests"])
         print("[+] Stage 2: Topological Compile Order:", res["stages"]["topology"]["compile_order"])
+        print("[+] Stage 2.5: ThinLTO Dead-Code Slicing:", res["stages"]["dead_code_slicing"]["pruned_count"], "symbols pruned")
+        assert "dead_code_slicing" in res["stages"]
         print("[+] Stage 3: CPG Tenant Isolation:    ", res["stages"]["cpg_security"]["isolation_preserved"])
         print("[+] Stage 4: CEGIS ABI Bridges:       ", res["stages"]["synthesis"]["bridges_synthesized"])
         print("[+] Stage 5: Machine Codegen Modules: ", res["stages"]["codegen"]["modules_added"])
         print("[+] Stage 5.5: Silicon Safety Sandbox:", res["stages"]["preflight_safety"]["is_safe_for_silicon"])
         assert res["stages"]["preflight_safety"]["is_safe_for_silicon"] is True
         assert res["stages"]["preflight_safety"]["simulated_return_value"] == 175
+        assert res["stages"]["preflight_safety"]["assembly_invariants_valid"] is True
         print("[+] Stage 6: Native Object Linking:   ", res["stages"]["linking"]["success"])
         print("[+] Stage 7: Unified Binary Emitted:  ", res["stages"]["emission"]["artifact_path"])
         print(f"             Binary File Size:         {res['stages']['emission']['file_size']} bytes")
