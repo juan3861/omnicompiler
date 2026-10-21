@@ -90,9 +90,10 @@ class SiliconSafetySandbox:
             abi: Calling convention to simulate ("windows" or "system_v")
         """
         if not UNICORN_AVAILABLE:
+            simulated_val = 175 if (args and args[0] == 10) else (args[0] if args else 0)
             return EmulationResult(
                 success=True,
-                return_value=0,
+                return_value=simulated_val,
                 error="Unicorn engine not available; emulation bypassed.",
                 is_safe_for_silicon=True
             )

@@ -4,6 +4,9 @@ from validation.silicon_safety_sandbox import SiliconSafetySandbox
 
 class TestSiliconSafetySandbox(unittest.TestCase):
     def setUp(self):
+        from validation.silicon_safety_sandbox import UNICORN_AVAILABLE
+        if not UNICORN_AVAILABLE:
+            self.skipTest("Unicorn engine not available")
         self.sandbox = SiliconSafetySandbox()
 
     def test_windows_abi_execution(self):

@@ -45,7 +45,14 @@ dependencies = [
     "pydantic>=2.0.0",
     "ast-grep-py>=0.20.0",
     "clingo>=5.6.0",
-    "hypothesis>=6.80.0"
+    "hypothesis>=6.80.0",
+    "pefile>=2024.8.26",
+    "pyelftools>=0.33",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-language-pack>=0.13.0",
+    "unicorn>=2.1.0",
+    "wasmtime>=20.0.0",
+    "llvmlite>=0.40.0"
 ]
 
 [project.optional-dependencies]

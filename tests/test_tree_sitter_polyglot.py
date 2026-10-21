@@ -4,6 +4,9 @@ from slicer.tree_sitter_polyglot import TreeSitterPolyglotEngine
 
 class TestTreeSitterPolyglot(unittest.TestCase):
     def setUp(self):
+        from slicer.tree_sitter_polyglot import TREE_SITTER_AVAILABLE
+        if not TREE_SITTER_AVAILABLE:
+            self.skipTest("Tree-Sitter language pack not available")
         self.engine = TreeSitterPolyglotEngine()
 
     def test_c_prototype_parsing(self):
