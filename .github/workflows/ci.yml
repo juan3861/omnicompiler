@@ -49,3 +49,7 @@ jobs:
     - name: 5. Run Frontier Breakthrough (E-Graphs, CEGIS Synthesis & Memory Frame Verification)
       run: |
         python test_frontier_breakthrough.py
+
+    - name: 6. Run Supreme Ceiling Audit (Omni-SSA IR, Native x86-64 JIT Silicon & CPG Taint)
+      run: |
+        python test_supreme_ceiling_audit.py
