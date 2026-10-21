@@ -45,3 +45,7 @@ jobs:
     - name: 4. Run OmniMutator 8-Category AST Superoptimizer & Z3 SMT Proofs
       run: |
         python test_empirical_evolution_audit.py
+
+    - name: 5. Run Frontier Breakthrough (E-Graphs, CEGIS Synthesis & Memory Frame Verification)
+      run: |
+        python test_frontier_breakthrough.py
