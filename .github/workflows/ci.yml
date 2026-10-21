@@ -59,3 +59,12 @@ jobs:
       run: |
         python test_titans_supreme_benchmark.py
 
+    - name: 8. Run OmniRepo Compiler Multi-Repository E2E Pipeline
+      run: |
+        python -m unittest tests/test_repo_manifest_ingestor.py
+        python -m unittest tests/test_persistent_cpg.py
+        python -m unittest tests/test_universal_abi_bridge.py
+        python -m unittest tests/test_object_linker.py
+        python test_omni_repo_compiler_e2e.py
+
+

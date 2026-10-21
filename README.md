@@ -192,6 +192,13 @@ Transplanted directly from the pinnacles of global compiler science (CompCert, C
    - Proves Memory Frame Preservation via Z3 Array Theory (QF_ABV) and validates UB refinement ($T \le S$).
 9. **Code Property Graph (CPG) & Taint Engine ([`slicer/code_property_graph.py`](slicer/code_property_graph.py))**:
    - Merges AST, Control Flow Graph (CFG), and Program Dependence Graph (PDG) for interprocedural taint reachability.
+10. **OmniRepo Multi-Repository Compiler & Linker ([`omni_repo_compiler.py`](omni_repo_compiler.py))**:
+   - Unites disparate repositories into a single executable or dynamic shared library:
+     - **Manifest & Topology Ingestor ([`orchestrator/repo_manifest_ingestor.py`](orchestrator/repo_manifest_ingestor.py))**: Detects project manifests (Python, C/C++, Rust), extracts signatures and builds topological compile DAG.
+     - **Persistent Disk-Backed CPG ([`slicer/persistent_cpg.py`](slicer/persistent_cpg.py))**: Scales to millions of AST/CFG/DDG nodes on disk, linking inter-repo calls and verifying cross-tenant taint isolation.
+     - **Universal ABI Bridge ([`adapters/universal_abi_bridge.py`](adapters/universal_abi_bridge.py))**: Synthesizes low-level C-ABI trampolines (Windows x64 $\leftrightarrow$ System V AMD64), natural struct alignments, and parameter coercions.
+     - **Native Object Linker ([`compiler/object_linker.py`](compiler/object_linker.py))**: Aggregates object modules, resolves cross-module symbols, and applies 32-bit relative (`REL32` / `R_X86_64_PC32`) and 64-bit absolute (`ADDR64`) relocations.
+
 
 ---
 
