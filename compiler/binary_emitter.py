@@ -22,6 +22,48 @@ import struct
 from typing import Optional, List, Union
 
 
+class MiniAssembler:
+    """
+    Two-pass relocation assembler for deterministic instruction and branch offset emission.
+    Eliminates fragile hardcoded jump displacement offsets in emitted machine code.
+    """
+    def __init__(self):
+        self.code = bytearray()
+        self.labels = {}
+        self.fixups = []
+
+    def label(self, name: str):
+        self.labels[name] = len(self.code)
+
+    def emit(self, b: bytes):
+        self.code.extend(b)
+
+    def jmp_rel8(self, op_byte: int, target_label: str):
+        pos = len(self.code)
+        self.emit(bytes([op_byte, 0]))
+        self.fixups.append((pos + 1, target_label, 1, 0))
+
+    def jmp_rel32(self, op_bytes: bytes, target_label: str, target_offset: int = 0):
+        pos = len(self.code)
+        self.emit(op_bytes + b"\x00\x00\x00\x00")
+        self.fixups.append((pos + len(op_bytes), target_label, 4, target_offset))
+
+    def resolve(self) -> bytes:
+        for pos, target_label, size, offset in self.fixups:
+            if target_label not in self.labels:
+                raise ValueError(f"Unresolved assembler label: {target_label}")
+            target = self.labels[target_label] + offset
+            next_rip = pos + size
+            disp = target - next_rip
+            if size == 1:
+                if not (-128 <= disp <= 127):
+                    raise ValueError(f"Relative jump displacement {disp} out of int8 range for label '{target_label}'")
+                struct.pack_into("<b", self.code, pos, disp)
+            else:
+                struct.pack_into("<i", self.code, pos, disp)
+        return bytes(self.code)
+
+
 class StandaloneBinaryEmitter:
     """
     Direct Machine-Code Binary & Shared Library Emitter.
@@ -55,18 +97,100 @@ class StandaloneBinaryEmitter:
 
         text_code = bytearray()
         if entry_offset is not None and custom_code:
-            # Startup stub calling entry_offset and passing return value to ExitProcess
-            startup = bytearray()
-            startup.extend(b"\x48\x83\xec\x28")       # 0: sub rsp, 40 (4)
-            startup.extend(b"\xb9\x0a\x00\x00\x00")   # 4: mov ecx, 10 (5)
-            disp32_call = 13 + entry_offset           # 9: call entry_function in custom_code
-            startup.extend(b"\xe8" + struct.pack("<i", disp32_call)) # 9: call (5)
-            startup.extend(b"\x89\xc1")               # 14: mov ecx, eax (2)
-            next_rip = 0x1000 + 16 + 6                # 22
-            disp32_iat = 0x2040 - next_rip
-            startup.extend(b"\xff\x15" + struct.pack("<i", disp32_iat)) # 16: call [ExitProcess] (6)
-            startup.extend(b"\x48\x83\xc4\x28\xc3")   # 22: add rsp, 40; ret (5)
-            text_code = startup + bytearray(custom_code)
+            asm = MiniAssembler()
+            asm.emit(b"\x48\x83\xec\x28")  # sub rsp, 40
+
+            # Call GetCommandLineA (at IAT 0x2058):
+            call_getcmd_rip = 0x1000 + len(asm.code) + 6
+            asm.emit(b"\xff\x15" + struct.pack("<i", 0x2058 - call_getcmd_rip))
+
+            asm.emit(b"\x48\x89\xc6")                    # mov rsi, rax
+            asm.emit(b"\x48\xc7\xc3\x0a\x00\x00\x00")    # mov rbx, 10 (default argument)
+
+            # Check quote for executable name
+            asm.emit(b"\x0f\xb6\x0e")                    # movzx rcx, byte [rsi]
+            asm.emit(b"\x80\xf9\x22")                    # cmp cl, '"'
+            asm.jmp_rel8(0x75, "skip_no_quote")
+
+            asm.label("skip_quoted")
+            asm.emit(b"\x48\xff\xc6")                    # inc rsi
+            asm.emit(b"\x0f\xb6\x0e")                    # movzx rcx, byte [rsi]
+            asm.emit(b"\x84\xc9")                        # test cl, cl
+            asm.jmp_rel8(0x74, "use_default")
+            asm.emit(b"\x80\xf9\x22")                    # cmp cl, '"'
+            asm.jmp_rel8(0x75, "skip_quoted")
+            asm.emit(b"\x48\xff\xc6")                    # inc rsi
+            asm.jmp_rel8(0xeb, "find_arg")
+
+            asm.label("skip_no_quote")
+            asm.emit(b"\x0f\xb6\x0e")                    # movzx rcx, byte [rsi]
+            asm.emit(b"\x84\xc9")                        # test cl, cl
+            asm.jmp_rel8(0x74, "use_default")
+            asm.emit(b"\x80\xf9\x20")                    # cmp cl, ' '
+            asm.jmp_rel8(0x74, "find_arg")
+            asm.emit(b"\x48\xff\xc6")                    # inc rsi
+            asm.jmp_rel8(0xeb, "skip_no_quote")
+
+            asm.label("find_arg")
+            asm.emit(b"\x0f\xb6\x0e")                    # movzx rcx, byte [rsi]
+            asm.emit(b"\x84\xc9")                        # test cl, cl
+            asm.jmp_rel8(0x74, "use_default")
+            asm.emit(b"\x80\xf9\x20")                    # cmp cl, ' '
+            asm.jmp_rel8(0x75, "parse_num")
+            asm.emit(b"\x48\xff\xc6")                    # inc rsi
+            asm.jmp_rel8(0xeb, "find_arg")
+
+            asm.label("parse_num")
+            asm.emit(b"\x80\xf9\x30")                    # cmp cl, '0'
+            asm.jmp_rel8(0x72, "use_default")
+            asm.emit(b"\x80\xf9\x39")                    # cmp cl, '9'
+            asm.jmp_rel8(0x77, "use_default")
+            asm.emit(b"\x48\x31\xdb")                    # xor rbx, rbx
+
+            asm.label("num_loop")
+            asm.emit(b"\x0f\xb6\x0e")                    # movzx rcx, byte [rsi]
+            asm.emit(b"\x48\xff\xc6")                    # inc rsi
+            asm.emit(b"\x84\xc9")                        # test cl, cl
+            asm.jmp_rel8(0x74, "use_default")
+            asm.emit(b"\x80\xf9\x30")                    # cmp cl, '0'
+            asm.jmp_rel8(0x72, "use_default")
+            asm.emit(b"\x80\xf9\x39")                    # cmp cl, '9'
+            asm.jmp_rel8(0x77, "use_default")
+            asm.emit(b"\x80\xe9\x30")                    # sub cl, '0'
+            asm.emit(b"\x48\x6b\xdb\x0a")                # imul rbx, 10
+            asm.emit(b"\x48\x0f\xb6\xd1")                # movzx rdx, cl
+            asm.emit(b"\x48\x01\xd3")                    # add rbx, rdx
+            asm.jmp_rel8(0xeb, "num_loop")
+
+            asm.label("use_default")
+            asm.emit(b"\x48\x89\xd9")                    # mov rcx, rbx (pass parsed integer in RCX)
+            asm.jmp_rel32(b"\xe8", "fn_target", entry_offset) # call fn_target + entry_offset
+            asm.emit(b"\x89\xc1")                        # mov ecx, eax
+
+            # Call ExitProcess (at IAT 0x2050):
+            call_exit_rip = 0x1000 + len(asm.code) + 6
+            asm.emit(b"\xff\x15" + struct.pack("<i", 0x2050 - call_exit_rip))
+            asm.emit(b"\x48\x83\xc4\x28\xc3")            # add rsp, 40; ret
+
+            asm.label("fn_target")
+            asm.emit(custom_code)
+
+            text_code = bytearray(asm.resolve())
+            raw_text_len = len(text_code)
+            aligned_text_len = ((raw_text_len + file_align - 1) // file_align) * file_align
+            text_code = text_code.ljust(aligned_text_len, b"\x90")
+
+            idata = bytearray(file_align)
+            struct.pack_into("<IIIII", idata, 0, 0x2030, 0, 0, 0x2080, 0x2050)
+            struct.pack_into("<QQQ", idata, 0x30, 0x2090, 0x20A0, 0)
+            struct.pack_into("<QQQ", idata, 0x50, 0x2090, 0x20A0, 0)
+            idata[0x80:0x80 + 13] = b"KERNEL32.DLL\0"
+            idata[0x90:0x90 + 14] = b"\x00\x00ExitProcess\0"
+            idata[0xA0:0xA0 + 18] = b"\x00\x00GetCommandLineA\0"
+
+            iat_rva = 0x2050
+            iat_size = 24
+            idata_vsize = 0xB8
         elif custom_code:
             text_code.extend(b"\x48\x83\xec\x28")  # sub rsp, 40
             text_code.extend(custom_code)
@@ -76,6 +200,21 @@ class StandaloneBinaryEmitter:
             disp32 = iat_rva - next_rip
             text_code.extend(b"\xff\x15" + struct.pack("<i", disp32))
             text_code.extend(b"\x48\x83\xc4\x28\xc3")  # add rsp, 40; ret
+
+            raw_text_len = len(text_code)
+            aligned_text_len = ((raw_text_len + file_align - 1) // file_align) * file_align
+            text_code.extend(b"\x90" * (aligned_text_len - raw_text_len))
+
+            idata = bytearray(file_align)
+            struct.pack_into("<IIIII", idata, 0, 0x2030, 0, 0, 0x2050, 0x2040)
+            struct.pack_into("<Q", idata, 0x30, 0x2060)
+            struct.pack_into("<Q", idata, 0x40, 0x2060)
+            idata[0x50:0x50 + 13] = b"KERNEL32.DLL\0"
+            idata[0x60:0x60 + 14] = b"\x00\x00ExitProcess\0"
+
+            iat_rva = 0x2040
+            iat_size = 16
+            idata_vsize = 0x74
         else:
             text_code.extend(b"\x48\x83\xec\x28")  # sub rsp, 40
             text_code.extend(b"\xb9" + struct.pack("<I", exit_code & 0xFFFFFFFF))  # mov ecx, exit_code
@@ -85,16 +224,20 @@ class StandaloneBinaryEmitter:
             text_code.extend(b"\xff\x15" + struct.pack("<i", disp32))
             text_code.extend(b"\x48\x83\xc4\x28\xc3")  # add rsp, 40; ret
 
-        raw_text_len = len(text_code)
-        aligned_text_len = ((raw_text_len + file_align - 1) // file_align) * file_align
-        text_code.extend(b"\x90" * (aligned_text_len - raw_text_len))
+            raw_text_len = len(text_code)
+            aligned_text_len = ((raw_text_len + file_align - 1) // file_align) * file_align
+            text_code.extend(b"\x90" * (aligned_text_len - raw_text_len))
 
-        idata = bytearray(file_align)
-        struct.pack_into("<IIIII", idata, 0, 0x2030, 0, 0, 0x2050, 0x2040)
-        struct.pack_into("<Q", idata, 0x30, 0x2060)
-        struct.pack_into("<Q", idata, 0x40, 0x2060)
-        idata[0x50:0x50 + 13] = b"KERNEL32.DLL\0"
-        idata[0x60:0x60 + 14] = b"\x00\x00ExitProcess\0"
+            idata = bytearray(file_align)
+            struct.pack_into("<IIIII", idata, 0, 0x2030, 0, 0, 0x2050, 0x2040)
+            struct.pack_into("<Q", idata, 0x30, 0x2060)
+            struct.pack_into("<Q", idata, 0x40, 0x2060)
+            idata[0x50:0x50 + 13] = b"KERNEL32.DLL\0"
+            idata[0x60:0x60 + 14] = b"\x00\x00ExitProcess\0"
+
+            iat_rva = 0x2040
+            iat_size = 16
+            idata_vsize = 0x74
 
         dos_header = bytearray(64)
         dos_header[0:2] = b"MZ"
@@ -128,7 +271,7 @@ class StandaloneBinaryEmitter:
 
         data_dirs = bytearray(16 * 8)
         struct.pack_into("<II", data_dirs, 1 * 8, 0x2000, 40)
-        struct.pack_into("<II", data_dirs, 12 * 8, 0x2040, 16)
+        struct.pack_into("<II", data_dirs, 12 * 8, iat_rva, iat_size)
 
         sec_text = struct.pack(
             "<8sIIIIIIHHI",
@@ -141,7 +284,7 @@ class StandaloneBinaryEmitter:
         sec_idata = struct.pack(
             "<8sIIIIIIHHI",
             b".idata\0\0",
-            0x74, 0x2000, len(idata), 0x200 + len(text_code),
+            idata_vsize, 0x2000, len(idata), 0x200 + len(text_code),
             0, 0, 0, 0,
             0xC0000040
         )
@@ -290,14 +433,46 @@ class StandaloneBinaryEmitter:
 
         code = bytearray()
         if entry_offset is not None and custom_code:
-            startup = bytearray()
-            startup.extend(b"\xbf\x0a\x00\x00\x00")  # mov edi, 10
-            disp32_call = 9 + entry_offset
-            startup.extend(b"\xe8" + struct.pack("<i", disp32_call))
-            startup.extend(b"\x89\xc7")              # mov edi, eax
-            startup.extend(b"\xb8\x3c\x00\x00\x00")  # mov eax, 60 (sys_exit)
-            startup.extend(b"\x0f\x05")              # syscall
-            code = startup + bytearray(custom_code)
+            asm = MiniAssembler()
+            # Linux x86-64 startup: [rsp] = argc, [rsp+16] = argv[1]
+            asm.emit(b"\x48\xc7\xc0\x0a\x00\x00\x00")       # mov rax, 10 (default argument)
+            asm.emit(b"\x48\x8b\x34\x24")                   # mov rsi, [rsp] (argc)
+            asm.emit(b"\x48\x83\xfe\x02")                   # cmp rsi, 2
+            asm.jmp_rel8(0x7c, "use_default")               # jl use_default
+
+            asm.emit(b"\x48\x8b\x74\x24\x10")               # mov rsi, [rsp+16] (argv[1])
+            asm.emit(b"\x0f\xb6\x0e")                       # movzx rcx, byte [rsi]
+            asm.emit(b"\x80\xf9\x30")                       # cmp cl, '0'
+            asm.jmp_rel8(0x72, "use_default")
+            asm.emit(b"\x80\xf9\x39")                       # cmp cl, '9'
+            asm.jmp_rel8(0x77, "use_default")
+            asm.emit(b"\x48\x31\xc0")                       # xor rax, rax
+
+            asm.label("parse_loop")
+            asm.emit(b"\x0f\xb6\x0e")                       # movzx rcx, byte [rsi]
+            asm.emit(b"\x48\xff\xc6")                       # inc rsi
+            asm.emit(b"\x84\xc9")                           # test cl, cl
+            asm.jmp_rel8(0x74, "use_default")
+            asm.emit(b"\x80\xf9\x30")                       # cmp cl, '0'
+            asm.jmp_rel8(0x72, "use_default")
+            asm.emit(b"\x80\xf9\x39")                       # cmp cl, '9'
+            asm.jmp_rel8(0x77, "use_default")
+            asm.emit(b"\x80\xe9\x30")                       # sub cl, '0'
+            asm.emit(b"\x48\x6b\xc0\x0a")                   # imul rax, 10
+            asm.emit(b"\x48\x0f\xb6\xd1")                   # movzx rdx, cl
+            asm.emit(b"\x48\x01\xd0")                       # add rax, rdx
+            asm.jmp_rel8(0xeb, "parse_loop")
+
+            asm.label("use_default")
+            asm.emit(b"\x48\x89\xc7")                       # mov rdi, rax (pass parsed integer in RDI)
+            asm.jmp_rel32(b"\xe8", "fn_target", entry_offset) # call fn_target + entry_offset
+            asm.emit(b"\x89\xc7")                           # mov edi, eax
+            asm.emit(b"\xb8\x3c\x00\x00\x00")               # mov eax, 60 (sys_exit)
+            asm.emit(b"\x0f\x05")                           # syscall
+
+            asm.label("fn_target")
+            asm.emit(custom_code)
+            code = bytearray(asm.resolve())
         elif custom_code:
             code.extend(custom_code)
             code.extend(b"\x89\xc7")  # mov edi, eax

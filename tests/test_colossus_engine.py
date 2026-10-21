@@ -182,9 +182,17 @@ class TestColossusEngine(unittest.TestCase):
         if sys.platform != "win32":
             os.chmod(out_exe, 0o755)
 
-        # Run as a freestanding process
-        proc = subprocess.run([out_exe], capture_output=True)
-        self.assertEqual(proc.returncode, 175)
+        # 1. Run with default argument (no args) -> default argument 10 -> (10 << 4) + 15 = 175
+        proc_default = subprocess.run([out_exe], capture_output=True)
+        self.assertEqual(proc_default.returncode, 175)
+
+        # 2. Run with dynamic CLI argument "5" -> (5 << 4) + 15 = 95
+        proc_5 = subprocess.run([out_exe, "5"], capture_output=True)
+        self.assertEqual(proc_5.returncode, 95)
+
+        # 3. Run with dynamic CLI argument "7" -> (7 << 4) + 15 = 127
+        proc_7 = subprocess.run([out_exe, "7"], capture_output=True)
+        self.assertEqual(proc_7.returncode, 127)
 
 
 if __name__ == "__main__":
