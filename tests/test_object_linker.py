@@ -3,6 +3,7 @@ Unit Tests for Native Object Linker & Symbol Relocation Engine
 """
 
 import unittest
+import sys
 import ctypes
 import os
 import tempfile
@@ -17,26 +18,27 @@ class TestNativeObjectLinker(unittest.TestCase):
 
     def test_inter_module_relocation_and_linking(self):
         # 1. Module A (Core Math Repo):
-        # fast_add(rcx, rdx) -> rax = rcx + rdx
-        # 48 89 c8       mov rax, rcx
-        # 48 01 d0       add rax, rdx
-        # c3             ret
+        # fast_add(arg0, arg1) -> rax = arg0 + arg1
+        if sys.platform == "win32":
+            # Windows x64 ABI: arg0 in RCX, arg1 in RDX
+            code_fast_add = b"\x48\x89\xc8\x48\x01\xd0\xc3"  # mov rax, rcx; add rax, rdx; ret
+            load_const_15 = b"\x48\xc7\xc2\x0f\x00\x00\x00"  # mov rdx, 15
+        else:
+            # Linux System V AMD64 ABI: arg0 in RDI, arg1 in RSI
+            code_fast_add = b"\x48\x89\xf8\x48\x01\xf0\xc3"  # mov rax, rdi; add rax, rsi; ret
+            load_const_15 = b"\x48\xc7\xc6\x0f\x00\x00\x00"  # mov rsi, 15
+
         mod_core = ObjectModule("repo_core")
-        code_fast_add = b"\x48\x89\xc8\x48\x01\xd0\xc3"
         mod_core.add_symbol("fast_add", code_fast_add)
 
         # 2. Module B (Service Repo):
-        # service_calc(rcx):
-        # adds 15 to rcx by calling fast_add(rcx, 15)
-        # 48 c7 c2 0f 00 00 00   mov rdx, 15 (7 bytes)
-        # e8 00 00 00 00         call <fast_add> (5 bytes: opcode E8 at offset 7, disp32 at offset 8)
-        # c3                     ret
+        # service_calc(arg0): calls fast_add(arg0, 15)
         mod_service = ObjectModule("repo_service")
         call_code = bytearray()
-        call_code.extend(b"\x48\xc7\xc2\x0f\x00\x00\x00")  # mov rdx, 15
-        call_offset = len(call_code) + 1                   # offset of disp32
-        call_code.extend(b"\xe8\x00\x00\x00\x00")          # call placeholder
-        call_code.append(0xc3)                             # ret
+        call_code.extend(load_const_15)
+        call_offset = len(call_code) + 1  # offset of disp32 after opcode 0xE8
+        call_code.extend(b"\xe8\x00\x00\x00\x00")  # call placeholder
+        call_code.append(0xc3)  # ret
 
         mod_service.add_symbol("service_calc", bytes(call_code))
         mod_service.add_call_relocation(call_offset, "fast_add")
