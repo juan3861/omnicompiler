@@ -59,10 +59,11 @@ jobs:
       run: |
         python test_titans_supreme_benchmark.py
 
-    - name: 8. Run OmniRepo Compiler Multi-Repository E2E Pipeline & SOTA Unit Tests (27 Suites)
+    - name: 8. Run OmniRepo Compiler Multi-Repository E2E Pipeline & SOTA Unit Tests (52 Suites)
       run: |
         python -m unittest discover tests -v
         python test_omni_repo_compiler_e2e.py
+        python colossus_cli.py compile
 
     - name: 9. Run SOTA Comparative Benchmarks & Convergence Verification
       run: |

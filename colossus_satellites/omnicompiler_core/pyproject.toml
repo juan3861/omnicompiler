@@ -1,0 +1,12 @@
+[project]
+name = "omnicompiler_core"
+version = "1.0.0"
+description = "The Unified Colossus Compiler Core uniting all 5 Titan Satellites"
+requires-python = ">=3.10"
+dependencies = [
+    "titan_egraph",
+    "titan_cpg",
+    "titan_alive_refinement",
+    "titan_cegis_souper",
+    "titan_alphadev_mcts"
+]
