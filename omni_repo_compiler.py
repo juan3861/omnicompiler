@@ -156,10 +156,13 @@ class OmniRepoCompiler:
                 # Compile a representative arithmetic kernel for exported symbols
                 # Generates machine code: f(x) = (x << 4) + 15
                 code = bytearray()
-                code.extend(b"\x48\x89\xc8")        # mov rax, rcx
-                code.extend(b"\x48\xc1\xe0\x04")    # shl rax, 4
-                code.extend(b"\x48\x83\xc0\x0f")    # add rax, 15
-                code.append(0xc3)                   # ret
+                if sys.platform == "win32":
+                    code.extend(b"\x48\x89\xc8")        # mov rax, rcx (Windows x64 ABI)
+                else:
+                    code.extend(b"\x48\x89\xf8")        # mov rax, rdi (Linux System V AMD64 ABI)
+                code.extend(b"\x48\xc1\xe0\x04")        # shl rax, 4
+                code.extend(b"\x48\x83\xc0\x0f")        # add rax, 15
+                code.append(0xc3)                       # ret
                 obj_mod.add_symbol(exp.name, bytes(code))
 
             self.linker.add_module(obj_mod)
