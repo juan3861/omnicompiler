@@ -167,9 +167,15 @@ Transplanted directly from the pinnacles of global compiler science (CompCert, C
    - Compiles SSA directly into binary machine instructions in executable RAM (`VirtualAlloc` on Windows / `mmap` on Linux).
    - Achieves **270x–350x native hardware speedup** executing on physical CPU silicon registers.
    - Cross-Platform ABI: Support for Windows x64 ABI (`RCX`) and Linux System V AMD64 ABI (`RDI`).
-3. **Freestanding Standalone Binary Emitter ([`compiler/binary_emitter.py`](compiler/binary_emitter.py))**:
-   - Synthesizes fully linked, standalone 64-bit native executables directly in machine code with **zero external dependencies** (no GCC, Clang, MSVC, or Python runtime required).
-   - Targets Windows PE32+ (`.exe` importing `KERNEL32!ExitProcess`) and Linux ELF64 (`sys_exit` syscall 60).
+3. **Freestanding Standalone Binary & Shared Library Emitter ([`compiler/binary_emitter.py`](compiler/binary_emitter.py))**:
+   - Synthesizes fully linked, standalone 64-bit native executables and dynamic shared libraries directly in machine code with **zero external dependencies** (no GCC, Clang, MSVC, or Python runtime required).
+   - Multi-Architecture Targets: **x86-64 (AMD64)** and **ARM64 (AArch64)**.
+   - Formats:
+     - Windows PE32+ Console Executables (`.exe`)
+     - Windows PE32+ Dynamic Link Libraries (`.dll`) with full Export Directory Tables (`.edata`), callable natively via `ctypes.CDLL` / `LoadLibrary`
+     - Linux ELF64 Standalone Executables via direct `sys_exit` (syscall 60 on x86-64, syscall 93 on AArch64)
+     - Linux ELF64 Dynamic Shared Objects (`.so`) with `PT_DYNAMIC`, `.dynsym`, and `.dynstr` symbol resolution
+     - Windows ARM64 PE32+ (`IMAGE_FILE_MACHINE_ARM64 = 0xAA64`) and Linux ARM64 ELF64 (`EM_AARCH64 = 183`)
 4. **Chaitin-Briggs Graph Coloring Register Allocator ([`compiler/regalloc_graph_coloring.py`](compiler/regalloc_graph_coloring.py))**:
    - Liveness analysis across SSA basic blocks and interference graph construction.
    - Kempe simplification and Chaitin spill heuristics mapping virtual registers onto physical x86-64 registers (`RAX, RCX, RDX, RBX, RSI, RDI, R8-R15`) with **0 stack spills**.
@@ -197,6 +203,8 @@ Audited and physically proven via [`test_titans_supreme_benchmark.py`](test_tita
 |---|---|---|---|
 | **1M Batch Loop Latency** | 167.64 ms (CPython Bytecode) | **0.56 ms (Native x86-64 Machine Code)** | **300.3x Silicon Acceleration** |
 | **Standalone Binary Generation** | None (Python runtime required) | **PE32+ & ELF64 (0 dependencies)** | Executed via Subprocess (Exit 175) |
+| **Shared Dynamic Libraries (.dll / .so)** | None (No Export / DynSym) | **PE EAT & ELF DynSym (ctypes 175)** | Dynamic In-Memory Linking |
+| **Multi-Architecture Support** | x86-64 only | **x86-64 & ARM64 (AArch64)** | Validated PE 0xAA64 & ELF 183 |
 | **Arithmetic Superoptimization** | Greedy Local Minima (Stuck) | **AlphaDev MCTS + E-Graph** | **6.0x Cycle Reduction** (`x << 4`) |
 | **Division Strength Reduction** | Greedy Local Minima (Stuck) | **AlphaDev MCTS (idiv $\to$ shr)** | **19.0x Cycle Reduction** (`x >> 3`) |
 | **Register Allocation Spills** | 8 Spills to Stack Slots ($K=2$) | **0 Spills (Chaitin-Briggs $K=14$)** | 100% in CPU Silicon Registers |

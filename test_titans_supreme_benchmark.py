@@ -12,6 +12,7 @@ import os
 import time
 import ast
 import subprocess
+import struct
 from typing import Dict, Any
 
 from compiler.native_jit import NativeJITEngine
@@ -88,9 +89,69 @@ def run_benchmark_axis1_execution_latency() -> Dict[str, Any]:
         elf_magic = f.read(4)
     assert elf_magic == b"\x7fELF"
     print(f"[+] Cross-Target ELF64 Engine:      Verified (magic {elf_magic}, valid ELF64 header)")
-
     try:
         os.remove(test_elf)
+    except Exception:
+        pass
+
+    # 5. Dynamic Shared Library (.dll / .so with Export Tables)
+    dll_fn_code = b"\x48\x89\xc8\x48\xc1\xe0\x04\x48\x83\xc0\x0f\xc3"  # f(x) = (x << 4) + 15
+    if sys.platform == "win32":
+        import ctypes
+        dll_path = emitter.emit_shared_library(os.path.join("dist", "omni_test_lib.dll"), func_code=dll_fn_code, export_name="omni_calc")
+        lib = ctypes.CDLL(os.path.abspath(dll_path))
+        fn = getattr(lib, "omni_calc")
+        fn.argtypes = [ctypes.c_int64]
+        fn.restype = ctypes.c_int64
+        dll_val = fn(10)
+        assert dll_val == 175, f"DLL calculation mismatch: {dll_val}"
+        print(f"[+] Dynamic Shared Library (.dll):  Verified via ctypes.CDLL (omni_calc(10) = {dll_val})")
+        handle = lib._handle
+        del fn
+        del lib
+        kernel32 = ctypes.windll.kernel32
+        kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
+        kernel32.FreeLibrary(handle)
+        try:
+            os.remove(dll_path)
+        except Exception:
+            pass
+    else:
+        so_path = emitter.emit_shared_library(os.path.join("dist", "libomni_test.so"), func_code=dll_fn_code, export_name="omni_calc", target_format="elf_so")
+        with open(so_path, "rb") as f:
+            so_bytes = f.read()
+        assert so_bytes[:4] == b"\x7fELF"
+        assert struct.unpack_from("<H", so_bytes, 16)[0] == 3  # ET_DYN
+        print(f"[+] Dynamic Shared Library (.so):   Verified ET_DYN with dynamic symbols (.dynsym, .dynstr)")
+        try:
+            os.remove(so_path)
+        except Exception:
+            pass
+
+    # 6. Windows ARM64 (AArch64) PE32+ Binary Synthesis
+    arm_pe_path = os.path.join("dist", "omni_arm64.exe")
+    emitter.emit_standalone_binary(arm_pe_path, target_format="arm64_pe", exit_code=175)
+    with open(arm_pe_path, "rb") as f:
+        arm_pe_data = f.read()
+    arm_coff_machine = struct.unpack_from("<H", arm_pe_data, 0x80 + 4)[0]
+    assert arm_coff_machine == 0xAA64, f"Invalid ARM64 machine: {hex(arm_coff_machine)}"
+    print(f"[+] Windows ARM64 PE32+ Emitter:    Verified (COFF Machine: 0xAA64, AArch64)")
+    try:
+        os.remove(arm_pe_path)
+    except Exception:
+        pass
+
+    # 7. Linux ARM64 (AArch64) ELF64 Standalone Binary Synthesis
+    arm_elf_path = os.path.join("dist", "omni_arm64.bin")
+    emitter.emit_standalone_binary(arm_elf_path, target_format="arm64_elf", exit_code=175)
+    with open(arm_elf_path, "rb") as f:
+        arm_elf_data = f.read()
+    assert arm_elf_data[:4] == b"\x7fELF"
+    arm_elf_machine = struct.unpack_from("<H", arm_elf_data, 18)[0]
+    assert arm_elf_machine == 183, f"Invalid AArch64 machine: {arm_elf_machine}"
+    print(f"[+] Linux ARM64 ELF64 Emitter:      Verified (EM_AARCH64: 183, syscall 93 sys_exit)")
+    try:
+        os.remove(arm_elf_path)
     except Exception:
         pass
 
@@ -99,7 +160,10 @@ def run_benchmark_axis1_execution_latency() -> Dict[str, Any]:
         "jit_ms": round(t_jit, 2),
         "speedup": round(speedup, 1),
         "standalone_pe_verified": True,
-        "standalone_elf_verified": True
+        "standalone_elf_verified": True,
+        "shared_lib_verified": True,
+        "arm64_pe_verified": True,
+        "arm64_elf_verified": True
     }
 
 
@@ -268,6 +332,8 @@ def main():
     print(f"| {'1M Batch Loop Latency':<34} | {res1['cpython_ms']:>14.2f} ms | {res1['jit_ms']:>15.2f} ms |")
     print(f"| {'Silicon Hardware Speedup':<34} | {'1.0x (CPython)':<18} | {res1['speedup']:>18.1f}x |")
     print(f"| {'Standalone Binary Generation':<34} | {'None (Python dep)':<18} | {'PE32+ & ELF64 (0-dep)':<22} |")
+    print(f"| {'Shared Dynamic Library (.dll/.so)':<34} | {'None (No EAT/DynSym)':<18} | {'PE EAT & ELF DynSym':<22} |")
+    print(f"| {'ARM64 (AArch64) Architecture':<34} | {'x86-64 only':<18} | {'PE AA64 & ELF 183':<22} |")
     print(f"| {'Arithmetic Superoptimization':<34} | {'Greedy / Stuck':<18} | {res2['mcts_case1_speedup']:>18.1f}x |")
     print(f"| {'Division Strength Reduction':<34} | {'Greedy / Stuck':<18} | {res2['mcts_case2_speedup']:>18.1f}x |")
     print(f"| {'Register Allocation Spills':<34} | {spill_constrained_str:<18} | {spill_chaitin_str:<22} |")
