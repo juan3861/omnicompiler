@@ -1,0 +1,8 @@
+[project]
+name = "smt_refinement_validator"
+version = "1.0.0"
+description = "Alive2 & CompCert Style SMT Translation Validation & Memory Model Refinement"
+requires-python = ">=3.10"
+dependencies = [
+    "z3-solver>=4.12.0"
+]

@@ -19,7 +19,7 @@
         "test_frontier_breakthrough.py",
         "test_omni_repo_compiler_e2e.py",
         "test_supreme_ceiling_audit.py",
-        "test_titans_supreme_benchmark.py"
+        "test_compiler_subsystems_benchmark.py"
       ]
     },
     "adapters": {

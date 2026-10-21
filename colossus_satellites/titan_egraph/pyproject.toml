@@ -1,8 +1,0 @@
-[project]
-name = "titan_egraph"
-version = "1.0.0"
-description = "Equality Saturation & Relational E-Matching Engine (egg / egglog style)"
-requires-python = ">=3.10"
-dependencies = [
-    "z3-solver>=4.12.0"
-]

@@ -1,0 +1,6 @@
+[project]
+name = "mcts_assembly_superoptimizer"
+version = "1.0.0"
+description = "MCTS-Driven Assembly Instruction Superoptimizer & Latency Minimizer"
+requires-python = ">=3.10"
+dependencies = []

@@ -1,8 +1,0 @@
-[project]
-name = "titan_alive_refinement"
-version = "1.0.0"
-description = "SMT Translation Validation & Memory Model Refinement (Alive2 & CompCert style)"
-requires-python = ">=3.10"
-dependencies = [
-    "z3-solver>=4.12.0"
-]

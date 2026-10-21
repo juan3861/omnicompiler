@@ -46,7 +46,7 @@
 | Gate 4: OmniMutator & Z3 | `python test_empirical_evolution_audit.py` | 8 | 0.91s | 0 | **PASS** |
 | Gate 5: Frontier Breakthrough | `python test_frontier_breakthrough.py` | 6 | 1.03s | 0 | **PASS** |
 | Gate 6: Supreme Ceiling Audit | `python test_supreme_ceiling_audit.py` | 6 | 1.36s | 0 | **PASS** |
-| Gate 7: 12-Titans Benchmark | `python test_titans_supreme_benchmark.py` | 10 | 2.37s | 0 | **PASS** |
+| Gate 7: Subsystems Benchmark | `python test_compiler_subsystems_benchmark.py` | 10 | 2.37s | 0 | **PASS** |
 | Gate 8: OmniRepo E2E Pipeline | `python test_omni_repo_compiler_e2e.py` | 8 stages | 2.46s | 0 | **PASS** |
 | Gate 9: SOTA Benchmarks | `python external_component_candidates/benchmarks/comparative_benchmark.py` | 4 benchmarks | 0.12s | 0 | **PASS** |
 

@@ -1,0 +1,12 @@
+[project]
+name = "compiler_core"
+version = "1.0.0"
+description = "OmniCompiler Core Orchestrator uniting all 5 modular compiler optimization subsystems"
+requires-python = ">=3.10"
+dependencies = [
+    "egraph_optimizer",
+    "cpg_taint_analyzer",
+    "smt_refinement_validator",
+    "cegis_abi_synthesizer",
+    "mcts_assembly_superoptimizer"
+]

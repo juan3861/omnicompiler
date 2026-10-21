@@ -1,0 +1,8 @@
+[project]
+name = "cegis_abi_synthesizer"
+version = "1.0.0"
+description = "CEGIS Inductive Synthesis Engine & Cross-Language ABI Adapter Generator"
+requires-python = ">=3.10"
+dependencies = [
+    "z3-solver>=4.12.0"
+]

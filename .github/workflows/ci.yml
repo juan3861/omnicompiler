@@ -9,7 +9,7 @@ on:
 
 jobs:
   verify:
-    name: SMT Translation Validation & Multi-Organ Audit (${{ matrix.os }})
+    name: SMT Translation Validation & Multi-Repository Pipeline (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -35,7 +35,7 @@ jobs:
       run: |
         python benchmarks/adversarial_fixtures.py
 
-    - name: 2. Run OMEGA Multi-Repo Empirical Synthesis Audit (14 Gates)
+    - name: 2. Run Multi-Repo Empirical Synthesis Audit (14 Gates)
       run: |
         python test_empirical_audit.py
 
@@ -55,15 +55,15 @@ jobs:
       run: |
         python test_supreme_ceiling_audit.py
 
-    - name: 7. Run 12-Titans Supreme Maturity Benchmark (MCTS, Standalone Binary, Chaitin-Briggs)
+    - name: 7. Run Subsystems Maturity Benchmark (MCTS, Standalone Binary, Chaitin-Briggs)
       run: |
-        python test_titans_supreme_benchmark.py
+        python test_compiler_subsystems_benchmark.py
 
-    - name: 8. Run OmniRepo Compiler Multi-Repository E2E Pipeline & SOTA Unit Tests (52 Suites)
+    - name: 8. Run OmniRepo Compiler Multi-Repository E2E Pipeline & Unit Tests
       run: |
         python -m unittest discover tests -v
         python test_omni_repo_compiler_e2e.py
-        python colossus_cli.py compile
+        python omnicompiler_cli.py compile
 
     - name: 9. Run SOTA Comparative Benchmarks & Convergence Verification
       run: |
