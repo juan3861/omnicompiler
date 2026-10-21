@@ -1,0 +1,304 @@
+{
+  "repository": "omnicompiler",
+  "total_files": 118,
+  "total_lines": 22911,
+  "total_functions": 679,
+  "total_classes": 133,
+  "subsystems": {
+    "root": {
+      "files": 9,
+      "lines": 3744,
+      "functions": 36,
+      "classes": 1,
+      "file_list": [
+        "bootstrap_v2.py",
+        "cli.py",
+        "omni_repo_compiler.py",
+        "test_empirical_audit.py",
+        "test_empirical_evolution_audit.py",
+        "test_frontier_breakthrough.py",
+        "test_omni_repo_compiler_e2e.py",
+        "test_supreme_ceiling_audit.py",
+        "test_titans_supreme_benchmark.py"
+      ]
+    },
+    "adapters": {
+      "files": 4,
+      "lines": 683,
+      "functions": 14,
+      "classes": 6,
+      "file_list": [
+        "adapters/cegis_engine.py",
+        "adapters/synthesizer.py",
+        "adapters/universal_abi_bridge.py",
+        "adapters/__init__.py"
+      ]
+    },
+    "benchmarks": {
+      "files": 9,
+      "lines": 3317,
+      "functions": 47,
+      "classes": 2,
+      "file_list": [
+        "benchmarks/adversarial_fixtures.py",
+        "benchmarks/benchmark_frontier_14.py",
+        "benchmarks/benchmark_frontier_28.py",
+        "benchmarks/corpus_p4.py",
+        "benchmarks/__init__.py",
+        "benchmarks/reference_pair/repo_a_docs/doc_service.py",
+        "benchmarks/reference_pair/repo_a_docs/__init__.py",
+        "benchmarks/reference_pair/repo_b_search/search_engine.py",
+        "benchmarks/reference_pair/repo_b_search/__init__.py"
+      ]
+    },
+    "compiler": {
+      "files": 6,
+      "lines": 1347,
+      "functions": 61,
+      "classes": 18,
+      "file_list": [
+        "compiler/binary_emitter.py",
+        "compiler/native_jit.py",
+        "compiler/object_linker.py",
+        "compiler/regalloc_graph_coloring.py",
+        "compiler/ssa_ir.py",
+        "compiler/tensor_tiler.py"
+      ]
+    },
+    "contracts": {
+      "files": 2,
+      "lines": 310,
+      "functions": 16,
+      "classes": 10,
+      "file_list": [
+        "contracts/models.py",
+        "contracts/__init__.py"
+      ]
+    },
+    "controller": {
+      "files": 2,
+      "lines": 625,
+      "functions": 15,
+      "classes": 1,
+      "file_list": [
+        "controller/orchestrator.py",
+        "controller/__init__.py"
+      ]
+    },
+    "crypto": {
+      "files": 1,
+      "lines": 176,
+      "functions": 11,
+      "classes": 1,
+      "file_list": [
+        "crypto/blake3_engine.py"
+      ]
+    },
+    "discovery": {
+      "files": 2,
+      "lines": 205,
+      "functions": 6,
+      "classes": 2,
+      "file_list": [
+        "discovery/matcher.py",
+        "discovery/__init__.py"
+      ]
+    },
+    "evolution": {
+      "files": 7,
+      "lines": 2263,
+      "functions": 91,
+      "classes": 22,
+      "file_list": [
+        "evolution/continuous_evolution_daemon.py",
+        "evolution/egraph_engine.py",
+        "evolution/mcts_hardware_optimizer.py",
+        "evolution/omni_mutator.py",
+        "evolution/recursive_bootstrap_loop.py",
+        "evolution/self_evolution_engine.py",
+        "evolution/status_dashboard.py"
+      ]
+    },
+    "frontends": {
+      "files": 3,
+      "lines": 487,
+      "functions": 6,
+      "classes": 2,
+      "file_list": [
+        "frontends/polyglot_frontend.py",
+        "frontends/python_frontend.py",
+        "frontends/__init__.py"
+      ]
+    },
+    "HEAD": {
+      "files": 45,
+      "lines": 5938,
+      "functions": 241,
+      "classes": 36,
+      "file_list": [
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/cli.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/compiler_v2_core.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/adapters/synthesizer.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/adapters/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/contracts/models.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/contracts/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/controller/orchestrator.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/controller/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/discovery/matcher.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/discovery/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/frontends/polyglot_frontend.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/frontends/python_frontend.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/frontends/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/materializers/engine.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/materializers/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/packaging/packager.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/packaging/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/planner/engine.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/planner/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/recipes/registry.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/recipes/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/slicer/capsule_extractor.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/slicer/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/snapshots/engine.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/snapshots/__init__.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/validation/validator.py",
+        "HEAD/repo_compiler_core/cee04f51a358eee5aea40bea913e5186f2dbeaef7b54cedef8602f94098b717f/validation/__init__.py",
+        "HEAD/repo_radon_metrics/9c4fe4e8999df92904dabf7cb177b7c06604e292dcaecf8993d517a85dbac9ac/radon_service.py",
+        "HEAD/repo_radon_metrics/9c4fe4e8999df92904dabf7cb177b7c06604e292dcaecf8993d517a85dbac9ac/radon/complexity.py",
+        "HEAD/repo_radon_metrics/9c4fe4e8999df92904dabf7cb177b7c06604e292dcaecf8993d517a85dbac9ac/radon/metrics.py",
+        "HEAD/repo_radon_metrics/9c4fe4e8999df92904dabf7cb177b7c06604e292dcaecf8993d517a85dbac9ac/radon/raw.py",
+        "HEAD/repo_radon_metrics/9c4fe4e8999df92904dabf7cb177b7c06604e292dcaecf8993d517a85dbac9ac/radon/visitors.py",
+        "HEAD/repo_radon_metrics/9c4fe4e8999df92904dabf7cb177b7c06604e292dcaecf8993d517a85dbac9ac/radon/__init__.py",
+        "HEAD/repo_radon_metrics/9c4fe4e8999df92904dabf7cb177b7c06604e292dcaecf8993d517a85dbac9ac/radon/__main__.py",
+        "HEAD/repo_sbom_supplychain/6cfa2e2c8a13d9cd9b7dbbd8c2e1e8e3c6103ff2e8f5f05a29bbb250f55313fe/sbom_service.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture_service.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/config.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/core.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/lines.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/noqa.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/reachability.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/utils.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/version.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/__init__.py",
+        "HEAD/repo_vulture_ast/a0e1d6600a589629764cbad21b3e899a7f7ed3d3e4259df21b1708e9acccfecd/vulture/__main__.py"
+      ]
+    },
+    "materializers": {
+      "files": 2,
+      "lines": 307,
+      "functions": 6,
+      "classes": 1,
+      "file_list": [
+        "materializers/engine.py",
+        "materializers/__init__.py"
+      ]
+    },
+    "orchestrator": {
+      "files": 2,
+      "lines": 488,
+      "functions": 24,
+      "classes": 8,
+      "file_list": [
+        "orchestrator/repo_manifest_ingestor.py",
+        "orchestrator/salsa_query_engine.py"
+      ]
+    },
+    "packaging": {
+      "files": 2,
+      "lines": 64,
+      "functions": 2,
+      "classes": 1,
+      "file_list": [
+        "packaging/packager.py",
+        "packaging/__init__.py"
+      ]
+    },
+    "planner": {
+      "files": 2,
+      "lines": 324,
+      "functions": 6,
+      "classes": 1,
+      "file_list": [
+        "planner/engine.py",
+        "planner/__init__.py"
+      ]
+    },
+    "recipes": {
+      "files": 2,
+      "lines": 82,
+      "functions": 6,
+      "classes": 1,
+      "file_list": [
+        "recipes/registry.py",
+        "recipes/__init__.py"
+      ]
+    },
+    "runtime": {
+      "files": 1,
+      "lines": 72,
+      "functions": 8,
+      "classes": 2,
+      "file_list": [
+        "runtime/sharded_allocator.py"
+      ]
+    },
+    "slicer": {
+      "files": 4,
+      "lines": 784,
+      "functions": 31,
+      "classes": 7,
+      "file_list": [
+        "slicer/capsule_extractor.py",
+        "slicer/code_property_graph.py",
+        "slicer/persistent_cpg.py",
+        "slicer/__init__.py"
+      ]
+    },
+    "snapshots": {
+      "files": 2,
+      "lines": 107,
+      "functions": 3,
+      "classes": 1,
+      "file_list": [
+        "snapshots/engine.py",
+        "snapshots/__init__.py"
+      ]
+    },
+    "storage": {
+      "files": 1,
+      "lines": 153,
+      "functions": 8,
+      "classes": 1,
+      "file_list": [
+        "storage/mmap_store.py"
+      ]
+    },
+    "tests": {
+      "files": 5,
+      "lines": 279,
+      "functions": 15,
+      "classes": 4,
+      "file_list": [
+        "tests/test_object_linker.py",
+        "tests/test_persistent_cpg.py",
+        "tests/test_repo_manifest_ingestor.py",
+        "tests/test_universal_abi_bridge.py",
+        "tests/__init__.py"
+      ]
+    },
+    "validation": {
+      "files": 5,
+      "lines": 1156,
+      "functions": 26,
+      "classes": 5,
+      "file_list": [
+        "validation/biabduction_verifier.py",
+        "validation/refinement_memory_engine.py",
+        "validation/smt_refinement.py",
+        "validation/validator.py",
+        "validation/__init__.py"
+      ]
+    }
+  },
+  "timestamp": "2026-10-21T15:14:56Z"
+}

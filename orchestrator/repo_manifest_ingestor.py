@@ -11,6 +11,7 @@ import ast
 from typing import Dict, List, Set, Tuple, Any, Optional
 from crypto.blake3_engine import blake3_digest
 from orchestrator.salsa_query_engine import SalsaQueryEngine
+from slicer.tree_sitter_polyglot import TreeSitterPolyglotEngine
 
 
 class SymbolSignature:
@@ -106,6 +107,7 @@ class RepoManifestIngestor:
 
     def __init__(self, salsa_engine: Optional[SalsaQueryEngine] = None):
         self.salsa = salsa_engine or SalsaQueryEngine()
+        self.tree_sitter = TreeSitterPolyglotEngine()
 
     def ingest_repository(self, repo_path: str, repo_name: Optional[str] = None) -> RepoManifest:
         repo_path = os.path.abspath(repo_path)
@@ -204,9 +206,15 @@ class RepoManifestIngestor:
         try:
             with open(path, "rb") as f:
                 content = f.read()
+
+            if self.tree_sitter.is_available:
+                ts_exports = self.tree_sitter.parse_c_symbols(content, rel_path)
+                if ts_exports:
+                    return ts_exports, imports, content
+
             text = content.decode("utf-8", errors="ignore")
 
-            # Regex for C prototypes: e.g. int64_t func_name(int64_t a, int64_t b);
+            # Regex fallback for C prototypes: e.g. int64_t func_name(int64_t a, int64_t b);
             # or void func_name(int x);
             proto_re = re.compile(r'^\s*(?:extern\s+)?([a-zA-Z0-9_]+(?:\s*\*+)?)\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*;', re.MULTILINE)
             for match in proto_re.finditer(text):
@@ -237,9 +245,15 @@ class RepoManifestIngestor:
         try:
             with open(path, "rb") as f:
                 content = f.read()
+
+            if self.tree_sitter.is_available:
+                ts_exports = self.tree_sitter.parse_rust_symbols(content, rel_path)
+                if ts_exports:
+                    return ts_exports, imports, content
+
             text = content.decode("utf-8", errors="ignore")
 
-            # Match: pub fn func_name(param1: type, ...) -> ret_type
+            # Regex fallback: Match: pub fn func_name(param1: type, ...) -> ret_type
             fn_re = re.compile(r'pub\s+fn\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)(?:\s*->\s*([a-zA-Z0-9_<>]+))?', re.MULTILINE)
             for match in fn_re.finditer(text):
                 fn_name, params_str, ret_type = match.groups()

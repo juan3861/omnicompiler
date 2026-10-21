@@ -1,0 +1,62 @@
+{
+  "manifest_version": "1.0.0",
+  "project": "omnicompiler",
+  "generated_at": "2026-10-21T15:15:35Z",
+  "selected_components": [
+    {
+      "id": "CAND-01",
+      "name": "tree-sitter",
+      "subpackage": "tree-sitter-language-pack",
+      "version": "0.25.2 / 0.13.0",
+      "license": "MIT",
+      "upstream": "https://github.com/tree-sitter/tree-sitter",
+      "module_binding": "tree_sitter",
+      "target_subsystem": "slicer/tree_sitter_polyglot.py",
+      "benefit": "Grammar-grade concrete syntax tree parsing across 50+ programming languages."
+    },
+    {
+      "id": "CAND-02",
+      "name": "llvmlite",
+      "subpackage": "llvmlite.binding",
+      "version": "0.47.0",
+      "license": "BSD-2-Clause",
+      "upstream": "https://github.com/numba/llvmlite",
+      "module_binding": "llvmlite",
+      "target_subsystem": "compiler/llvm_backend.py",
+      "benefit": "Full LLVM IR code generation, JIT compilation, and industrial O3 vectorization/optimization."
+    },
+    {
+      "id": "CAND-03",
+      "name": "unicorn",
+      "subpackage": "unicorn.x86_const",
+      "version": "2.1.4",
+      "license": "GPL-2.0 w/ exception",
+      "upstream": "https://github.com/unicorn-engine/unicorn",
+      "module_binding": "unicorn",
+      "target_subsystem": "validation/silicon_safety_sandbox.py",
+      "benefit": "Zero-risk virtual CPU pre-flight machine code execution and memory safety emulation."
+    },
+    {
+      "id": "CAND-04",
+      "name": "pefile & pyelftools",
+      "subpackage": "pefile / elftools",
+      "version": "2024.8.26 / 0.33",
+      "license": "MIT / Public Domain",
+      "upstream": "https://github.com/erocarrera/pefile & https://github.com/eliben/pyelftools",
+      "module_binding": "pefile, elftools",
+      "target_subsystem": "validation/binary_structure_auditor.py",
+      "benefit": "Formal specification validation of emitted PE/COFF and ELF binaries, sections, and relocations."
+    },
+    {
+      "id": "CAND-05",
+      "name": "wasmtime",
+      "subpackage": "wasmtime",
+      "version": "49.0.0",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/bytecodealliance/wasmtime-py",
+      "module_binding": "wasmtime",
+      "target_subsystem": "compiler/wasm_backend.py",
+      "benefit": "Universal WebAssembly sandboxed compilation and cross-platform portable execution."
+    }
+  ]
+}

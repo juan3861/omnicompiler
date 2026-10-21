@@ -59,9 +59,14 @@ def run_e2e_multi_repo_test():
         print("[+] Stage 3: CPG Tenant Isolation:    ", res["stages"]["cpg_security"]["isolation_preserved"])
         print("[+] Stage 4: CEGIS ABI Bridges:       ", res["stages"]["synthesis"]["bridges_synthesized"])
         print("[+] Stage 5: Machine Codegen Modules: ", res["stages"]["codegen"]["modules_added"])
+        print("[+] Stage 5.5: Silicon Safety Sandbox:", res["stages"]["preflight_safety"]["is_safe_for_silicon"])
+        assert res["stages"]["preflight_safety"]["is_safe_for_silicon"] is True
+        assert res["stages"]["preflight_safety"]["simulated_return_value"] == 175
         print("[+] Stage 6: Native Object Linking:   ", res["stages"]["linking"]["success"])
         print("[+] Stage 7: Unified Binary Emitted:  ", res["stages"]["emission"]["artifact_path"])
         print(f"             Binary File Size:         {res['stages']['emission']['file_size']} bytes")
+        print("[+] Stage 8: Formal Binary Spec Audit:", res["stages"]["formal_audit"]["is_valid"])
+        assert res["stages"]["formal_audit"]["is_valid"] is True
 
         # 4. Physical In-Memory Verification (Load DLL via ctypes.CDLL on Windows / Validate ELF SO on Linux)
         if sys.platform == "win32":

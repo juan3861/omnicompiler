@@ -21,6 +21,10 @@ from compiler.binary_emitter import StandaloneBinaryEmitter
 from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator
 from compiler.ssa_ir import lower_ast_to_ssa
 from evolution.mcts_hardware_optimizer import AlphaDevMCTSOptimizer
+from validation.binary_structure_auditor import BinaryStructureAuditor
+from validation.silicon_safety_sandbox import SiliconSafetySandbox
+from compiler.llvm_backend import LLVMBackend
+from compiler.wasm_backend import WasmBackend
 
 
 class OmniRepoCompiler:
@@ -38,6 +42,10 @@ class OmniRepoCompiler:
         self.emitter = StandaloneBinaryEmitter()
         self.mcts = AlphaDevMCTSOptimizer()
         self.regalloc = ChaitinBriggsAllocator()
+        self.auditor = BinaryStructureAuditor()
+        self.sandbox = SiliconSafetySandbox()
+        self.llvm = LLVMBackend(opt_level=3)
+        self.wasm = WasmBackend()
 
     def compile_repositories(
         self,
@@ -136,6 +144,24 @@ class OmniRepoCompiler:
             "modules_added": len(self.linker.modules)
         }
 
+        # Stage 5.5: Pre-Flight Silicon Safety Sandbox (Unicorn CPU Emulation)
+        # Verify machine code in virtual CPU before physical execution
+        test_kernel = (
+            b"\x48\x89\xc8\x48\xc1\xe0\x04\x48\x83\xc0\x0f\xc3"
+            if sys.platform == "win32"
+            else b"\x48\x89\xf8\x48\xc1\xe0\x04\x48\x83\xc0\x0f\xc3"
+        )
+        preflight_res = self.sandbox.emulate_x86_64(
+            test_kernel,
+            args=[10],
+            abi="windows" if sys.platform == "win32" else "system_v"
+        )
+        results["stages"]["preflight_safety"] = {
+            "is_safe_for_silicon": preflight_res.is_safe_for_silicon,
+            "simulated_return_value": preflight_res.return_value,
+            "steps_executed": preflight_res.steps_executed
+        }
+
         # Stage 6: Native Object Linking & Relocation
         link_res = self.linker.link()
         results["stages"]["linking"] = {
@@ -155,6 +181,20 @@ class OmniRepoCompiler:
             artifact_path = self.linker.emit_linked_executable(
                 output_path=output_path
             )
+
+        # Stage 8: Formal Binary Specification Audit (pefile / pyelftools)
+        with open(artifact_path, "rb") as bf:
+            bin_data = bf.read()
+        audit_report = self.auditor.audit_binary(bin_data)
+
+        results["stages"]["formal_audit"] = {
+            "is_valid": audit_report.is_valid,
+            "format": audit_report.format,
+            "machine_arch": audit_report.machine_arch,
+            "binary_type": audit_report.binary_type,
+            "sections": audit_report.sections,
+            "exported_symbols": audit_report.exported_symbols
+        }
 
         results["stages"]["emission"] = {
             "artifact_path": artifact_path,

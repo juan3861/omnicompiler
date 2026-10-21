@@ -59,12 +59,13 @@ jobs:
       run: |
         python test_titans_supreme_benchmark.py
 
-    - name: 8. Run OmniRepo Compiler Multi-Repository E2E Pipeline
+    - name: 8. Run OmniRepo Compiler Multi-Repository E2E Pipeline & SOTA Unit Tests (27 Suites)
       run: |
-        python -m unittest tests/test_repo_manifest_ingestor.py
-        python -m unittest tests/test_persistent_cpg.py
-        python -m unittest tests/test_universal_abi_bridge.py
-        python -m unittest tests/test_object_linker.py
+        python -m unittest discover tests -v
         python test_omni_repo_compiler_e2e.py
+
+    - name: 9. Run SOTA Comparative Benchmarks & Convergence Verification
+      run: |
+        python external_component_candidates/benchmarks/comparative_benchmark.py
 
 
