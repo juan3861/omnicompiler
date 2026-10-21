@@ -37,6 +37,9 @@ from validation.smt_refinement import SmtRefinementVerifier
 from crypto.blake3_engine import blake3_digest
 from evolution.self_evolution_engine import CasimirLangevinTunneling
 from evolution.omni_mutator import OmniMutator
+from evolution.egraph_engine import (
+    EGraph, ast_to_egraph, EqualitySaturationEngine, EGraphExtractor
+)
 
 GENERATIONS_ROOT = os.environ.get("GENERATIONS_ROOT", os.path.join(os.path.dirname(BASE_DIR), "repository-compiler-generations"))
 CHAIN_STATUS_FILE = os.path.join(GENERATIONS_ROOT, "recursive_chain_status.json")
@@ -153,6 +156,52 @@ class MultiOrganAstMutator(ast.NodeTransformer):
         return node
 
 
+class EGraphAstOptimizer(ast.NodeTransformer):
+    """
+    Applies Equality Saturation with Pareto Extraction across AST BinOps.
+    Eliminates the greedy destruction glass ceiling by preserving all equivalent
+    representations in an E-Graph and extracting the minimal microarchitectural latency term.
+    """
+
+    def __init__(self):
+        self.sat_engine = EqualitySaturationEngine()
+        self.extractor = EGraphExtractor()
+        self.saturations_count = 0
+        self.cycles_saved = 0.0
+
+    def _compute_cost(self, node: ast.AST) -> float:
+        """Computes hardware microarchitectural ALU cycle latency of an AST expression."""
+        cost = 0.0
+        for n in ast.walk(node):
+            if isinstance(n, ast.Mult):
+                cost += 3.0
+            elif isinstance(n, (ast.FloorDiv, ast.Mod)):
+                cost += 18.0
+            elif isinstance(n, (ast.Add, ast.Sub, ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.BitXor)):
+                cost += 1.0
+        return cost
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        try:
+            initial_cost = self._compute_cost(node)
+            egraph = EGraph()
+            root_id = ast_to_egraph(node, egraph)
+
+            sat_res = self.sat_engine.saturate(egraph, max_iterations=3)
+            if sat_res.get("total_rewrites", 0) > 0:
+                best_expr_str, _ = self.extractor.extract_optimal(root_id, egraph)
+                new_node = ast.parse(best_expr_str, mode="eval").body
+                new_cost = self._compute_cost(new_node)
+                if new_cost < initial_cost:
+                    self.saturations_count += 1
+                    self.cycles_saved += (initial_cost - new_cost)
+                    return new_node
+        except Exception:
+            pass
+        return node
+
+
 class RecursiveBootstrapChain:
     """Orchestrates multi-organ recursive compiler generations where Generation N compiles Generation N+1."""
 
@@ -241,18 +290,30 @@ class RecursiveBootstrapChain:
 
         parent_organ_hash = blake3_digest(parent_organ_code)
 
-        # 2. Genesis Darwin Genetic Mutation Pass via OmniMutator (8 Optimization Classes)
+        # 2. Genesis Darwin Genetic Mutation Pass via OmniMutator & E-Graph Equality Saturation
         try:
             tree = ast.parse(parent_organ_code)
             mutator = OmniMutator(mutation_rate=0.75)
             mutated_tree = mutator.visit(tree)
             ast.fix_missing_locations(mutated_tree)
-            candidate_code = ast.unparse(mutated_tree)
+
+            # 2B. E-Graph Equality Saturation & Pareto Latency Extraction
+            egraph_opt = EGraphAstOptimizer()
+            saturated_tree = egraph_opt.visit(mutated_tree)
+            ast.fix_missing_locations(saturated_tree)
+
+            candidate_code = ast.unparse(saturated_tree)
             # Verify syntactic validity of the mutated code
             compile(candidate_code, f"<{organ_id}_mutant>", "exec")
             mutated_code = candidate_code
+
+            if egraph_opt.saturations_count > 0:
+                mutator.mutations_applied.append(
+                    f"egraph_eqsat(saved_{egraph_opt.cycles_saved:.1f}_cycles)"
+                )
         except Exception:
             mutator = OmniMutator(mutation_rate=0.75)
+            egraph_opt = EGraphAstOptimizer()
             mutated_code = parent_organ_code
 
         # Casimir-Langevin stochastic tunneling if code was unchanged
@@ -309,6 +370,9 @@ class RecursiveBootstrapChain:
             "parent_organ_blake3": parent_organ_hash,
             "child_organ_blake3": child_organ_hash,
             "mutations_retained": mutator.mutations_applied,
+            "egraph_saturation_applied": (getattr(egraph_opt, "saturations_count", 0) > 0),
+            "egraph_saturations_count": getattr(egraph_opt, "saturations_count", 0),
+            "egraph_cycles_saved": getattr(egraph_opt, "cycles_saved", 0.0),
             "smt_refinement_verified": True,
             "speedup_vs_parent": 1.05,
             "status": "CERTIFIED_ACTIVE_PROMOTED"

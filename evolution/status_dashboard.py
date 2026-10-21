@@ -107,7 +107,7 @@ def format_time_only(timestamp_str: Optional[str]) -> str:
         return timestamp_str[:8] if timestamp_str else "--:--:--"
 
 
-def compute_mutation_metrics(lineage: List[Dict[str, Any]]) -> Dict[str, int]:
+def compute_mutation_metrics(lineage: List[Dict[str, Any]]) -> Dict[str, Any]:
     metrics = {
         "strength_reductions": 0,
         "constant_folding": 0,
@@ -117,17 +117,30 @@ def compute_mutation_metrics(lineage: List[Dict[str, Any]]) -> Dict[str, int]:
         "hardware_bitwise": 0,
         "dead_code_pruning": 0,
         "casimir_tunneling": 0,
+        "egraph_saturations": 0,
+        "egraph_cycles_saved": 0.0,
         "total_mutations": 0,
         "smt_verified_count": 0
     }
     for entry in lineage:
         if entry.get("smt_refinement_verified"):
             metrics["smt_verified_count"] += 1
+        if entry.get("egraph_saturation_applied"):
+            metrics["egraph_saturations"] += 1
+            try:
+                import math
+                saved = float(entry.get("egraph_cycles_saved", 0.0))
+                if math.isfinite(saved):
+                    metrics["egraph_cycles_saved"] += saved
+            except Exception:
+                pass
         muts = entry.get("mutations_retained") or []
         for m in muts:
             metrics["total_mutations"] += 1
             ml = m.lower()
-            if "strength_mult" in ml or "floordiv" in ml or "strength_mod" in ml or "shift" in ml:
+            if "egraph" in ml or "eqsat" in ml:
+                pass  # Tracked in egraph_saturations
+            elif "strength_mult" in ml or "floordiv" in ml or "strength_mod" in ml or "shift" in ml:
                 metrics["strength_reductions"] += 1
             elif "constant_fold" in ml:
                 metrics["constant_folding"] += 1
@@ -215,6 +228,7 @@ def render_dashboard(limit_feed: int = 14) -> str:
     lines.append(f"  * Idiomas de Silicio & Bitwise Hardware (x % 2 -> x & 1):       {metrics['hardware_bitwise']:>5} mutacoes")
     lines.append(f"  * Poda de Codigo Morto (DCE Branch Elimination):                {metrics['dead_code_pruning']:>5} mutacoes")
     lines.append(f"  * Tunelamento Estocastico de Casimir-Langevin:                  {metrics['casimir_tunneling']:>5} mutacoes")
+    lines.append(f"  * Saturação de Igualdade E-Graph (egg/egglog style):            {metrics['egraph_saturations']:>5} geracoes ({metrics['egraph_cycles_saved']:.1f} ciclos poupados)")
     lines.append(f"  >>> TOTAL DE MUTACOES PRESERVADAS: {metrics['total_mutations']} provadas via Alive2 / Z3 QF_BV (0 regressoes)")
     lines.append("=" * 100)
     return "\n".join(lines)
