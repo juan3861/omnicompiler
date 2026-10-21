@@ -111,3 +111,8 @@ class MemoryRefinementVerifier:
             "refinement_verified": refinement_proven,
             "counterexamples": []
         }
+
+
+# Canonical Alias
+SeparationFrameEngine = MemoryRefinementVerifier
+

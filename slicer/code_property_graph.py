@@ -136,3 +136,19 @@ class CodePropertyGraph:
                             queue.append(path + [neighbor])
 
         return None
+
+    def find_tainted_reachability(self, start_id: int) -> Set[int]:
+        """Computes all nodes reachable from `start_id` via DDG_FLOW edges."""
+        reachable = set()
+        visited = set()
+        queue = [start_id]
+        while queue:
+            curr = queue.pop(0)
+            if curr not in visited:
+                visited.add(curr)
+                reachable.add(curr)
+                for neighbor, edge_kind in self.adj_out.get(curr, []):
+                    if edge_kind == "DDG_FLOW":
+                        queue.append(neighbor)
+        return reachable
+

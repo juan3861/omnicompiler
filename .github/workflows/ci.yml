@@ -54,3 +54,8 @@ jobs:
     - name: 6. Run Supreme Ceiling Audit (Omni-SSA IR, Native x86-64 JIT Silicon & CPG Taint)
       run: |
         python test_supreme_ceiling_audit.py
+
+    - name: 7. Run 12-Titans Supreme Maturity Benchmark (MCTS, Standalone Binary, Chaitin-Briggs)
+      run: |
+        python test_titans_supreme_benchmark.py
+

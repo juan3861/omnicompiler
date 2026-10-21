@@ -194,8 +194,8 @@ class NativeJitCompiler:
             # 48 39 fa  cmp rdx, rdi
             code.extend([0x48, 0x39, 0xFA])
 
-        # 7c f0  jl loop (-16 bytes)
-        code.extend([0x7C, 0xF0])
+        # 7c ea  jl loop (-22 bytes = 0xEA)
+        code.extend([0x7C, 0xEA])
         # c3     ret
         code.append(0xC3)
 
@@ -206,3 +206,8 @@ class NativeJitCompiler:
         fn_type = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_int64)
         callable_fn = fn_type(mem.ptr)
         return callable_fn, mem, raw_code.hex()
+
+
+# Canonical Alias
+NativeJITEngine = NativeJitCompiler
+

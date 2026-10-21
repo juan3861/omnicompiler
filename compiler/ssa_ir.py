@@ -135,3 +135,26 @@ class AstToSsaLowering:
         result_var = lower_node(expr_ast)
         entry.add_instruction(SSAInstruction(None, "ret", [result_var]))
         return fn
+
+
+def lower_ast_to_ssa(node: ast.AST, fn_name: str = "func", param_names: Optional[List[str]] = None) -> SSAFunction:
+    """Convenience helper to lower an AST function definition or expression to SSA."""
+    lowering = AstToSsaLowering()
+    if isinstance(node, ast.FunctionDef):
+        name = node.name
+        params = [arg.arg for arg in node.args.args]
+        # Return expression in body
+        for stmt in node.body:
+            if isinstance(stmt, ast.Return) and stmt.value:
+                return lowering.lower_expression_function(name, params, stmt.value)
+            elif isinstance(stmt, ast.Assign) and len(node.body) > 1 and isinstance(node.body[-1], ast.Return):
+                # Simple sequence lowering
+                pass
+        # Fallback to last return expression
+        ret_expr = [s.value for s in node.body if isinstance(s, ast.Return) and s.value]
+        if ret_expr:
+            return lowering.lower_expression_function(name, params, ret_expr[-1])
+        return lowering.lower_expression_function(name, params, ast.Constant(value=0))
+    else:
+        return lowering.lower_expression_function(fn_name, param_names or [], node)
+

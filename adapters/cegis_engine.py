@@ -37,12 +37,12 @@ class AdapterCegisSynthesizer:
         tokens = set(param_name.lower().split("_"))
         if tokens & {"tenant", "org", "account", "workspace"}:
             return "tenant"
-        if tokens & {"doc", "document", "item", "record", "order", "id"}:
-            return "identifier"
-        if tokens & {"content", "body", "payload", "text", "raw", "data", "message"}:
-            return "payload"
         if tokens & {"query", "q", "search", "filter"}:
             return "search"
+        if tokens & {"content", "body", "payload", "text", "raw", "data", "message"}:
+            return "payload"
+        if tokens & {"doc", "document", "item", "record", "order", "id"}:
+            return "identifier"
         return "generic"
 
     def synthesize_parameter_mapping(
@@ -141,7 +141,7 @@ class AdapterCegisSynthesizer:
             # Generate adversarial counterexample: test tenant boundary leak
             has_leak = False
             for callee_k, caller_v in candidate_mapping.items():
-                if "tenant" in caller_v.lower() and "tenant" not in callee_k.lower() and "org" not in callee_k.lower():
+                if self._get_category(caller_v) == "tenant" and self._get_category(callee_k) != "tenant":
                     # Counterexample found: tenant passed to non-tenant slot
                     has_leak = True
                     break
@@ -191,3 +191,8 @@ class AdapterCegisSynthesizer:
             f"        return self.target({args_str})\n"
         )
         return code
+
+
+# Canonical Alias
+CegisEngine = AdapterCegisSynthesizer
+
