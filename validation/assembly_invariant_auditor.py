@@ -75,37 +75,62 @@ class AssemblyInvariantAuditor:
 
         while i < n:
             # Check 48 83 EC <imm8> (sub rsp, imm8)
-            if i + 3 < n and code_bytes[i:i+3] == b"\x48\x83\xec":
-                imm = code_bytes[i+3]
-                stack_alloc += imm
-                i += 4
-                continue
+            if code_bytes[i:i+3] == b"\x48\x83\xec":
+                if i + 3 < n:
+                    imm = code_bytes[i+3]
+                    stack_alloc += imm
+                    i += 4
+                    continue
+                else:
+                    errors.append(f"Truncated sub rsp, imm8 instruction at offset {i}")
+                    i += 3
+                    continue
             # Check 48 81 EC <imm32> (sub rsp, imm32)
-            elif i + 6 < n and code_bytes[i:i+3] == b"\x48\x81\xec":
-                imm = struct.unpack("<I", code_bytes[i+3:i+7])[0]
-                stack_alloc += imm
-                i += 7
-                continue
+            elif code_bytes[i:i+3] == b"\x48\x81\xec":
+                if i + 6 < n:
+                    imm = struct.unpack("<I", code_bytes[i+3:i+7])[0]
+                    stack_alloc += imm
+                    i += 7
+                    continue
+                else:
+                    errors.append(f"Truncated sub rsp, imm32 instruction at offset {i}")
+                    i += 3
+                    continue
             # Check 48 83 C4 <imm8> (add rsp, imm8)
-            elif i + 3 < n and code_bytes[i:i+3] == b"\x48\x83\xc4":
-                imm = code_bytes[i+3]
-                stack_free += imm
-                i += 4
-                continue
+            elif code_bytes[i:i+3] == b"\x48\x83\xc4":
+                if i + 3 < n:
+                    imm = code_bytes[i+3]
+                    stack_free += imm
+                    i += 4
+                    continue
+                else:
+                    errors.append(f"Truncated add rsp, imm8 instruction at offset {i}")
+                    i += 3
+                    continue
             # Check 48 81 C4 <imm32> (add rsp, imm32)
-            elif i + 6 < n and code_bytes[i:i+3] == b"\x48\x81\xc4":
-                imm = struct.unpack("<I", code_bytes[i+3:i+7])[0]
-                stack_free += imm
-                i += 7
-                continue
+            elif code_bytes[i:i+3] == b"\x48\x81\xc4":
+                if i + 6 < n:
+                    imm = struct.unpack("<I", code_bytes[i+3:i+7])[0]
+                    stack_free += imm
+                    i += 7
+                    continue
+                else:
+                    errors.append(f"Truncated add rsp, imm32 instruction at offset {i}")
+                    i += 3
+                    continue
             # Check Call relative (E8 <disp32>)
-            elif code_bytes[i] == 0xE8 and i + 4 < n:
-                disp32 = struct.unpack("<i", code_bytes[i+1:i+5])[0]
-                if not (-0x80000000 <= disp32 <= 0x7FFFFFFF):
-                    branch_safe = False
-                    errors.append(f"Branch displacement out of 32-bit range at offset {i}: {disp32}")
-                i += 5
-                continue
+            elif code_bytes[i] == 0xE8:
+                if i + 4 < n:
+                    disp32 = struct.unpack("<i", code_bytes[i+1:i+5])[0]
+                    if not (-0x80000000 <= disp32 <= 0x7FFFFFFF):
+                        branch_safe = False
+                        errors.append(f"Branch displacement out of 32-bit range at offset {i}: {disp32}")
+                    i += 5
+                    continue
+                else:
+                    errors.append(f"Truncated call relative displacement at offset {i}")
+                    i += 1
+                    continue
 
             i += 1
 

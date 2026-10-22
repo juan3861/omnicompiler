@@ -1,0 +1,97 @@
+{
+  "manifest_version": "3.0.0",
+  "protocol": "ALPHA-C3",
+  "frozen_at": "2026-10-22T09:23:00Z",
+  "baseline_commit": "700ecbae2c7e156cadf71d3def08076ea6574bde",
+  "minimum_score_threshold": 95.0,
+  "scoring_weights": {
+    "functional_correctness": 30,
+    "reliability": 25,
+    "security": 15,
+    "integration_architecture": 15,
+    "measured_performance": 10,
+    "reproducibility_documentation": 5
+  },
+  "mandatory_gates": [
+    {
+      "id": "GATE-01-MANIFEST-TOPO",
+      "name": "Multi-Repo Ingestion & Topological Resolution",
+      "category": "functional_correctness",
+      "weight": 5,
+      "eliminatory": true,
+      "oracle": "DAG dependency resolution produces deterministic compile order with zero cycles."
+    },
+    {
+      "id": "GATE-02-THINLTO-SLICING",
+      "name": "Inter-Repository Dead Code Slicing",
+      "category": "functional_correctness",
+      "weight": 5,
+      "eliminatory": true,
+      "oracle": "Unreferenced symbols across repositories are pruned with symbol conservation (before == after + pruned)."
+    },
+    {
+      "id": "GATE-03-CPG-TAINT-ISOLATION",
+      "name": "Code Property Graph Tenant Isolation",
+      "category": "security",
+      "weight": 7.5,
+      "eliminatory": true,
+      "oracle": "Zero cross-tenant dataflow taint paths from confidential sources to public sinks."
+    },
+    {
+      "id": "GATE-04-UNIVERSAL-ABI-CEGIS",
+      "name": "Universal ABI Bridge & CEGIS Synthesis",
+      "category": "integration_architecture",
+      "weight": 7.5,
+      "eliminatory": true,
+      "oracle": "Windows x64 and System V AMD64 calling conventions correctly marshalled with stack alignment."
+    },
+    {
+      "id": "GATE-05-MACHINE-CODEGEN-LINKING",
+      "name": "Native Object Linking & Relocation",
+      "category": "functional_correctness",
+      "weight": 10,
+      "eliminatory": true,
+      "oracle": "Static linking applies REL32 and ADDR64 relocations across modules with 0 unresolved symbols."
+    },
+    {
+      "id": "GATE-06-CROSS-TARGET-EMISSION",
+      "name": "Universal Cross-Target Binary Emission",
+      "category": "integration_architecture",
+      "weight": 7.5,
+      "eliminatory": true,
+      "oracle": "Direct machine code emission of Windows PE32+ (x86-64/ARM64) and Linux ELF64 (x86-64/ARM64) standalone binaries and shared libraries without external toolchains."
+    },
+    {
+      "id": "GATE-07-SILICON-SAFETY-SANDBOX",
+      "name": "Pre-Flight Silicon Safety Sandbox",
+      "category": "security",
+      "weight": 7.5,
+      "eliminatory": true,
+      "oracle": "Unicorn x86-64 CPU emulation catches segmentation faults, null writes, and infinite loops prior to host execution."
+    },
+    {
+      "id": "GATE-08-FORMAL-BINARY-AUDIT",
+      "name": "Formal PE/ELF Structure Verification",
+      "category": "reliability",
+      "weight": 10,
+      "eliminatory": true,
+      "oracle": "pefile and pyelftools verify headers, sections, machine architectures, and export tables."
+    },
+    {
+      "id": "GATE-09-ADVERSARIAL-MUTATION-FUZZ",
+      "name": "Independent Adversarial Fuzzing & Mutation Gate",
+      "category": "reliability",
+      "weight": 15,
+      "eliminatory": true,
+      "oracle": "100% of injected mutants killed; property-based fuzzing with Hypothesis passes all invariants."
+    },
+    {
+      "id": "GATE-10-PERFORMANCE-RESOURCES",
+      "name": "Microarchitectural Benchmark & Memory Stability",
+      "category": "measured_performance",
+      "weight": 10,
+      "eliminatory": true,
+      "oracle": "x86-64 JIT achieves >100x speedup vs CPython; 0 memory leaks across 100 DLL Load/Free cycles (+0.00 MB delta)."
+    }
+  ]
+}
