@@ -141,6 +141,66 @@ class TestHostileBoundaryAdversarial(unittest.TestCase):
         self.assertFalse(res.is_safe_for_silicon, "Silicon sandbox failed to trap division by zero!")
         self.assertFalse(res.success)
 
+    def test_adversarial_relocation_out_of_bounds_raises_specific_error(self):
+        """Hostile Test 9: RelocationOutOfBoundsError is strictly raised on section overflow."""
+        from compiler.object_linker import RelocationOutOfBoundsError
+        linker = NativeObjectLinker()
+        mod = ObjectModule("mod_boundary")
+        mod.add_symbol("f", b"\xb8\x00\x00\x00\x00\xc3")  # 6 bytes
+        # Relocation offset 5 + 4 bytes = 9 > 6
+        mod.relocations.append(RelocationEntry(
+            section=".text",
+            offset=5,
+            symbol_name="f",
+            reloc_type="REL32"
+        ))
+        linker.add_module(mod)
+        with self.assertRaises(RelocationOutOfBoundsError):
+            linker.link()
+
+    def test_adversarial_audit_ledger_tampering_and_types(self):
+        """Hostile Test 10: Audit ledger rejects empty nonces, None runners, and invalid types."""
+        from compiler.audit_ledger import verify_audit_ledger
+        # Missing/empty nonce
+        bad_ledger = {
+            "audit_nonce": "",
+            "runner_id": "RUNNER-1",
+            "builder_session_id": "SESSION-1",
+            "verified": True,
+            "trusted_runner": True,
+            "hmac_signature": "dummy"
+        }
+        ok, msg = verify_audit_ledger(bad_ledger)
+        self.assertFalse(ok)
+        self.assertIn("audit_nonce", msg)
+
+        # Non-boolean verified
+        bad_ledger2 = {
+            "audit_nonce": "NONCE-1",
+            "runner_id": "RUNNER-1",
+            "builder_session_id": "SESSION-1",
+            "verified": 1,  # int 1 instead of literal True
+            "trusted_runner": True,
+            "hmac_signature": "dummy"
+        }
+        ok2, msg2 = verify_audit_ledger(bad_ledger2)
+        self.assertFalse(ok2)
+        self.assertIn("must be boolean True", msg2)
+
+    def test_adversarial_binary_structure_corrupted_header(self):
+        """Hostile Test 11: BinaryStructureAuditor rejects truncated/corrupted ELF/PE headers."""
+        from validation.binary_structure_auditor import BinaryStructureAuditor
+        auditor = BinaryStructureAuditor()
+        # Truncated ELF header
+        corrupt_elf = b"\x7fELF\x02\x01\x01"
+        rep = auditor.audit_binary(corrupt_elf)
+        self.assertFalse(rep.is_valid)
+
+        # Truncated PE header
+        corrupt_pe = b"MZ\x90\x00\x03\x00\x00\x00"
+        rep_pe = auditor.audit_binary(corrupt_pe)
+        self.assertFalse(rep_pe.is_valid)
+
 
 if __name__ == "__main__":
     unittest.main()

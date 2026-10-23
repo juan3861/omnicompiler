@@ -1,48 +1,40 @@
-# CONSENSUS DECISION RECORD — ALPHA-C PROTOCOL
-**Decision ID:** `DEC-OMNI-003`  
-**Protocol:** ALPHA-C (Epistemically Controlled Simulated Consensus C0–C7)  
-**Baseline Commit:** `700ecbae2c7e156cadf71d3def08076ea6574bde`  
-**Date:** 2026-10-22  
-**Activation Reason:** Requirement for universal cross-compilation target selection (`--target-os`, `--arch`, `--format`) versus formal relocation overflow protection and dual-target verification.  
+# CONSENSUS DECISION RECORD (DEC-OMNI-004)
+**Protocol:** MASTER PROMPT ALPHA-C5 (Epistemic Consensus & Governance)  
+**Date:** 2026-10-23  
+**Audit Nonce:** `NONCE-C5-20261023-OMNI01`  
+**Status:** CONSENSUS REACHED  
 
 ---
 
-### 1. Perspectives & Initial Evaluations (Prior to Deliberation)
-
-#### AGI Lens (Short-Term Execution, Practical Utility & Direct Value)
-- **Position:** Implement dynamic CLI target flags in `omnicompiler_cli.py` (`--format {shared_lib,executable}`, `--target-os {windows,linux}`, `--arch {x86_64,arm64}`) and connect them to `OmniRepoCompiler.compile_repositories`.
-- **Argument:** Users and automated harnesses currently cannot specify cross-compilation targets via the CLI without modifying source files. Exposing explicit CLI targets makes OmniCompiler immediately usable as a universal drop-in cross-compiler from Windows to Linux and ARM64.
-- **Identified Risk:** Potential generation of foreign binary formats (e.g., Linux ELF64 or ARM64 on a Windows host) that cannot be executed via native host `ctypes` without throwing an `OSError`.
-
-#### ASI Lens (Systemic Robustness, Second-Order Invariants & Risk Governance)
-- **Position:** Enforce pre-flight validation invariants on all emitted cross-target binaries: relocate displacement checking ($|\text{disp32}| \le 2^{31}-1$), structural format inspection via `pefile` and `pyelftools`, and fallback to virtual CPU silicon emulation (Unicorn) when host execution is physically impossible due to foreign architecture.
-- **Argument:** Emitting a binary that cannot be verified on the local host creates an `UNKNOWN` evidence gap unless a virtual execution oracle (Unicorn sandbox) or structural validator (`pyelftools`) validates the emitted machine code.
-- **Identified Risk:** Overhead of running multiple formal analyzers and emulators on every single compile command.
+### Decision Context
+OmniCompiler requires an integrated provenance mechanism and hardened section relocation checks to fulfill Protocol ALPHA-C5:
+1. Every compilation artifact should be cryptographically bound to its source inputs, toolchain invariants, formal verification proofs, and run nonce.
+2. The object linker must enforce rigid section boundary invariants during symbol relocation fixups.
 
 ---
 
-### 2. Decision Matrix & Multi-Criteria Trade-offs
+### Divergent Perspectives
 
-| Criterion | Weight | Option 1 (AGI: CLI Targets Only) | Option 2 (ASI: Reloc Invariants Only) | Option 3 (Consensus Synthesis) |
-| :--- | :--- | :--- | :--- | :--- |
-| **Immediate Practical Utility** | 25% | 95 | 70 | 95 |
-| **Microarchitectural Soundness** | 25% | 75 | 95 | 95 |
-| **Cross-Platform Verification** | 20% | 70 | 90 | 95 |
-| **Implementation Simplicity** | 15% | 90 | 80 | 85 |
-| **Security & Safety Invariants** | 10% | 80 | 95 | 95 |
-| **Reversibility** | 5% | 95 | 95 | 95 |
-| **Weighted Total** | **100%** | **81.75** | **85.75** | **94.00** |
+#### Perspective 1: The AGI Lens (Pragmatic Systems Engineering)
+- **Stance:** Cryptographic overhead must not degrade compilation throughput. The audit ledger must be a zero-dependency, self-contained JSON/HMAC structure emitted alongside or embedded within the binary metadata.
+- **Relocation Safety:** Relocation bounds checking should prevent obvious heap buffer overflows and corrupt offset calculations during static linking without requiring heavyweight symbolic execution during each link step.
+- **CLI Ergonomics:** The compiler CLI must offer a dedicated `--verify-ledger` or `audit-attest` subcommand so that continuous integration systems can validate compilation authenticity in sub-millisecond time.
 
----
-
-### 3. Falsifiable Hypothesis & Discriminator Test
-- **Hypothesis:** Exposing `--target-os {windows,linux}`, `--arch {x86_64,arm64}`, and `--format {shared_lib,executable}` in `omnicompiler_cli.py` and `omni_repo_compiler.py`, coupled with automated dispatch to `BinaryStructureAuditor` (`pefile`/`pyelftools`) and `SiliconSafetySandbox` (Unicorn x86-64), will enable 100% verified cross-target binary emission with 0 host crashes and zero Python runtime dependencies.
-- **Discriminator Test:** Compile both a Windows PE32+ `.exe` and a Linux ELF64 standalone binary from the CLI, inspect their file headers via `pefile` and `pyelftools`, and execute the native host binary directly to verify mathematical output `175`.
+#### Perspective 2: The ASI Lens (Formal Completeness & Zero-Trust Invariants)
+- **Stance:** Every emitted byte in a binary must be accounted for by a mathematical invariant. Merely emitting a log is insufficient; the ledger must compute a Merkle tree of input files, verify that the SHA-256 of the binary matches the signed receipt, and guarantee that the audit nonce cannot be replayed or forged.
+- **Relocation Bounds:** Any relocation pointing outside `[section.offset, section.offset + section.size]` or violating target machine alignment (4-byte alignment for code branches, 8-byte alignment for 64-bit pointers) is a critical integrity violation that must immediately halt the pipeline before binary emission.
+- **Strict Precedence:** Invariant verification failures must strictly precede all score calculations. If a ledger signature fails or a relocation is out of bounds, the status is irrevocably `REJECTED`.
 
 ---
 
-### 4. Consensus Decision
-- **Verdict:** `AGREED` on Option 3 (Consensus Synthesis).
-- **Owner:** Agent 1 (Principal Builder).
-- **Auditor Role:** Agent 2 (Adversarial Auditor) remains completely isolated and evaluates the resulting code and evidence independently without co-authoring the implementation.
-- **Rollback Condition:** Revert to commit `700ecbae2c7e156cadf71d3def08076ea6574bde` if any regression occurs in the 53 existing unit tests or if cross-target emission fails structural verification.
+### Epistemic Synthesis & Final Invariants
+1. **Module `compiler/audit_ledger.py`:**
+   - Generates `CompilationAuditLedger` containing `audit_nonce`, `timestamp_iso`, `builder_session_id`, `runner_id`, `source_merkle_root`, `target_config` (OS, arch, format), `binary_hash_sha256`, `section_hashes`, `formal_proofs_passed`, and `hmac_signature`.
+   - Provides `verify_audit_receipt(receipt_dict, binary_bytes, secret_key=None) -> (bool, str)` with strict fail-closed validation.
+2. **Hardened Object Linker (`compiler/object_linker.py`):**
+   - Implements `validate_relocation_bounds(relocation, section_size)` ensuring `reloc.offset + reloc.size <= section_size` and proper alignment.
+   - Throws `RelocationOutOfBoundsError` on invariant violation.
+3. **CLI Integration (`omnicompiler_cli.py`):**
+   - Adds `--sign-ledger` and `audit-attest` commands.
+4. **Adversarial Audit Tests:**
+   - Added to test suite: verifying ledger signature verification, detecting tampered receipts, catching out-of-bounds relocations, and verifying alignment.

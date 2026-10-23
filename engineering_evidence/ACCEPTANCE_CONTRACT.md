@@ -1,104 +1,99 @@
-# ACCEPTANCE CONTRACT — SCOPE FREEZE ALPHA-C3
-**Protocol:** Dual-Agent Evidence-Driven Engineering (ALPHA-C3 Consensus & Independent Adversarial Audit)  
-**Version:** 3.0.0 (FROZEN)  
-**Contract Signature:** SHA-256 (Locked at initialization)  
-**Date:** 2026-10-22  
+# ACCEPTANCE CONTRACT — SCOPE FREEZE ALPHA-C5
+**Protocol:** Dual-Agent Evidence-Driven Engineering (ALPHA-C5 Epistemic Consensus, Bound Identity & Authenticated Evidence Ledger)  
+**Version:** 5.0.0 (FROZEN)  
+**Intensity Classification (C5.1):** `SUBSYSTEM` Tier (Compiler Subsystem Hardening: Cryptographic Audit Ledger, Section Relocation Boundary Verification, and Nonce-Gated Provenance)  
+**Audit Nonce (C5.2):** `NONCE-C5-20261023-OMNI01`  
+**Builder Session ID:** `SESSION-BUILDER-C5-c406d4a9`  
+**Auditor Session ID:** `SESSION-AUDITOR-C5-46437d19`  
+**Trusted Runner ID:** `RUNNER-TRUSTED-CPYTHON311-WIN64`  
+**Baseline Commit:** `e171684e27f67adcf997bf9b794b6cefb548c8b6`  
+**Date:** 2026-10-23  
 
 ---
 
 ### 1. Canonical Workspace & Baseline Commit
 - **Repository:** `F:\repository-compiler` (`omnicompiler`)
-- **Initial Baseline Commit:** `700ecbae2c7e156cadf71d3def08076ea6574bde`
+- **Initial Baseline Commit:** `e171684e27f67adcf997bf9b794b6cefb548c8b6`
 - **Pre-existing Local State:** Clean working tree, fully synced with `origin/main`.
 - **Target Remote:** `https://github.com/juan3861/omnicompiler.git`
 
 ---
 
-### 2. Objective, Domain, Users & Explicit Scope Boundaries
-- **Primary Objective:** Upgrade OmniCompiler under Protocol ALPHA-C3 into a universal, multi-target, polyglot compiler engine capable of cross-target compilation (Windows PE32+ x86-64/ARM64 and Linux ELF64 x86-64/ARM64) for standalone executables and shared libraries, with formal silicon safety emulation, ThinLTO dead-code slicing, persistent CPG taint tracking, e-graph equality saturation, and independent adversarial falsification.
-- **Domain:** Compiler Engineering, Binary Linkers (PE/COFF & ELF), SMT Refinement, Microarchitectural Superoptimization, Sandboxing (Unicorn, Wasmtime).
-- **Intended Users:** Systems programmers, compiler engineers, automated code-generation agents, formal verification researchers.
-- **Mandatory Capabilities:**
-  1. Universal CLI (`omnicompiler_cli.py`) supporting cross-target compilation (`--format {shared_lib,executable}`, `--target-os {windows,linux}`, `--arch {x86_64,arm64}`).
-  2. Multi-repository manifest ingestion with topological dependency resolution.
-  3. ThinLTO program dependence graph slicing (dead-code elimination).
-  4. Persistent Code Property Graph (CPG) with cross-repo taint flow tracking and tenant isolation.
-  5. Universal ABI Bridge (Windows x64 $\leftrightarrow$ System V AMD64) with struct alignment and CEGIS parameter synthesis.
-  6. Direct machine-code native object linking (`REL32` and `ADDR64` relocations) without external toolchains.
-  7. Dual-target binary emission: PE32+ (x86-64 & ARM64) and ELF64 (x86-64 & ARM64) for both shared libraries and standalone executables.
-  8. Pre-flight silicon safety validation via Unicorn CPU emulation sandbox.
-  9. Formal binary specification auditor (`pefile` & `pyelftools`).
-  10. Independent adversarial audit with property fuzzing, mutation fault injection, and holdout testing.
-- **Explicit Scope Boundaries:** Confined strictly to `F:\repository-compiler` and the designated evidence artifacts directory. No modification of external repositories or user workspace.
+### 2. Adaptive Intensity Tier Classification (C5.1)
+- **Assigned Tier:** `SUBSYSTEM`
+- **Technical Justification:** OmniCompiler's core compiler pipeline (multi-repo ingestion, slicing, persistent CPG, ABI synthesis, native code generation, PE/ELF emission, Unicorn CPU emulation, and LLVM/Wasm backends) is established and verified. The current cycle hardens the compiler with an integrated cryptographic audit ledger (`compiler/audit_ledger.py`), enforces strict section boundary invariants during object relocation (`compiler/object_linker.py`), integrates CLI audit attestation, and validates all evidence receipts through nonce-bound identity attestation under Section 8B and C5.2–C5.7.
 
 ---
 
-### 3. Environment, Architecture, Interfaces & Technical Constraints
+### 3. Objective, Domain, Users & Explicit Scope Boundaries
+- **Primary Objective:** Upgrade OmniCompiler under Protocol ALPHA-C5 to embed authenticated cryptographic audit ledgers into compiled multi-repo artifacts, harden native object linking with strict section relocation bounds, enforce formal PE/ELF section alignment invariants, and execute dual-agent adversarial falsification with inventory closure.
+- **Domain:** Compiler Engineering, Binary Linkers (PE/COFF & ELF), Cryptographic Provenance Ledgers, SMT Refinement, Sandboxing (Unicorn, Wasmtime).
+- **Intended Users:** Systems programmers, compiler engineers, automated code-generation agents, formal verification researchers.
+- **Mandatory Capabilities (11 Gates):**
+  1. `GATE-01-MANIFEST-TOPO`: Multi-repo manifest ingestion with topological dependency resolution.
+  2. `GATE-02-THINLTO-SLICING`: Inter-repository dead-code slicing with symbol conservation.
+  3. `GATE-03-MACHINE-CODEGEN-LINKING`: Native object linking and relocation with strict boundary checks.
+  4. `GATE-04-FORMAL-BINARY-AUDIT`: Formal PE/ELF structure and section alignment verification (`pefile`, `pyelftools`).
+  5. `GATE-05-ADVERSARIAL-MUTATION-FUZZ`: Independent adversarial mutation testing (11/11 mutants killed) & Hypothesis fuzzing.
+  6. `GATE-06-CPG-TAINT-ISOLATION`: Persistent Code Property Graph tenant isolation and taint tracking.
+  7. `GATE-07-SILICON-SAFETY-SANDBOX`: Pre-flight silicon safety sandbox via Unicorn CPU emulation.
+  8. `GATE-08-UNIVERSAL-ABI-CEGIS`: Universal ABI Bridge (Windows x64 $\leftrightarrow$ System V AMD64) with CEGIS parameter synthesis.
+  9. `GATE-09-CROSS-TARGET-EMISSION`: Direct machine-code emission for PE32+ (x86-64/ARM64) and ELF64 (x86-64/ARM64) shared libraries and executables.
+  10. `GATE-10-PERFORMANCE-RESOURCES`: Microarchitectural benchmark (>100x speedup vs CPython, 0 memory leaks across 100 cycles).
+  11. `GATE-11-CRYPTO-AUDIT-LEDGER`: Embedded cryptographic audit ledger with HMAC/SHA-256 signatures, nonce verification, and CLI audit attestation.
+- **Explicit Scope Boundaries:** Confined strictly to `F:\repository-compiler` and the engineering evidence artifacts.
+
+---
+
+### 4. Environment, Architecture, Interfaces & Technical Constraints
 - **Execution Platform:** Windows 10/11 x64 host with cross-compilation capability for System V AMD64, Linux ELF64, Windows ARM64, and Linux ARM64.
 - **Python Version:** Python 3.11 (`C:\Users\juanp\AppData\Local\Programs\Python\Python311\python.exe`).
 - **Core Technology Stack:**
   - Solvers: `z3-solver` (4.13.0.0), `clingo` (5.8.2).
-  - Parsing: `tree-sitter` (0.25.2), `tree-sitter-language-pack` (0.13.0), `libcst` (1.9.0).
-  - Compilation & Emulation: `llvmlite` (0.47.0), `wasmtime` (49.0.0), `unicorn` (2.1.4).
-  - Binary Inspection: `pefile` (2024.8.26), `pyelftools` (0.33), `pypcode` (3.3.3).
-  - Property & Fuzz Testing: `hypothesis` (6.170.2).
-- **Constraints:** Freestanding binary generation with zero external compiler dependencies (no GCC, Clang, or MSVC required at runtime).
+  - Emulators & Sandboxes: `unicorn` (2.1.4), `wasmtime` (49.0.0).
+  - Code Generation: `llvmlite` (0.47.0), direct x86-64/AArch64 machine-code emitter.
+  - Binary Parsers: `pefile` (2024.8.26), `pyelftools` (0.33).
+  - Fuzzing & Property Testing: `hypothesis` (6.170.2).
+  - Cryptography: `hashlib`, `hmac` (SHA-256).
 
 ---
 
-### 4. Threat Model, Licensing, Privacy & Security
-- **Licenses:** All reused components MUST be permissive open-source (MIT, Apache-2.0, BSD-2-Clause, Public Domain). AGPL and restrictive proprietary licenses are strictly rejected.
-- **Supply Chain Integrity:** All third-party imports must be validated for provenance and pinned versions.
-- **Sandbox Security:** Emitted machine code must undergo pre-flight execution in the Unicorn virtual CPU sandbox before physical silicon execution.
-- **Tenant Isolation:** Persistent CPG must enforce mathematical separation of multi-tenant data flows (zero cross-tenant taint leaks).
+### 5. Scoring Weights & Strict Precedence (ALPHA-C4 Section 8B & ALPHA-C5 C5.4)
+- **Weight Distribution (Total 100 points):**
+  - Functional Correctness: 30 pts (Gates 1, 2, 3)
+  - Reliability: 25 pts (Gates 4, 5)
+  - Security: 15 pts (Gates 6, 7)
+  - Integration & Architecture: 15 pts (Gates 8, 9)
+  - Measured Performance: 10 pts (Gate 10)
+  - Reproducibility & Documentation: 5 pts (Gate 11)
+- **Approval Threshold:** Total Score $\ge 95.0 / 100$.
+- **Strict Precedence Rule:**
+  1. Any authentic eliminatory `FAIL` $\implies$ **REJECTED** immediately.
+  2. Any unverified or missing mandatory gate $\implies$ **BLOCKED**.
+  3. Only with all 11 gates at verified `PASS` $\implies$ Calculate score via deterministic formula:
+     $$\text{Final Score} = \sum_{i=1}^{11} (\text{Gate Pass}_i \times \text{Weight}_i)$$
+  4. If $\text{Final Score} \ge 95.0 \implies$ **APPROVED**.
 
 ---
 
-### 5. Functional, Performance, Integrity & Resource Baseline
-- **Baseline Unit Tests:** 53 unit tests passing in $< 10.0$ seconds.
-- **Baseline CI Pipeline:** 100% green on Windows and Ubuntu (`39686715181`).
-- **Baseline Stress Protocol:** 3 consecutive clean rounds with 0 bottlenecks, 0 malfunctions, and +0.00 MB memory delta across 100 DLL LoadLibrary/FreeLibrary cycles.
-- **Baseline Latency:**
-  - Native x86-64 JIT: $0.60\text{ ms}$ for 1M iterations ($279.1\times$ faster than CPython).
-  - AlphaDev MCTS: $6.0\times$ to $19.0\times$ speedup on arithmetic kernels.
-  - Chaitin-Briggs Graph Coloring: 0 spills with 10 variables in SSA live range.
-  - Unicorn Pre-flight: $< 2.0\text{ ms}$ per function.
-  - Formal PE/ELF Audit: $< 1.0\text{ ms}$ per binary.
+### 6. Inventory Closure (C5.3) & Authenticated Evidence Chain (C5.2)
+- All evidence receipts must be generated with `audit_nonce = "NONCE-C5-20261023-OMNI01"`.
+- Every gate must have a closed receipt in `EVIDENCE_LEDGER.md`.
+- No cherry-picking PASS receipts. Any legitimate failure in an eliminatory gate forces REJECTED.
+- Receipts must bind:
+  - `gate_id`
+  - `status` (`PASS`, `FAIL`, `UNKNOWN`)
+  - `audit_nonce`
+  - `session_id`
+  - `runner_id`
+  - `verified`: literal `True` (boolean)
+  - `trusted_runner`: literal `True` (boolean)
+  - `artifact_hash` (SHA-256)
+  - `timestamp_iso`
 
 ---
 
-### 6. Success Metrics, Tolerances & Disqualifying Criteria
-- **Eliminatory Criteria (Immediate REJECTED):**
-  1. Any regression in the 53 existing test suites or the CI gates.
-  2. Any access violation, segmentation fault, or unhandled exception during pre-flight or host execution.
-  3. Any license violation (e.g. AGPL contamination).
-  4. Any fabricated benchmark, mock bypass, or self-awarded score.
-- **Success Threshold:**
-  - $100\%$ PASS on all mandatory functional requirements.
-  - Weighted evaluation score $\ge 95/100$ awarded by the Independent Adversarial Auditor.
-
----
-
-### 7. Authorized Tools & Credentials
-- **Tools:** Git, Python 3.11, Unittest/Pytest, Hypothesis, GitHub CLI (`gh`), PowerShell.
-- **Permissions:** Full local read/write access to `F:\repository-compiler` and artifacts directory.
-- **Prohibitions:** No access or modification to private credentials, user documents, or external workspaces.
-
----
-
-### 8. Operational Budget & Bounds
-- **Time/Execution Budget:** Maximum 5 iterative discovery and integration loops.
-- **Storage Budget:** Artifacts and candidate files bounded to $< 50\text{ MB}$.
-- **Process Concurrency:** Bounded subprocesses; clean handle release (`FreeLibrary` / `close()`).
-
----
-
-### 9. Mandatory Evidence Receipt Structure & Audit Independence
-- **Evidence Receipt Schema:**
-  - `gate_id`: Specific requirement ID from ACCEPTANCE_MANIFEST.
-  - `command`: Full CLI invocation string.
-  - `working_dir`: Exact execution directory.
-  - `exit_code`: Numeric return code ($0 = \text{success}$).
-  - `stdout_hash` / `stderr`: Captured logs and output samples.
-  - `timestamp`: UTC timestamp.
-- **Independence:** Agent 2 (Adversarial Auditor) executes independent property tests, mutation analysis, and state invariant checks in a dedicated subagent context with clean session lineage.
+### 7. Governance, Anti-Gaming & Budget
+- **Dual-Agent Isolation:** Builder (Agent 1) implements features and local verification (`LOCAL_TEST_PASS`). Independent Adversarial Auditor (Agent 2 - Subagent) independently validates, runs adversarial mutations, and issues binding verdict (`APPROVED` / `REJECTED` / `BLOCKED`).
+- **Anti-Gaming:** No mock bypasses, no hardcoded benchmark inputs, no altered timeouts, no self-attested score by Agent 1.
+- **Budget Ceiling:** Max 15 minutes test execution, zero cost API tokens (local compute).

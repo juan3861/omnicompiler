@@ -137,7 +137,22 @@ class NativeObjectLinker:
                     continue
 
                 target_offset = global_symbol_table[target_sym]
+                if reloc.offset < 0:
+                    raise RelocationOutOfBoundsError(
+                        f"Negative relocation offset {reloc.offset} in module {mod.repo_name}"
+                    )
+
                 patch_offset = mod_offset + reloc.offset
+                reloc_size = 4 if reloc.reloc_type == "REL32" else 8
+                if patch_offset + reloc_size > len(combined_text):
+                    raise RelocationOutOfBoundsError(
+                        f"Relocation slot [{patch_offset}..{patch_offset + reloc_size}] exceeds combined .text bounds ({len(combined_text)}) in module {mod.repo_name}"
+                    )
+
+                if target_offset < 0 or target_offset >= len(combined_text):
+                    raise RelocationOutOfBoundsError(
+                        f"Relocation target symbol '{target_sym}' at offset {target_offset} is outside valid .text bounds [0..{len(combined_text)})"
+                    )
 
                 if reloc.reloc_type == "REL32":
                     # E8 <disp32>: next instruction is at patch_offset + 4
@@ -199,4 +214,9 @@ class NativeObjectLinker:
 
 
 class LinkerError(Exception):
+    pass
+
+
+class RelocationOutOfBoundsError(LinkerError):
+    """Raised when a relocation offset, slot, or target falls outside valid section boundaries."""
     pass

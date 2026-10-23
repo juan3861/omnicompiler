@@ -119,12 +119,21 @@ class BinaryStructureAuditor:
         is_dll = bool(chars & pefile.IMAGE_CHARACTERISTICS["IMAGE_FILE_DLL"])
         bin_type = "shared_library" if is_dll else "executable"
 
-        # 4. Sections Audit
+        # 4. Sections Audit & Section Alignment Verification
+        sec_align = pe.OPTIONAL_HEADER.SectionAlignment
+        file_align = pe.OPTIONAL_HEADER.FileAlignment
+        if sec_align < file_align:
+            warnings.append(f"SectionAlignment ({sec_align}) is less than FileAlignment ({file_align})")
+
         for sec in pe.sections:
             sec_name = sec.Name.decode("utf-8", errors="ignore").rstrip("\x00")
             sections.append(sec_name)
             if sec.SizeOfRawData == 0 and sec.Misc_VirtualSize == 0:
                 warnings.append(f"Section {sec_name} has zero raw and virtual size.")
+            if sec_align > 0 and (sec.VirtualAddress % sec_align != 0):
+                warnings.append(f"Section {sec_name} VirtualAddress (0x{sec.VirtualAddress:x}) not aligned to SectionAlignment (0x{sec_align:x})")
+            if file_align > 0 and (sec.PointerToRawData % file_align != 0):
+                warnings.append(f"Section {sec_name} PointerToRawData (0x{sec.PointerToRawData:x}) not aligned to FileAlignment (0x{file_align:x})")
 
         # 5. Export Directory Audit
         if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
@@ -218,7 +227,12 @@ class BinaryStructureAuditor:
         else:
             bin_type = str(e_type)
 
-        # 2. Sections
+        # 2. Sections & Segment Alignments
+        for seg in elf.iter_segments():
+            p_align = seg["p_align"]
+            if p_align > 1 and (p_align & (p_align - 1)) != 0:
+                warnings.append(f"Segment alignment {p_align} is not a power of two")
+
         for s in elf.iter_sections():
             name = s.name
             if name:
