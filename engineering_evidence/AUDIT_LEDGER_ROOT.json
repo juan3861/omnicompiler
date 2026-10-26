@@ -1,0 +1,38 @@
+{
+  "audit_nonce": "NONCE-C7-20261026-DISCOVERY100",
+  "auditor_session_id": "SESSION-AUDITOR-C7-46437d19",
+  "baseline_commit": "d743d404d49a37a7b8e1a7ba313faea4bc01c6e1",
+  "builder_session_id": "SESSION-BUILDER-C7-c406d4a9",
+  "emitted_binaries": {
+    "linux_elf64_exe": {
+      "path": "dist/omnicompiler_unified_linux_x86_64_executable",
+      "sha256": "83db19f282c1320301597c8ede54e3390ff23f822f9d49f6e0d277c250b8ef17",
+      "size": 283
+    },
+    "macos_macho64_exe": {
+      "path": "dist/omnicompiler_unified_macos_x86_64_executable",
+      "sha256": "6b1229bcdbf0411edeeba6164ca0b0d2b0f439e5c9503d48f66f807fa1986255",
+      "size": 4168
+    },
+    "windows_pe32_dll": {
+      "path": "dist/omnicompiler_unified_windows_x86_64_shared_lib.dll",
+      "sha256": "b48ef3a6189000f5658e582fe8bf9245ac86b7c353fe6003060c7ff751809f7f",
+      "size": 1536
+    }
+  },
+  "formal_proofs_passed": {
+    "assembly_invariants": true,
+    "heap_biabduction": true,
+    "macho_spec_audit": true,
+    "silicon_safety": true,
+    "structural_audit": true
+  },
+  "hmac_signature": "e1476b45e26c0b7ef7edcb8accbe5829eceeff0472e93d7b8d37d7b8674c06cc",
+  "ledger_version": "1.0.0",
+  "protocol": "MASTER PROMPT ALPHA-C7 DISCOVERY-100",
+  "runner_id": "RUNNER-TRUSTED-CPYTHON311-WIN64",
+  "source_merkle_root": "8e78c546a885d6bd632ddae20d99ba713e34118d35ed7b590d5c8ad990118e6f",
+  "timestamp_iso": "2026-10-26T04:20:00Z",
+  "trusted_runner": true,
+  "verified": true
+}

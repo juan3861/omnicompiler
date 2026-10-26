@@ -243,14 +243,21 @@ class OmniRepoCompiler:
         # Stage 7: Binary Emission
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         if target_format == "shared_lib":
-            resolved_fmt = "pe_dll" if effective_os == "windows" else "elf_so"
+            if effective_os == "windows":
+                resolved_fmt = "pe_dll"
+            elif effective_os == "macos":
+                resolved_fmt = "macho_dylib"
+            else:
+                resolved_fmt = "elf_so"
             artifact_path = self.linker.emit_linked_shared_library(
                 output_path=output_path,
                 export_name=entry_export,
                 target_format=resolved_fmt
             )
         else:
-            if effective_arch == "arm64":
+            if effective_os == "macos":
+                resolved_fmt = "arm64_macho" if effective_arch == "arm64" else "macho64"
+            elif effective_arch == "arm64":
                 resolved_fmt = "arm64_pe" if effective_os == "windows" else "arm64_elf"
             else:
                 resolved_fmt = "pe64" if effective_os == "windows" else "elf64"
@@ -316,7 +323,7 @@ def main():
     parser.add_argument("--repos", required=True, help="Comma-separated repository directories to compile")
     parser.add_argument("--output", required=True, help="Output binary or shared library path")
     parser.add_argument("--format", default="shared_lib", choices=["shared_lib", "executable"], help="Target format")
-    parser.add_argument("--target-os", choices=["windows", "linux"], help="Target operating system")
+    parser.add_argument("--target-os", choices=["windows", "linux", "macos"], help="Target operating system")
     parser.add_argument("--arch", choices=["x86_64", "arm64"], default="x86_64", help="Target architecture")
     parser.add_argument("--entry", default="omni_main", help="Exported entrypoint name")
     parser.add_argument("--audit-nonce", default="NONCE-C5-20261023-OMNI01", help="Audit nonce for provenance ledger")

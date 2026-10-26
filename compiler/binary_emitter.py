@@ -676,6 +676,185 @@ class StandaloneBinaryEmitter:
         return headers + raw_code
 
     # =========================================================================
+    # MACH-O 64-BIT (macOS x86-64 & Apple Silicon ARM64) EMITTERS
+    # =========================================================================
+
+    def build_macho64(
+        self,
+        exit_code: int = 0,
+        custom_code: Optional[bytes] = None,
+        arch: str = "x86_64",
+        entry_offset: Optional[int] = None
+    ) -> bytes:
+        """
+        Synthesizes a 64-bit Mach-O standalone executable (MH_EXECUTE) for macOS.
+        Supports both x86-64 and Apple Silicon ARM64 architectures.
+        Zero external dependencies: direct binary machine-code emission.
+        """
+        is_arm64 = (arch.lower() in ("arm64", "aarch64"))
+        cpu_type = 0x0100000C if is_arm64 else 0x01000007
+        cpu_subtype = 0x00000000 if is_arm64 else 0x80000003
+
+        if custom_code is not None:
+            raw_code = custom_code
+        else:
+            if is_arm64:
+                # mov x0, exit_code ; mov x16, 1 (sys_exit) ; svc 0x80
+                val = exit_code & 0xFFFF
+                mov_x0 = struct.pack("<I", 0xD2800000 | (val << 5))
+                mov_x16 = struct.pack("<I", 0xD2800000 | (1 << 5) | 16)
+                svc = struct.pack("<I", 0xD4001001)
+                raw_code = mov_x0 + mov_x16 + svc
+            else:
+                # mov edi, exit_code ; mov eax, 0x2000001 (sys_exit bsd) ; syscall
+                raw_code = struct.pack("<BII", 0xBF, exit_code, 0)
+                raw_code += b"\xb8\x01\x00\x00\x02\x0f\x05"
+
+        page_size = 0x4000 if is_arm64 else 0x1000
+        cmd1_size = 72
+        cmd2_size = 72 + 80
+        cmd3_size = 24
+        sizeofcmds = cmd1_size + cmd2_size + cmd3_size
+        ncmds = 3
+
+        header = struct.pack(
+            "<IIIIIIII",
+            0xFEEDFACF,
+            cpu_type,
+            cpu_subtype,
+            0x2,        # MH_EXECUTE
+            ncmds,
+            sizeofcmds,
+            0x00200085, # MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+            0
+        )
+
+        code_offset = page_size
+        code_vaddr = 0x100000000 + code_offset
+
+        # 1. __PAGEZERO
+        pagezero_vmsize = 0x100000000
+        cmd_pagezero = struct.pack(
+            "<II16sQQQQIIII",
+            0x19, cmd1_size, b"__PAGEZERO\x00\x00\x00\x00\x00\x00",
+            0, pagezero_vmsize,
+            0, 0,
+            0, 0,
+            0, 0
+        )
+
+        # 2. __TEXT + __text
+        text_vmsize = page_size * 2
+        text_filesize = (code_offset + len(raw_code) + 3) & ~3
+
+        cmd_text = struct.pack(
+            "<II16sQQQQIIII",
+            0x19, cmd2_size, b"__TEXT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            0x100000000, text_vmsize,
+            0, text_filesize,
+            7, 5,
+            1, 0
+        )
+
+        sec_text = struct.pack(
+            "<16s16sQQIIIIIIII",
+            b"__text\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            b"__TEXT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            code_vaddr, len(raw_code),
+            code_offset, 2,
+            0, 0,
+            0x80000400,
+            0, 0, 0
+        )
+
+        # 3. LC_MAIN
+        actual_entry = code_offset + (entry_offset if entry_offset is not None else 0)
+        cmd_main = struct.pack(
+            "<IIQQ",
+            0x80000028, cmd3_size,
+            actual_entry,
+            0
+        )
+
+        all_headers = header + cmd_pagezero + cmd_text + sec_text + cmd_main
+        padded_headers = all_headers.ljust(code_offset, b"\x00")
+        return padded_headers + raw_code
+
+    def build_macho64_dylib(
+        self,
+        func_code: bytes,
+        export_name: str = "omni_compute",
+        arch: str = "x86_64",
+        dylib_name: Optional[str] = None
+    ) -> bytes:
+        """
+        Synthesizes a 64-bit Mach-O dynamic shared library (MH_DYLIB) for macOS.
+        """
+        is_arm64 = (arch.lower() in ("arm64", "aarch64"))
+        cpu_type = 0x0100000C if is_arm64 else 0x01000007
+        cpu_subtype = 0x00000000 if is_arm64 else 0x80000003
+
+        page_size = 0x4000 if is_arm64 else 0x1000
+        code_offset = page_size
+
+        install_name = (dylib_name or f"lib{export_name}.dylib").encode("utf-8") + b"\x00"
+        padded_name = install_name.ljust((len(install_name) + 7) & ~7, b"\x00")
+        cmd_id_size = 24 + len(padded_name)
+
+        cmd1_size = 72 + 80
+        sizeofcmds = cmd1_size + cmd_id_size
+        ncmds = 2
+
+        header = struct.pack(
+            "<IIIIIIII",
+            0xFEEDFACF,
+            cpu_type,
+            cpu_subtype,
+            0x6,        # MH_DYLIB
+            ncmds,
+            sizeofcmds,
+            0x00200085,
+            0
+        )
+
+        code_vaddr = code_offset
+        text_vmsize = page_size * 2
+        text_filesize = code_offset + len(func_code)
+
+        cmd_text = struct.pack(
+            "<II16sQQQQIIII",
+            0x19, cmd1_size, b"__TEXT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            0, text_vmsize,
+            0, text_filesize,
+            7, 5,
+            1, 0
+        )
+
+        sec_text = struct.pack(
+            "<16s16sQQIIIIIIII",
+            b"__text\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            b"__TEXT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            code_vaddr, len(func_code),
+            code_offset, 2,
+            0, 0,
+            0x80000400,
+            0, 0, 0
+        )
+
+        cmd_id = struct.pack(
+            "<IIIIII",
+            0x0D, cmd_id_size,
+            24,
+            1,
+            0x00010000,
+            0x00010000
+        ) + padded_name
+
+        all_headers = header + cmd_text + sec_text + cmd_id
+        padded_headers = all_headers.ljust(code_offset, b"\x00")
+        return padded_headers + func_code
+
+    # =========================================================================
     # HIGH-LEVEL ORCHESTRATION HELPERS
     # =========================================================================
 
@@ -709,6 +888,10 @@ class StandaloneBinaryEmitter:
         elif target_format == "arm64_pe":
             if not output_path.endswith(".exe"): output_path += ".exe"
             data = self.build_arm64_pe(exit_code=exit_code, custom_code=custom_code)
+        elif target_format in ("macho64", "macho_x86_64"):
+            data = self.build_macho64(exit_code=exit_code, custom_code=custom_code, arch="x86_64", entry_offset=entry_offset)
+        elif target_format in ("arm64_macho", "macho_arm64"):
+            data = self.build_macho64(exit_code=exit_code, custom_code=custom_code, arch="arm64", entry_offset=entry_offset)
         else:
             raise ValueError(f"Unsupported binary target: {target_format}")
 
@@ -734,6 +917,9 @@ class StandaloneBinaryEmitter:
         elif target_format == "elf_so":
             if not output_path.endswith(".so"): output_path += ".so"
             data = self.build_elf64_so(func_code=func_code, export_name=export_name)
+        elif target_format in ("macho_dylib", "dylib"):
+            if not output_path.endswith(".dylib"): output_path += ".dylib"
+            data = self.build_macho64_dylib(func_code=func_code, export_name=export_name, dylib_name=os.path.basename(output_path))
         else:
             raise ValueError(f"Unsupported shared library target: {target_format}")
 

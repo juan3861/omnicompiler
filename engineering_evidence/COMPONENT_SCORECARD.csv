@@ -1,0 +1,101 @@
+component_id,repository,gear_name,target_gap,relevance_gap_coverage,relevance_functional_adherence,relevance_impact,relevance_modularity,total_relevance,readiness_compatibility,readiness_maturity,readiness_cost_fit,readiness_evidence,readiness_reversibility,total_readiness,status
+GEAR-001,gimli-rs/object,"Unified cross-platform parsing and writing for PE,",GAP-01: Mach-O Multi-Target Binary ,38,28,19,10,95,26,18,18,18,8,88,STAGED
+GEAR-002,m4b/goblin,"Zero-allocation multi-format parser for Mach-O 64,",GAP-01: Mach-O Multi-Target Binary ,37,28,18,9,92,26,17,17,17,8,85,STAGED
+GEAR-003,gimli-rs/gimli,Zero-copy DWARF v4/v5 line table and frame descrip,GAP-02: DWARF Debug Line Table Gene,36,27,18,9,90,25,16,16,16,9,82,STAGED
+GEAR-004,rui314/mold,"Parallel section layout, relocations and string ta",GAP-04: Incremental Linker Hot-Patc,36,27,18,8,89,22,15,15,15,8,75,STAGED
+GEAR-005,bytecodealliance/regalloc2,Single-pass SSA-based backtracking register alloca,Core: Register Allocation Hardening,35,26,18,9,88,25,17,17,17,8,84,STAGED
+GEAR-006,google/highway,"Runtime dispatch for AVX2, AVX-512, and ARM NEON v",GAP-03: Vectorized SIMD Instruction,34,26,17,9,86,21,14,14,14,7,70,STAGED
+GEAR-007,angr/cle,"Pure Python binary loader supporting PE, ELF, Mach",GAP-01: Mach-O Multi-Target Binary ,35,26,17,9,87,27,18,18,18,8,89,STAGED
+GEAR-008,al45tair/faerie,Lightweight emission of ELF64 and Mach-O 64 object,GAP-01: Mach-O Multi-Target Binary ,34,26,17,8,85,24,16,16,16,8,80,STAGED
+GEAR-009,trailofbits/maco,Pythonic Mach-O structure parsing and verification,GAP-01: Mach-O Multi-Target Binary ,35,26,18,9,88,27,18,18,18,9,90,STAGED
+GEAR-010,bytecodealliance/cranelift,SSA-based intermediate representation with target ,Core: Retargetable Machine Code Low,36,27,18,8,89,23,16,16,16,7,78,STAGED
+GEAR-011,egraphs-good/egg,E-graph equality saturation with amortized invaria,Core: E-Graph Optimization,34,26,17,8,85,23,15,15,15,8,76,STAGED
+GEAR-012,egraphs-good/egglog,Datalog-based term rewriting combined with e-graph,Core: E-Graph Rule Execution,33,25,16,8,82,22,14,14,14,8,72,STAGED
+GEAR-013,AliveToolkit/alive2,Bit-exact formal verification of IR refinement usi,Core: SMT Refinement Validation,34,26,17,9,86,22,15,15,15,8,75,STAGED
+GEAR-014,slp/wild,Ultra-fast parallel ELF linker written in Rust wit,GAP-04: Incremental Linker Hot-Patc,34,25,17,8,84,22,15,15,15,7,74,STAGED
+GEAR-015,google/souper,SMT-driven synthesis of peephole optimization rule,Core: CEGIS Superoptimization,33,25,17,8,83,22,14,14,14,8,72,STAGED
+GEAR-016,StanfordPL/stoke,MCMC Markov chain sampling over x86-64 assembly in,Core: MCTS Hardware Superoptimizer,32,24,16,9,81,21,14,14,14,7,70,STAGED
+GEAR-017,asmjit/asmjit,Complete x86/x64 and AArch64 machine code emitter ,Core: Native Machine Codegen,34,25,17,8,84,24,16,16,16,8,80,STAGED
+GEAR-018,facebook/infer,Bi-abduction compositional spatial heap reasoning,Core: Memory Safety Verification,33,25,16,8,82,21,14,14,14,8,71,STAGED
+GEAR-019,joernio/joern,"Unified AST, CFG, and Program Dependence Graph for",Core: CPG Taint Tracking,33,25,17,8,83,22,15,15,15,8,75,STAGED
+GEAR-020,jart/cosmopolitan,Dual-format polyglot headers (MZ + ELF + Mach-O in,GAP-01: Mach-O Multi-Target Binary ,34,26,17,8,85,24,16,16,16,9,81,STAGED
+GEAR-021,Z3Prover/z3,Z3 SMT solver with QF_BV and theory of arrays,Core SMT,32,24,16,7,79,26,17,17,17,8,85,RESERVE
+GEAR-022,cvc5/cvc5,Automated SMT solver with strong bitvector heurist,Core SMT,31,23,16,8,78,23,16,16,16,7,78,RESERVE
+GEAR-023,llvm/llvm-project,"Clang, LLD, LLVM IR, Polly polyhedral optimizer",Core Toolchain,32,24,16,7,79,24,16,16,16,8,80,RESERVE
+GEAR-024,bytecodealliance/wasmtime,WASI preview 2 and Wasm execution engine,GAP-05: WASI,32,24,16,7,79,22,15,15,15,8,75,RESERVE
+GEAR-025,unicorn-engine/unicorn,QEMU-based multi-architecture virtual CPU sandbox,Core Silicon Sandbox,32,24,16,7,79,26,17,17,17,8,85,RESERVE
+GEAR-026,capstone-engine/capstone,Multi-architecture binary disassembler,Core Binary Analysis,31,23,16,8,78,26,18,18,18,8,88,RESERVE
+GEAR-027,keystone-engine/keystone,Multi-architecture assembler engine,Core Assembler,31,23,15,8,77,24,16,16,16,8,80,RESERVE
+GEAR-028,erocarrera/pefile,Python module to parse and audit PE files,Core PE Auditor,32,24,16,7,79,28,18,18,18,10,92,RESERVE
+GEAR-029,eliben/pyelftools,Pure Python ELF and DWARF parser,Core ELF Auditor,32,24,16,7,79,28,18,18,18,10,92,RESERVE
+GEAR-030,SVF-tools/SVF,Static value-flow analysis for LLVM IR,Core Static Analysis,30,22,15,8,75,20,14,14,14,6,68,RESERVE
+GEAR-031,tree-sitter/tree-sitter,Incremental multi-language parser,Core Polyglot Frontend,31,23,16,8,78,26,17,17,17,8,85,RESERVE
+GEAR-032,sljit/sljit,Stackless JIT compiler for multiple CPU platforms,Core JIT Lowering,30,23,15,8,76,22,15,15,15,7,74,RESERVE
+GEAR-033,LuaJIT/LuaJIT,Tracing JIT compiler and DynASM assembler,Core JIT,31,23,16,8,78,25,16,16,16,9,82,RESERVE
+GEAR-034,v8/v8,Turbofan JIT compiler and Sea-of-Nodes IR,Core IR Design,31,23,15,8,77,20,13,13,13,6,65,RESERVE
+GEAR-035,pypy/pypy,Tracing JIT and garbage collector generator,Core Runtime,30,22,15,7,74,19,13,13,13,6,64,RESERVE
+GEAR-036,ziglang/zig,Integrated compiler with native cross-linker for P,GAP-01: Mach-O,32,24,16,7,79,23,15,15,15,8,76,RESERVE
+GEAR-037,rust-lang/rust,LLVM and Cranelift codegen backends,Core Compiler,31,23,15,8,77,22,14,14,14,8,72,RESERVE
+GEAR-038,model-checking/kani,CBMC-based bounded model checking for Rust,Core Verification,30,22,15,8,75,21,14,14,14,7,70,RESERVE
+GEAR-039,creusot-rs/creusot,Formal verification of Rust contracts via Why3,Core Verification,30,22,15,7,74,20,14,14,14,6,68,RESERVE
+GEAR-040,AbsInt/CompCert,Formally verified C compiler in Coq,Core Verification,30,23,15,8,76,19,12,12,12,7,62,RESERVE
+GEAR-041,CakeML/cakeml,Formally verified functional language and native c,Core Verification,30,22,15,7,74,18,12,12,12,6,60,RESERVE
+GEAR-042,JuliaLang/julia,JIT compiler based on LLVM with type inference,Core JIT,30,22,15,8,75,21,14,14,14,7,70,RESERVE
+GEAR-043,oracle/graal,Dynamic polyglot JIT compiler and native image gen,Core Ahead-of-Time,30,23,15,8,76,20,13,13,13,7,66,RESERVE
+GEAR-044,emscripten-core/emscripten,Compiler toolchain to WebAssembly,Core WebAssembly,30,22,15,8,75,23,16,16,16,7,78,RESERVE
+GEAR-045,WebAssembly/wabt,"The WebAssembly Binary Toolkit (wast2json, wasm2wa",Core WebAssembly,31,23,16,8,78,25,17,17,17,8,84,RESERVE
+GEAR-046,WebAssembly/binaryen,Optimizer and compiler infrastructure for WebAssem,Core WebAssembly,31,23,15,8,77,24,16,16,16,8,80,RESERVE
+GEAR-047,wasmerio/wasmer,Multi-backend WebAssembly runtime,Core WebAssembly,30,22,15,8,75,23,15,15,15,8,76,RESERVE
+GEAR-048,manticore-org/manticore,Symbolic execution for x86-64 and EVM binaries,Core Symbolic Execution,31,23,15,8,77,23,16,16,16,7,78,RESERVE
+GEAR-049,angr/angr,Multi-architecture binary analysis and CFG recover,Core Binary Analysis,31,23,16,8,78,23,15,15,15,8,76,RESERVE
+GEAR-050,angr/archinfo,Classes with architecture-specific information,Core ABI,31,23,16,8,78,26,18,18,18,8,88,RESERVE
+GEAR-051,angr/pyvex,Python bindings for the VEX intermediate represent,Core IR,30,23,15,8,76,24,16,16,16,8,80,RESERVE
+GEAR-052,angr/claripy,Claripy solver engine wrapping Z3,Core SMT,31,23,15,8,77,25,16,16,16,9,82,RESERVE
+GEAR-053,ispc/ispc,C-based SPMD language compiler for CPU SIMD,GAP-03: SIMD,31,23,16,8,78,22,14,14,14,8,72,RESERVE
+GEAR-054,shibatch/sleef,SIMD mathematical library for x86 and ARM,GAP-03: SIMD,31,23,15,8,77,24,16,16,16,8,80,RESERVE
+GEAR-055,halide/Halide,Decoupling algorithm from schedule in image pipeli,Core Scheduling,30,23,15,8,76,20,14,14,14,6,68,RESERVE
+GEAR-056,microsoft/win32metadata,Tooling for complete Win32 API specifications,Core Windows ABI,30,22,15,8,75,22,15,15,15,7,74,RESERVE
+GEAR-057,microsoft/checkedc,Extension adding checked pointers and arrays to C,Core Safety,30,22,15,7,74,20,14,14,14,6,68,RESERVE
+GEAR-058,google/sanitizers,AddressSanitizer and MemorySanitizer runtimes,Core Safety,31,23,15,8,77,23,16,16,16,7,78,RESERVE
+GEAR-059,google/benchmark,C++ microbenchmarking support library,Core Benchmarks,30,22,15,8,75,25,16,16,16,9,82,RESERVE
+GEAR-060,google/fuzztest,C++ property and coverage-guided fuzz testing,Core Fuzzing,30,23,15,8,76,22,15,15,15,8,75,RESERVE
+GEAR-061,HypothesisWorks/hypothesis,Advanced property-based testing framework for Pyth,Core Property Testing,32,24,16,7,79,28,18,18,18,10,92,RESERVE
+GEAR-062,rosette-lang/rosette,Solver-aided programming for synthesis and verific,Core Synthesis,31,23,15,8,77,20,13,13,13,7,66,RESERVE
+GEAR-063,spcl/dacapo,Standardized benchmark suite for dynamic compilers,Core Benchmark,29,22,14,7,72,21,14,14,14,7,70,RESERVE
+GEAR-064,dotnet/roslyn,Roslyn C# and VB compiler with syntax API,Core Architecture,30,23,15,8,76,22,14,14,14,8,72,RESERVE
+GEAR-065,dotnet/runtime,RyuJIT 64-bit optimizing JIT compiler,Core JIT,31,23,15,8,77,21,14,14,14,7,70,RESERVE
+GEAR-066,libfirm/libfirm,Pure SSA graph-based intermediate representation,Core IR,30,23,15,8,76,20,14,14,14,6,68,RESERVE
+GEAR-067,csl-iisc/pluto,Automatic parallelizer and locality optimizer,GAP-03: SIMD,30,22,15,8,75,19,12,12,12,7,62,RESERVE
+GEAR-068,COBRA-Compiler/pluto,Fork with updated Polyhedral extraction algorithms,GAP-03: SIMD,30,22,15,7,74,19,12,12,12,7,62,RESERVE
+GEAR-069,phil-opp/blog_os,"Bare-metal OS tutorials, page tables and interrupt",Core Low-Level,30,22,15,7,74,22,15,15,15,8,75,RESERVE
+GEAR-070,alexcrichton/tar-rs,Tar reader and writer in pure Rust,Packaging,27,20,14,7,68,26,17,17,17,8,85,ARCHIVED
+GEAR-071,crossbeam-rs/crossbeam,"Lock-free queues, epoch-based reclamation",Core Concurrency,29,22,15,7,73,25,17,17,17,8,84,RESERVE
+GEAR-072,apple/swift,"Swift compiler, SIL (Swift Intermediate Language)",Core IR,30,23,15,8,76,20,14,14,14,6,68,RESERVE
+GEAR-073,apple/swift-llvm,Apple LLVM fork with Swift calling conventions,Core ABI,30,22,15,8,75,21,14,14,14,7,70,RESERVE
+GEAR-074,golang/go,Go compiler SSA backend and plan9 assembler,Core SSA,31,23,15,8,77,25,16,16,16,9,82,RESERVE
+GEAR-075,tinygo-org/tinygo,Go compiler for microcontrollers and Wasm,Core Embedded,30,22,15,8,75,23,16,16,16,7,78,RESERVE
+GEAR-076,lemon-mint/mach-o,Pure Go Mach-O parser and writer library,GAP-01: Mach-O,31,23,16,8,78,24,16,16,16,8,80,RESERVE
+GEAR-077,aidansteele/osx-abi-macho-file,Rust implementation of Apple OS X ABI Mach-O file ,GAP-01: Mach-O,31,23,16,8,78,23,16,16,16,7,78,RESERVE
+GEAR-078,radareorg/radare2,"Disassembly, binary patching and analysis framewor",Core Binary Analysis,30,23,15,8,76,22,15,15,15,8,75,RESERVE
+GEAR-079,NationalSecurityAgency/ghidra,Ghidra decompiler and P-code intermediate language,Core Decompilation,31,23,15,8,77,22,14,14,14,8,72,RESERVE
+GEAR-080,retdec/retdec,LLVM-based retargetable machine code decompiler,Core Decompilation,30,23,15,8,76,21,14,14,14,7,70,RESERVE
+GEAR-081,lifting-bits/remill,"Translating x86, amd64, and aarch64 to LLVM bitcod",Core Lifting,31,23,15,8,77,22,14,14,14,8,72,RESERVE
+GEAR-082,lifting-bits/sleigh,Standalone C++ implementation of Ghidra Sleigh pro,Core ISA Spec,30,23,15,8,76,21,14,14,14,7,70,RESERVE
+GEAR-083,lifting-bits/anvill,Decompilation pipeline from machine code to LLVM I,Core Decompilation,30,22,15,8,75,20,14,14,14,6,68,RESERVE
+GEAR-084,DynamoRIO/dynamorio,Runtime code manipulation and instrumentation engi,Core Runtime,30,22,15,8,75,20,14,14,14,6,68,RESERVE
+GEAR-085,Frida/frida,Scriptable dynamic binary instrumentation engine,Core Runtime,30,23,15,8,76,22,15,15,15,7,74,RESERVE
+GEAR-086,intel/pin,Intel dynamic binary instrumentation tool,Core DBI,28,21,14,7,70,18,12,12,12,6,60,ARCHIVED
+GEAR-087,avast/yaramod,YARA rule AST generation and manipulation,Core Security,29,22,14,7,72,22,15,15,15,7,74,RESERVE
+GEAR-088,VirusTotal/yara,Pattern matching swiss army knife for malware anal,Core Security,29,22,15,7,73,24,16,16,16,8,80,RESERVE
+GEAR-089,kaitai-io/kaitai_struct,Declarative parser generator for binary formats,Core Binary Parsing,31,23,15,8,77,22,15,15,15,8,75,RESERVE
+GEAR-090,sharkdp/hexyl,Colored hex viewer with byte classification,Tooling,26,20,13,6,65,26,17,17,17,8,85,ARCHIVED
+GEAR-091,charliesome/charlie,Minimal standalone x86-64 executable generator,Core Emitter,30,22,15,7,74,23,15,15,15,8,76,RESERVE
+GEAR-092,yrp604/rappel,Interactive x86/ARM assembly exploration REPL,Core Assembly,29,22,15,7,73,22,15,15,15,8,75,RESERVE
+GEAR-093,trailofbits/manticore,Dynamic symbolic execution framework for binaries,Core Symbolic,31,23,15,8,77,23,16,16,16,7,78,RESERVE
+GEAR-094,llvm-mirror/lld,Mirror of LLVM LLD linker,Core Linker,30,23,15,8,76,21,14,14,14,7,70,ARCHIVED
+GEAR-095,rui314/8cc,Small C compiler designed for self-hosting,Core Compiler,30,22,15,7,74,22,15,15,15,8,75,RESERVE
+GEAR-096,rui314/chibicc,"Clean, pedagogical C11 compiler generating x86-64",Core Compiler,31,23,16,8,78,25,16,16,16,9,82,RESERVE
+GEAR-097,antirez/load81,Small 2D engine with lightweight bytecode interpre,Core Runtime,26,20,13,7,66,22,15,15,15,8,75,ARCHIVED
+GEAR-098,BLAKE3-team/BLAKE3,Official implementation of BLAKE3 tree-hashing alg,Core Crypto,32,24,16,7,79,27,18,18,18,9,90,RESERVE
+GEAR-099,facebook/zstd,Zstandard real-time compression algorithm,Core Compression,31,23,16,8,78,27,18,18,18,9,90,RESERVE
+GEAR-100,rui314/sold,High-performance Mach-O linker spinoff of mold,GAP-01: Mach-O,31,23,16,8,78,20,13,13,13,6,65,RESERVE

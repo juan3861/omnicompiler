@@ -75,7 +75,7 @@ def cmd_compile(args) -> int:
         out_path = args.output
     else:
         if target_format == "shared_lib":
-            ext = ".dll" if effective_os == "windows" else ".so"
+            ext = ".dll" if effective_os == "windows" else (".dylib" if effective_os == "macos" else ".so")
         else:
             ext = ".exe" if effective_os == "windows" else ""
         out_path = os.path.join(BASE_DIR, "dist", f"omnicompiler_unified_{effective_os}_{target_arch}_{target_format}{ext}")
@@ -260,7 +260,7 @@ def main():
     p_comp = subparsers.add_parser("compile", help="Compile submodules into unified native library or binary")
     p_comp.add_argument("-o", "--output", help="Output library or binary path")
     p_comp.add_argument("--format", default="shared_lib", choices=["shared_lib", "executable"], help="Target binary format")
-    p_comp.add_argument("--target-os", choices=["windows", "linux"], help="Target operating system (windows/linux)")
+    p_comp.add_argument("--target-os", choices=["windows", "linux", "macos"], help="Target operating system (windows/linux/macos)")
     p_comp.add_argument("--arch", choices=["x86_64", "arm64"], default="x86_64", help="Target architecture (x86_64/arm64)")
     p_comp.add_argument("--repos", help="Custom comma-separated repo directories (defaults to compiler_modules)")
     p_comp.add_argument("--audit-nonce", default="NONCE-C5-20261023-OMNI01", help="Audit nonce for cryptographic provenance ledger")

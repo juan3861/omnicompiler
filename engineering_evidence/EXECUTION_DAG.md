@@ -1,30 +1,28 @@
-# EXECUTION DAG (ALPHA-C5)
-**Protocol:** MASTER PROMPT ALPHA-C5  
-**Version:** 5.0.0  
-**Audit Nonce:** `NONCE-C5-20261023-OMNI01`  
+# EXECUTION DAG — ALPHA-C7 DISCOVERY-100
+**Protocol:** MASTER PROMPT ALPHA-C7 DISCOVERY-100  
+**Version:** 7.0.0  
+**Audit Nonce:** `NONCE-C7-20261026-DISCOVERY100`  
 
 ```mermaid
 graph TD
-    A["T0: Scope Freeze & Acceptance Contract (v5.0.0, Nonce Assigned)"] --> B["T1: Build Cryptographic Audit Ledger Subsystem (compiler/audit_ledger.py)"]
-    A --> C["T2: Harden Object Linker Relocation Bounds & Section Alignment"]
-    B --> D["T3: Integrate Audit Ledger with omni_repo_compiler.py & omnicompiler_cli.py"]
-    C --> D
-    D --> E["T4: Local Verification Suite (Builder - 67+ tests, E2E, benchmarks)"]
-    E --> F["T5: Spawn Independent Adversarial Auditor Subagent (Agent 2)"]
-    F --> G["T6: Adversarial Audit Falsification, Mutation Kill & Holdout Fuzzing"]
-    G --> H["T7: Deterministic Score Attestation & Inventory Closure (TRI_STATE_QUALITY_GATE.md)"]
-    H --> I["T8: Remote Synchronization (Git commit & push to GitHub)"]
-    I --> J["T9: Final Sovereign Report to Mestre Ruan"]
+    A["T0: Scope Freeze & Acceptance Contract (v7.0.0)"] --> B["T1: Baseline & Capability / Gap Mapping"]
+    B --> C["T2: DISCOVERY-100 Catalog & Scorecard (100 Repos)"]
+    C --> D["T3: Staging & Consensus Decision (DEC-OMNI-005)"]
+    D --> E["T4: Implement Mach-O 64 Emitter (compiler/binary_emitter.py)"]
+    D --> F["T5: Implement Mach-O Structural Auditor (validation/binary_structure_auditor.py)"]
+    E --> G["T6: Extend Object Linker & CLI for macOS Targets"]
+    F --> G
+    G --> H["T7: Unit & Property Tests for Mach-O Pipeline"]
+    H --> I["T8: Full System Test Suite (80+ Tests Passing)"]
+    I --> J["T9: Dispatch Independent Adversarial Auditor Subagent (Agent 2)"]
+    J --> K["T10: Audit Ledger Closure & Quality Gate Attestation"]
+    K --> L["T11: Commit, Push & GitHub Actions CI Verification"]
+    L --> M["T12: Sovereign Final Report to Mestre Ruan"]
 ```
 
-### Task Specifications & Dependencies
-- **T0:** Freeze `ACCEPTANCE_CONTRACT.md` and `ACCEPTANCE_MANIFEST.json` with SHA-256 digests. *(Completed)*
-- **T1:** Implement `compiler/audit_ledger.py` with HMAC/SHA-256 signatures, Merkle source root computation, and receipt validation.
-- **T2:** Implement relocation boundary checking and alignment invariants in `compiler/object_linker.py` and `validation/binary_structure_auditor.py`.
-- **T3:** Integrate CLI subcommands `--sign-ledger` and `audit-attest`.
-- **T4:** Run full local test suite (unit tests, property fuzz tests, mutations, cross-target compilation).
-- **T5:** Dispatch task to Independent Adversarial Auditor subagent (Agent 2).
-- **T6:** Adversarial Auditor verifies all gates independently without builder intervention.
-- **T7:** Compile receipts into `EVIDENCE_LEDGER.md`, calculate deterministic score (Section 8B), and sign `TRI_STATE_QUALITY_GATE.md`.
-- **T8:** Push changes to GitHub and confirm clean CI status.
-- **T9:** Issue Radical Truth Report to Mestre Ruan.
+### Tasks & Responsibilities
+- **T0–T3:** Completed (Scope, Baseline, 100 Repos Catalog, Staging, Consensus).
+- **T4–T7:** Principal Builder implementation of Mach-O 64-bit emitter, linker, auditor, and CLI integration.
+- **T8:** Local verification suite.
+- **T9–T10:** Independent Adversarial Auditor evaluation and score attestation.
+- **T11–T12:** Remote synchronization and final report.

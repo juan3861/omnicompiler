@@ -1,99 +1,53 @@
-# ACCEPTANCE CONTRACT — SCOPE FREEZE ALPHA-C5
-**Protocol:** Dual-Agent Evidence-Driven Engineering (ALPHA-C5 Epistemic Consensus, Bound Identity & Authenticated Evidence Ledger)  
-**Version:** 5.0.0 (FROZEN)  
-**Intensity Classification (C5.1):** `SUBSYSTEM` Tier (Compiler Subsystem Hardening: Cryptographic Audit Ledger, Section Relocation Boundary Verification, and Nonce-Gated Provenance)  
-**Audit Nonce (C5.2):** `NONCE-C5-20261023-OMNI01`  
-**Builder Session ID:** `SESSION-BUILDER-C5-c406d4a9`  
-**Auditor Session ID:** `SESSION-AUDITOR-C5-46437d19`  
-**Trusted Runner ID:** `RUNNER-TRUSTED-CPYTHON311-WIN64`  
-**Baseline Commit:** `e171684e27f67adcf997bf9b794b6cefb548c8b6`  
-**Date:** 2026-10-23  
+# ACCEPTANCE CONTRACT — SCOPE FREEZE ALPHA-C7 DISCOVERY-100
+**Protocol:** MASTER PROMPT ALPHA-C7 DISCOVERY-100 (Autonomous Engineering with Independent Evidence)  
+**Version:** 7.0.0 (FROZEN)  
+**Mode of Execution:** `DUAL_AGENT_VERIFIED`  
+- **Agent 1 (Principal Builder):** `SESSION-BUILDER-C7-c406d4a9`  
+- **Agent 2 (Independent Adversarial Auditor):** `SESSION-AUDITOR-C7-46437d19`  
+- **Trusted Host Runner:** `RUNNER-TRUSTED-CPYTHON311-WIN64`  
+**Baseline Commit:** `d743d404d49a37a7b8e1a7ba313faea4bc01c6e1`  
+**Timestamp:** `2026-10-26T04:00:00Z`  
+**Audit Nonce:** `NONCE-C7-20261026-DISCOVERY100`  
 
 ---
 
-### 1. Canonical Workspace & Baseline Commit
+### 1. Canonical Workspace & Baseline
 - **Repository:** `F:\repository-compiler` (`omnicompiler`)
-- **Initial Baseline Commit:** `e171684e27f67adcf997bf9b794b6cefb548c8b6`
-- **Pre-existing Local State:** Clean working tree, fully synced with `origin/main`.
-- **Target Remote:** `https://github.com/juan3861/omnicompiler.git`
+- **Remote:** `https://github.com/juan3861/omnicompiler.git` (branch `main`)
+- **Initial Baseline State:** Clean working tree, 80 tests passing in 7.98s, CI 100% green on commit `d743d40`.
 
 ---
 
-### 2. Adaptive Intensity Tier Classification (C5.1)
-- **Assigned Tier:** `SUBSYSTEM`
-- **Technical Justification:** OmniCompiler's core compiler pipeline (multi-repo ingestion, slicing, persistent CPG, ABI synthesis, native code generation, PE/ELF emission, Unicorn CPU emulation, and LLVM/Wasm backends) is established and verified. The current cycle hardens the compiler with an integrated cryptographic audit ledger (`compiler/audit_ledger.py`), enforces strict section boundary invariants during object relocation (`compiler/object_linker.py`), integrates CLI audit attestation, and validates all evidence receipts through nonce-bound identity attestation under Section 8B and C5.2–C5.7.
+### 2. Objective, Scope Boundaries & Exclusions
+- **Primary Objective:** Advance OmniCompiler under Protocol ALPHA-C7 with a systematic **DISCOVERY-100** campaign (surveying up to 100 real, canonical open-source compiler, linker, SMT, and verification repositories). Identify verified technology gaps, select candidates meeting relevance $\ge 80/100$, stage in `external_component_candidates/`, integrate high-impact minimal adaptations, and subject the system to independent adversarial audit and trusted ledger verification.
+- **Explicit Exclusions:** No modifications to external directories or user files outside `F:\repository-compiler` and the designated evidence artifacts. No fabricated repository URLs or synthetic maturity scores.
 
 ---
 
-### 3. Objective, Domain, Users & Explicit Scope Boundaries
-- **Primary Objective:** Upgrade OmniCompiler under Protocol ALPHA-C5 to embed authenticated cryptographic audit ledgers into compiled multi-repo artifacts, harden native object linking with strict section relocation bounds, enforce formal PE/ELF section alignment invariants, and execute dual-agent adversarial falsification with inventory closure.
-- **Domain:** Compiler Engineering, Binary Linkers (PE/COFF & ELF), Cryptographic Provenance Ledgers, SMT Refinement, Sandboxing (Unicorn, Wasmtime).
-- **Intended Users:** Systems programmers, compiler engineers, automated code-generation agents, formal verification researchers.
-- **Mandatory Capabilities (11 Gates):**
-  1. `GATE-01-MANIFEST-TOPO`: Multi-repo manifest ingestion with topological dependency resolution.
-  2. `GATE-02-THINLTO-SLICING`: Inter-repository dead-code slicing with symbol conservation.
-  3. `GATE-03-MACHINE-CODEGEN-LINKING`: Native object linking and relocation with strict boundary checks.
-  4. `GATE-04-FORMAL-BINARY-AUDIT`: Formal PE/ELF structure and section alignment verification (`pefile`, `pyelftools`).
-  5. `GATE-05-ADVERSARIAL-MUTATION-FUZZ`: Independent adversarial mutation testing (11/11 mutants killed) & Hypothesis fuzzing.
-  6. `GATE-06-CPG-TAINT-ISOLATION`: Persistent Code Property Graph tenant isolation and taint tracking.
-  7. `GATE-07-SILICON-SAFETY-SANDBOX`: Pre-flight silicon safety sandbox via Unicorn CPU emulation.
-  8. `GATE-08-UNIVERSAL-ABI-CEGIS`: Universal ABI Bridge (Windows x64 $\leftrightarrow$ System V AMD64) with CEGIS parameter synthesis.
-  9. `GATE-09-CROSS-TARGET-EMISSION`: Direct machine-code emission for PE32+ (x86-64/ARM64) and ELF64 (x86-64/ARM64) shared libraries and executables.
-  10. `GATE-10-PERFORMANCE-RESOURCES`: Microarchitectural benchmark (>100x speedup vs CPython, 0 memory leaks across 100 cycles).
-  11. `GATE-11-CRYPTO-AUDIT-LEDGER`: Embedded cryptographic audit ledger with HMAC/SHA-256 signatures, nonce verification, and CLI audit attestation.
-- **Explicit Scope Boundaries:** Confined strictly to `F:\repository-compiler` and the engineering evidence artifacts.
+### 3. Functional and Non-Functional Requirements (Gate Inventory)
+
+| Requirement ID | Specification / Domain Invariant | Category | Eliminatory |
+| :--- | :--- | :--- | :---: |
+| `REQ-C7-01-DISCOVERY100` | Research, verify and catalog up to 100 unique, real, traceable canonical repositories with deduplication and metrics. | Research & Discovery | Yes |
+| `REQ-C7-02-GAP-MAP` | Define factual `EXISTING_CAPABILITY_MAP.md` and `TECHNOLOGY_GAP_MAP.md` without selecting redundant components. | Architecture | Yes |
+| `REQ-C7-03-SCORECARD` | Two-axis scoring (Relevance 0–100, Readiness 0–100) per gear; threshold $\ge 80$ for candidate staging. | Methodology | Yes |
+| `REQ-C7-04-STAGING-GATE` | Verify licenses, supply chain, compatibility, and isolation before staging in `external_component_candidates/selected/`. | Security & Governance | Yes |
+| `REQ-C7-05-MINIMAL-INTEG` | Implement verified minimal component adaptation addressing a concrete technology gap without regression. | Functional Correctness | Yes |
+| `REQ-C7-06-UNIT-INTEG-E2E` | Full suite pass rate (80+ tests) including E2E multi-repo compilation and new component tests. | Reliability | Yes |
+| `REQ-C7-07-ADVERSARIAL-FUZZ` | 100% of mutation faults killed (11/11+) and adversarial boundary tests passing. | Reliability | Yes |
+| `REQ-C7-08-LEDGER-CLOSURE` | Provenance audit ledger with nonce authentication and cryptographic hash closure. | Reproducibility & Provenance | Yes |
+| `REQ-C7-09-PERFORMANCE-ZERO-LEAK` | JIT latency $>100\times$ vs CPython and zero memory leaks across 100 cycles (+0.00 MB delta). | Measured Performance | Yes |
+| `REQ-C7-10-DUAL-AGENT-AUDIT` | Independent audit conducted by Agent 2 subagent issuing verifiable verdict (APPROVED/REJECTED/BLOCKED). | Governance | Yes |
 
 ---
 
-### 4. Environment, Architecture, Interfaces & Technical Constraints
-- **Execution Platform:** Windows 10/11 x64 host with cross-compilation capability for System V AMD64, Linux ELF64, Windows ARM64, and Linux ARM64.
-- **Python Version:** Python 3.11 (`C:\Users\juanp\AppData\Local\Programs\Python\Python311\python.exe`).
-- **Core Technology Stack:**
-  - Solvers: `z3-solver` (4.13.0.0), `clingo` (5.8.2).
-  - Emulators & Sandboxes: `unicorn` (2.1.4), `wasmtime` (49.0.0).
-  - Code Generation: `llvmlite` (0.47.0), direct x86-64/AArch64 machine-code emitter.
-  - Binary Parsers: `pefile` (2024.8.26), `pyelftools` (0.33).
-  - Fuzzing & Property Testing: `hypothesis` (6.170.2).
-  - Cryptography: `hashlib`, `hmac` (SHA-256).
+### 4. Epistemic Decision Hierarchy & Precedence
+1. Any authentic eliminatory `FAIL` $\implies$ **REJECTED** immediately.
+2. Any missing mandatory evidence or unverified gate $\implies$ **BLOCKED**.
+3. All mandatory gates `PASS` $\implies$ Calculate score via deterministic rubric. Threshold $\ge 95.0/100 \implies$ **APPROVED**.
 
 ---
 
-### 5. Scoring Weights & Strict Precedence (ALPHA-C4 Section 8B & ALPHA-C5 C5.4)
-- **Weight Distribution (Total 100 points):**
-  - Functional Correctness: 30 pts (Gates 1, 2, 3)
-  - Reliability: 25 pts (Gates 4, 5)
-  - Security: 15 pts (Gates 6, 7)
-  - Integration & Architecture: 15 pts (Gates 8, 9)
-  - Measured Performance: 10 pts (Gate 10)
-  - Reproducibility & Documentation: 5 pts (Gate 11)
-- **Approval Threshold:** Total Score $\ge 95.0 / 100$.
-- **Strict Precedence Rule:**
-  1. Any authentic eliminatory `FAIL` $\implies$ **REJECTED** immediately.
-  2. Any unverified or missing mandatory gate $\implies$ **BLOCKED**.
-  3. Only with all 11 gates at verified `PASS` $\implies$ Calculate score via deterministic formula:
-     $$\text{Final Score} = \sum_{i=1}^{11} (\text{Gate Pass}_i \times \text{Weight}_i)$$
-  4. If $\text{Final Score} \ge 95.0 \implies$ **APPROVED**.
-
----
-
-### 6. Inventory Closure (C5.3) & Authenticated Evidence Chain (C5.2)
-- All evidence receipts must be generated with `audit_nonce = "NONCE-C5-20261023-OMNI01"`.
-- Every gate must have a closed receipt in `EVIDENCE_LEDGER.md`.
-- No cherry-picking PASS receipts. Any legitimate failure in an eliminatory gate forces REJECTED.
-- Receipts must bind:
-  - `gate_id`
-  - `status` (`PASS`, `FAIL`, `UNKNOWN`)
-  - `audit_nonce`
-  - `session_id`
-  - `runner_id`
-  - `verified`: literal `True` (boolean)
-  - `trusted_runner`: literal `True` (boolean)
-  - `artifact_hash` (SHA-256)
-  - `timestamp_iso`
-
----
-
-### 7. Governance, Anti-Gaming & Budget
-- **Dual-Agent Isolation:** Builder (Agent 1) implements features and local verification (`LOCAL_TEST_PASS`). Independent Adversarial Auditor (Agent 2 - Subagent) independently validates, runs adversarial mutations, and issues binding verdict (`APPROVED` / `REJECTED` / `BLOCKED`).
-- **Anti-Gaming:** No mock bypasses, no hardcoded benchmark inputs, no altered timeouts, no self-attested score by Agent 1.
-- **Budget Ceiling:** Max 15 minutes test execution, zero cost API tokens (local compute).
+### 5. Operational Budget & Anti-Gaming Rules
+- **Budget:** Max 20 minutes execution; zero API token billing (local compute + open search); max disk delta $< 50\text{ MB}$.
+- **Anti-Gaming:** No mock bypasses, no hardcoded inputs, no synthetic URLs in DISCOVERY-100 catalog, no self-attestation of approval by Agent 1.

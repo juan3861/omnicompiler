@@ -57,6 +57,8 @@ class BinaryStructureAuditor:
             return self.audit_pe(binary_bytes)
         elif binary_bytes[:4] == b"\x7fELF":
             return self.audit_elf(binary_bytes)
+        elif binary_bytes[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+            return self.audit_macho(binary_bytes)
         else:
             return BinaryAuditReport(
                 is_valid=False,
@@ -65,6 +67,98 @@ class BinaryStructureAuditor:
                 binary_type="unknown",
                 errors=[f"Unrecognized binary magic: {binary_bytes[:4].hex()}"]
             )
+
+    def audit_macho(self, macho_bytes: bytes) -> BinaryAuditReport:
+        """Formal structural audit of 64-bit Mach-O binaries (macOS x86-64 & ARM64)."""
+        import struct
+        errors = []
+        warnings = []
+        sections = []
+        exports = []
+        imports = []
+        metrics = {}
+
+        if len(macho_bytes) < 32:
+            return BinaryAuditReport(
+                is_valid=False,
+                format="Mach-O 64",
+                machine_arch="unknown",
+                binary_type="unknown",
+                errors=["Mach-O header truncated (less than 32 bytes)"]
+            )
+
+        magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack(
+            "<IIIIIIII", macho_bytes[:32]
+        )
+
+        if magic != 0xFEEDFACF:
+            errors.append(f"Invalid Mach-O 64 magic (expected 0xFEEDFACF, got 0x{magic:08X})")
+
+        if cputype == 0x01000007:
+            arch = "x86-64"
+        elif cputype == 0x0100000C:
+            arch = "ARM64"
+        else:
+            arch = f"unknown (0x{cputype:08X})"
+            warnings.append(f"Unexpected Mach-O CPU type: {arch}")
+
+        if filetype == 0x2:
+            bin_type = "executable"
+        elif filetype == 0x6:
+            bin_type = "shared_library"
+        else:
+            bin_type = f"unknown (0x{filetype:04X})"
+
+        offset = 32
+        for _ in range(ncmds):
+            if offset + 8 > len(macho_bytes):
+                errors.append("Load command header truncated")
+                break
+            cmd, cmdsize = struct.unpack("<II", macho_bytes[offset:offset+8])
+            if cmdsize < 8 or offset + cmdsize > len(macho_bytes):
+                errors.append(f"Malformed load command size ({cmdsize})")
+                break
+
+            if cmd == 0x19:  # LC_SEGMENT_64
+                if cmdsize >= 72:
+                    segname = macho_bytes[offset+8:offset+24].decode("utf-8", errors="ignore").rstrip("\x00")
+                    vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, sflags = struct.unpack(
+                        "<QQQQIIII", macho_bytes[offset+24:offset+72]
+                    )
+                    sec_offset = offset + 72
+                    for _ in range(nsects):
+                        if sec_offset + 80 <= offset + cmdsize:
+                            sectname = macho_bytes[sec_offset:sec_offset+16].decode("utf-8", errors="ignore").rstrip("\x00")
+                            sections.append(f"{segname}.{sectname}")
+                            sec_offset += 80
+            elif cmd == 0x0D:  # LC_ID_DYLIB
+                if cmdsize >= 24:
+                    name_off, = struct.unpack("<I", macho_bytes[offset+8:offset+12])
+                    if offset + name_off < offset + cmdsize:
+                        raw_name = macho_bytes[offset+name_off:offset+cmdsize].split(b"\x00")[0]
+                        exports.append(raw_name.decode("utf-8", errors="ignore"))
+
+            offset += cmdsize
+
+        metrics["magic"] = f"0x{magic:08X}"
+        metrics["cpu_type"] = arch
+        metrics["file_type"] = bin_type
+        metrics["total_size"] = len(macho_bytes)
+        metrics["ncmds"] = ncmds
+
+        is_valid = len(errors) == 0
+        return BinaryAuditReport(
+            is_valid=is_valid,
+            format="Mach-O 64",
+            machine_arch=arch,
+            binary_type=bin_type,
+            sections=sections,
+            exported_symbols=exports,
+            imported_symbols=imports,
+            warnings=warnings,
+            errors=errors,
+            metrics=metrics
+        )
 
     def audit_pe(self, pe_bytes: bytes) -> BinaryAuditReport:
         """Formal structural audit of Windows PE32+ binaries via pefile."""
