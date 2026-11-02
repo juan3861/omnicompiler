@@ -31,6 +31,9 @@ MANIFEST
 .rc_evolution_workspace/
 HEAD/
 *.db
+*.db-wal
+*.db-shm
+*.mmap
 *.sqlite
 *.sqlite3
 

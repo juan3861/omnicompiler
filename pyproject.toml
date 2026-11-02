@@ -52,7 +52,8 @@ dependencies = [
     "tree-sitter-language-pack>=0.13.0",
     "unicorn>=2.1.0",
     "wasmtime>=20.0.0",
-    "llvmlite>=0.40.0"
+    "llvmlite>=0.40.0",
+    "blake3>=0.4.1"
 ]
 
 [project.optional-dependencies]
@@ -71,8 +72,12 @@ Issues = "https://github.com/juan3861/omnicompiler/issues"
 
 [project.scripts]
 omnicompiler = "cli:main"
+omnicompiler-native = "omnicompiler_cli:main"
 omnicompiler-evolver = "evolution.recursive_bootstrap_loop:main"
 omnicompiler-status = "evolution.status_dashboard:main"
+
+[tool.setuptools]
+py-modules = ["cli", "omnicompiler_cli", "omni_repo_compiler"]
 
 [tool.setuptools.packages.find]
 where = ["."]

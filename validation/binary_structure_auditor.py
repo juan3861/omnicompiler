@@ -136,7 +136,57 @@ class BinaryStructureAuditor:
                     name_off, = struct.unpack("<I", macho_bytes[offset+8:offset+12])
                     if offset + name_off < offset + cmdsize:
                         raw_name = macho_bytes[offset+name_off:offset+cmdsize].split(b"\x00")[0]
-                        exports.append(raw_name.decode("utf-8", errors="ignore"))
+                        install_str = raw_name.decode("utf-8", errors="ignore")
+                        metrics["install_name"] = install_str
+                        if install_str and install_str not in exports:
+                            exports.append(install_str)
+            elif cmd == 0x02:  # LC_SYMTAB (nlist_64 exported symbols)
+                if cmdsize >= 24:
+                    symoff, nsyms, stroff, strsize = struct.unpack("<IIII", macho_bytes[offset+8:offset+24])
+                    if symoff + nsyms * 16 <= len(macho_bytes) and stroff + strsize <= len(macho_bytes):
+                        strtab = macho_bytes[stroff:stroff+strsize]
+                        for s_i in range(nsyms):
+                            n_off = symoff + s_i * 16
+                            n_strx, n_type, n_sect, n_desc, n_val = struct.unpack("<IBBHQ", macho_bytes[n_off:n_off+16])
+                            if (n_type & 0x01) and n_strx < len(strtab):  # N_EXT external symbol
+                                raw_sym = strtab[n_strx:].split(b"\x00")[0].decode("utf-8", errors="ignore")
+                                clean_sym = raw_sym[1:] if raw_sym.startswith("_") else raw_sym
+                                if clean_sym and clean_sym not in exports:
+                                    exports.append(clean_sym)
+            elif cmd == 0x1D:  # LC_CODE_SIGNATURE (Apple Silicon XNU Ad-Hoc CodeDirectory)
+                if cmdsize >= 16:
+                    import hashlib
+                    cs_off, cs_size = struct.unpack("<II", macho_bytes[offset+8:offset+16])
+                    if cs_off + cs_size <= len(macho_bytes) and cs_size >= 20:
+                        sb_magic, sb_len, sb_cnt = struct.unpack(">III", macho_bytes[cs_off:cs_off+12])
+                        if sb_magic != 0xFADE0CC0:
+                            errors.append(f"Invalid Mach-O CS_SuperBlob magic: 0x{sb_magic:08X}")
+                        else:
+                            _slot_type, cd_rel = struct.unpack(">II", macho_bytes[cs_off+12:cs_off+20])
+                            cd_pos = cs_off + cd_rel
+                            if cd_pos + 44 <= len(macho_bytes):
+                                (
+                                    cd_magic, _cd_len, _cd_ver, cd_flags, hash_off, _id_off,
+                                    _n_spec, n_code_slots, code_limit, hash_sz, hash_type, _plat, page_shift, _sp2
+                                ) = struct.unpack(">IIIIIIIIIBBBBI", macho_bytes[cd_pos:cd_pos+44])
+                                if cd_magic != 0xFADE0C02:
+                                    errors.append(f"Invalid CS_CodeDirectory magic: 0x{cd_magic:08X}")
+                                else:
+                                    page_sz = 1 << page_shift
+                                    hashes_ok = True
+                                    for slot in range(n_code_slots):
+                                        p_start = slot * page_sz
+                                        p_end = min(p_start + page_sz, code_limit)
+                                        expected_h = hashlib.sha256(macho_bytes[p_start:p_end]).digest()
+                                        h_pos = cd_pos + hash_off + slot * hash_sz
+                                        actual_h = macho_bytes[h_pos:h_pos+hash_sz]
+                                        if expected_h != actual_h:
+                                            hashes_ok = False
+                                            errors.append(f"CodeDirectory SHA-256 mismatch on page {slot}")
+                                            break
+                                    metrics["codesign_verified"] = hashes_ok
+                                    metrics["codesign_flags"] = f"0x{cd_flags:08X}"
+                                    metrics["codesign_pages"] = n_code_slots
 
             offset += cmdsize
 

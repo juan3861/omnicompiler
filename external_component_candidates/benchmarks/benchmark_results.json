@@ -1,29 +1,29 @@
 {
-  "timestamp": "2026-10-21T19:11:15Z",
+  "timestamp": "2026-11-02T05:00:11Z",
   "parsing": {
     "tree_sitter": {
-      "time_sec": 0.020058100002643187,
+      "time_sec": 0.019820399989839643,
       "symbols_extracted": 400
     },
     "regex": {
-      "time_sec": 0.0007855000003473833,
+      "time_sec": 0.0006871999939903617,
       "symbols_extracted": 400
     }
   },
   "execution": {
     "llvm_o3_jit": {
-      "time_sec": 3.7999998312443495e-06,
+      "time_sec": 6.499991286545992e-06,
       "result": 4999950000,
       "iterations": 100000
     },
     "wasmtime_sandbox": {
-      "time_sec": 0.0075058000002172776,
+      "time_sec": 0.008700900012627244,
       "result": 4999950000,
       "iterations": 100000
     }
   },
   "safety_and_audit": {
-    "unicorn_preflight_latency_ms": 1.8300520000047982,
-    "formal_audit_latency_ms": 0.5648700000165263
+    "unicorn_preflight_latency_ms": 2.261949999956414,
+    "formal_audit_latency_ms": 0.6348830001661554
   }
 }

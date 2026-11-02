@@ -56,6 +56,18 @@ class OmniMutator(ast.NodeTransformer):
     def _roll(self) -> bool:
         return random.random() <= self.mutation_rate
 
+    @staticmethod
+    def _is_pure_int_expr(node: ast.AST) -> bool:
+        """Checks that `node` has no function calls/side-effects and is not a non-int sequence/float literal."""
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.Call, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr)):
+                return False
+            if isinstance(sub, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                return False
+            if isinstance(sub, ast.Constant) and not isinstance(sub.value, int):
+                return False
+        return True
+
     # =========================================================================
     # CATEGORY 1: ARITHMETIC STRENGTH REDUCTION & ALGEBRAIC LAWS
     # =========================================================================
@@ -102,9 +114,9 @@ class OmniMutator(ast.NodeTransformer):
                 self.mutations_applied.append("algebraic_mult_1_eliminated")
                 return node.left
 
-        # 1.6. x * 0 -> 0
+        # 1.6. x * 0 -> 0 (only when x is side-effect-free integer expression)
         if isinstance(node.op, ast.Mult) and isinstance(node.right, ast.Constant) and node.right.value == 0:
-            if self._roll():
+            if self._is_pure_int_expr(node.left) and self._roll():
                 self.mutations_applied.append("algebraic_mult_0_to_0")
                 return ast.Constant(value=0)
 
@@ -245,3 +257,15 @@ class OmniMutator(ast.NodeTransformer):
                 self.mutations_applied.append("memory_sum_listcomp_to_generator_zero_alloc")
 
         return node
+
+
+def apply_omni_mutations(source_code: str, mutation_rate: float = 1.0) -> Tuple[str, List[str]]:
+    """
+    Deterministically applies side-effect-safe `OmniMutator` AST rewrites to `source_code`
+    and returns `(mutated_source, mutations_applied)`.
+    """
+    tree = ast.parse(source_code)
+    mutator = OmniMutator(mutation_rate=mutation_rate)
+    mutated_tree = mutator.visit(tree)
+    ast.fix_missing_locations(mutated_tree)
+    return ast.unparse(mutated_tree), list(mutator.mutations_applied)
