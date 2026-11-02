@@ -233,15 +233,50 @@ class NativeJitCompiler:
         callable_fn._jit_mem = mem
         return callable_fn, mem, raw_code.hex()
 
-    def compile_ssa(self, ssa_fn: SSAFunction) -> Tuple[Any, NativeJitMemory, str]:
-        """Compiles an arbitrary multi-block `SSAFunction` into W^X executable RAM."""
+    def compile_ssa(self, ssa_fn: SSAFunction, extra_symbols: Optional[Dict[str, int]] = None) -> Tuple[Any, NativeJitMemory, str]:
+        """Compiles an arbitrary multi-block `SSAFunction` into W^X executable RAM, resolving runtime collections."""
+        from runtime.native_heap import NATIVE_COLLECTION_SYMBOLS
         artifact = self.codegen.compile_function(ssa_fn)
+        raw_code = bytearray(artifact.code_bytes)
+
         if artifact.relocations:
-            unresolved = [r.symbol_name for r in artifact.relocations]
-            raise ValueError(f"JIT function '{ssa_fn.name}' has external symbol relocations {unresolved}; use NativeObjectLinker.")
-        raw_code = artifact.code_bytes
+            thunk_cache: Dict[str, int] = {}
+            if not hasattr(self, "_active_c_callbacks"):
+                self._active_c_callbacks = []
+
+            for rel in artifact.relocations:
+                sym = rel.symbol_name
+                if sym in thunk_cache:
+                    thunk_off = thunk_cache[sym]
+                elif sym in NATIVE_COLLECTION_SYMBOLS:
+                    fn_meta = NATIVE_COLLECTION_SYMBOLS[sym]
+                    fn_obj, arg_types, res_type = fn_meta
+                    c_fn = ctypes.CFUNCTYPE(res_type, *arg_types)(fn_obj)
+                    self._active_c_callbacks.append(c_fn)
+                    addr = ctypes.cast(c_fn, ctypes.c_void_p).value
+                    aligned_len = ((len(raw_code) + 15) // 16) * 16
+                    raw_code.extend(b"\x90" * (aligned_len - len(raw_code)))
+                    thunk_off = len(raw_code)
+                    thunk_code = b"\x49\xbb" + struct.pack("<Q", addr) + b"\x41\xff\xe3\x90\x90\x90"
+                    raw_code.extend(thunk_code)
+                    thunk_cache[sym] = thunk_off
+                elif extra_symbols and sym in extra_symbols:
+                    addr = extra_symbols[sym]
+                    aligned_len = ((len(raw_code) + 15) // 16) * 16
+                    raw_code.extend(b"\x90" * (aligned_len - len(raw_code)))
+                    thunk_off = len(raw_code)
+                    thunk_code = b"\x49\xbb" + struct.pack("<Q", addr) + b"\x41\xff\xe3\x90\x90\x90"
+                    raw_code.extend(thunk_code)
+                    thunk_cache[sym] = thunk_off
+                else:
+                    unresolved = [r.symbol_name for r in artifact.relocations if r.symbol_name not in thunk_cache and r.symbol_name not in NATIVE_COLLECTION_SYMBOLS]
+                    raise ValueError(f"JIT function '{ssa_fn.name}' has external symbol relocations {unresolved}; use NativeObjectLinker.")
+
+                disp32 = thunk_off - (rel.offset + 4)
+                struct.pack_into("<i", raw_code, rel.offset, disp32)
+
         mem = NativeJitMemory(size=max(4096, len(raw_code)))
-        mem.write_code(raw_code)
+        mem.write_code(bytes(raw_code))
 
         arg_ctypes = [ctypes.c_int64] * len(ssa_fn.params)
         fn_type = ctypes.CFUNCTYPE(ctypes.c_int64, *arg_ctypes)

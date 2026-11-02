@@ -343,6 +343,26 @@ class AstToSsaLowering:
                 entry.add_instruction(SSAInstruction(res_var, "call", [node.func.id] + arg_vars, source_line=line))
                 return res_var
 
+            elif isinstance(node, ast.Subscript):
+                base_var = lower_node(node.value)
+                idx_var = lower_node(node.slice)
+                is_raw_pointer = (
+                    isinstance(node.value, ast.Name)
+                    and (
+                        node.value.id in param_names
+                        or node.value.id.endswith("_ptr")
+                        or node.value.id.endswith("_buf")
+                        or node.value.id.startswith("buf")
+                        or node.value.id.startswith("sim_")
+                    )
+                )
+                res_var = self._next_var("ld")
+                if is_raw_pointer:
+                    entry.add_instruction(SSAInstruction(res_var, "load", [base_var, idx_var], source_line=line))
+                else:
+                    entry.add_instruction(SSAInstruction(res_var, "call", ["omni_item_get", base_var, idx_var], source_line=line))
+                return res_var
+
             fallback_var = self._next_var("val")
             entry.add_instruction(SSAInstruction(fallback_var, "unknown", [str(node)], source_line=line))
             return fallback_var
@@ -600,12 +620,12 @@ class AstToSsaLowering:
                 base_var = self._lower_expr(stmt.target.value)
                 idx_var = self._lower_expr(stmt.target.slice)
                 loaded = self._next_var("ld")
-                self._emit(loaded, "load", [base_var, idx_var], line=line)
+                self._emit(loaded, "call", ["omni_item_get", base_var, idx_var], line=line)
                 rhs_val = self._lower_expr(stmt.value)
                 opcode = self.BINOP_MAP.get(type(stmt.op), "add")
                 res = self._next_var("st_val")
                 self._emit(res, opcode, [loaded, rhs_val], line=line)
-                self._emit(None, "store", [base_var, idx_var, res], line=line)
+                self._emit(None, "call", ["omni_item_set", base_var, idx_var, res], line=line)
 
         elif isinstance(stmt, ast.If):
             cond_var = self._lower_expr(stmt.test)
@@ -768,6 +788,68 @@ class AstToSsaLowering:
                 self._seal_block(exit_bb)
                 self._cur_block = exit_bb
 
+            elif isinstance(stmt.target, ast.Name):
+                # Generic collection loop: `for item in <iterable>:`
+                coll_v = self._lower_expr(stmt.iter)
+                len_v = self._next_var("coll_len")
+                self._emit(len_v, "call", ["omni_item_len", coll_v], line=line)
+                iv_name = f"_iter_idx_{self._block_counter}"
+                iv_start = self._emit_const(0, line=line)
+                iv_step = self._emit_const(1, line=line)
+                self._write_variable(iv_name, self._cur_block, iv_start)
+
+                pre_bb = self._cur_block
+                self._loop_depth += 1
+                cond_bb = self._new_block("for_cond", seal=False)
+                body_bb = self._new_block("for_body", seal=False)
+                latch_bb = self._new_block("for_latch", seal=False)
+                self._loop_depth -= 1
+                exit_bb = self._new_block("for_exit", seal=False)
+
+                pre_bb.connect_to(cond_bb)
+                self._emit(None, "br", [cond_bb.name], line=line)
+
+                self._cur_block = cond_bb
+                cur_iv = self._read_variable(iv_name, cond_bb)
+                cond_var = self._next_var("for_cmp")
+                self._emit(cond_var, "cmp_lt", [cur_iv, len_v], line=line)
+                cond_bb.connect_to(body_bb)
+                cond_bb.connect_to(exit_bb)
+                self._emit(None, "br_cond", [cond_var, body_bb.name, exit_bb.name], line=line)
+
+                self._seal_block(body_bb)
+                self._loop_depth += 1
+                self._loop_stack.append((latch_bb, exit_bb))
+                self._cur_block = body_bb
+
+                # Fetch element from collection and bind to loop target
+                item_v = self._next_var("coll_item")
+                self._emit(item_v, "call", ["omni_item_get", coll_v, cur_iv], line=line)
+                self._write_variable(stmt.target.id, body_bb, item_v)
+
+                self._lower_stmt_list(stmt.body)
+                self._loop_stack.pop()
+                self._loop_depth -= 1
+
+                body_end = self._cur_block
+                if body_end is not None and not body_end.is_terminated:
+                    body_end.connect_to(latch_bb)
+                    self._emit(None, "br", [latch_bb.name], line=line)
+
+                self._seal_block(latch_bb)
+                if len(latch_bb.predecessors) > 0:
+                    self._cur_block = latch_bb
+                    latch_iv = self._read_variable(iv_name, latch_bb)
+                    next_iv = self._next_var(iv_name)
+                    self._emit(next_iv, "add", [latch_iv, iv_step], line=line)
+                    self._write_variable(iv_name, latch_bb, next_iv)
+                    latch_bb.connect_to(cond_bb)
+                    self._emit(None, "br", [cond_bb.name], line=line)
+
+                self._seal_block(cond_bb)
+                self._seal_block(exit_bb)
+                self._cur_block = exit_bb
+
         elif isinstance(stmt, ast.Break):
             if self._loop_stack:
                 _, break_bb = self._loop_stack[-1]
@@ -783,6 +865,16 @@ class AstToSsaLowering:
         elif isinstance(stmt, ast.Expr):
             if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
                 return  # Ignore docstring
+            if (
+                isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "append"
+                and isinstance(stmt.value.func.value, ast.Name)
+            ):
+                var_name = stmt.value.func.value.id
+                new_ptr = self._lower_expr(stmt.value)
+                self._write_variable(var_name, self._cur_block, new_ptr)
+                return
             self._lower_expr(stmt.value)
 
         elif isinstance(stmt, ast.Pass):
@@ -795,7 +887,20 @@ class AstToSsaLowering:
         elif isinstance(target, ast.Subscript):
             base_var = self._lower_expr(target.value)
             idx_var = self._lower_expr(target.slice)
-            self._emit(None, "store", [base_var, idx_var, val], line=line)
+            is_raw_pointer = (
+                isinstance(target.value, ast.Name)
+                and (
+                    (self._fn is not None and target.value.id in self._fn.params)
+                    or target.value.id.endswith("_ptr")
+                    or target.value.id.endswith("_buf")
+                    or target.value.id.startswith("buf")
+                    or target.value.id.startswith("sim_")
+                )
+            )
+            if is_raw_pointer:
+                self._emit(None, "store", [base_var, idx_var, val], line=line)
+            else:
+                self._emit(None, "call", ["omni_item_set", base_var, idx_var, val], line=line)
 
     def _lower_expr(self, node: ast.AST) -> SSAVar:
         assert self._cur_block is not None
@@ -880,17 +985,56 @@ class AstToSsaLowering:
             self._emit(res, "select", [cond_var, true_var, false_var], line=line)
             return res
 
+        elif isinstance(node, ast.List):
+            init_cap = self._emit_const(max(4, len(node.elts)), line=line)
+            list_ptr = self._next_var("list_ptr")
+            self._emit(list_ptr, "call", ["omni_list_new", init_cap], line=line)
+            for i, elt in enumerate(node.elts):
+                elt_v = self._lower_expr(elt)
+                idx_v = self._emit_const(i, line=line)
+                self._emit(None, "call", ["omni_list_set", list_ptr, idx_v, elt_v], line=line)
+            return list_ptr
+
+        elif isinstance(node, ast.Dict):
+            init_cap = self._emit_const(max(16, len(node.keys) * 2), line=line)
+            dict_ptr = self._next_var("dict_ptr")
+            self._emit(dict_ptr, "call", ["omni_dict_new", init_cap], line=line)
+            for k_node, v_node in zip(node.keys, node.values):
+                if k_node is not None:
+                    k_v = self._lower_expr(k_node)
+                    v_v = self._lower_expr(v_node)
+                    self._emit(None, "call", ["omni_dict_set", dict_ptr, k_v, v_v], line=line)
+            return dict_ptr
+
         elif isinstance(node, ast.Subscript):
             base_var = self._lower_expr(node.value)
             idx_var = self._lower_expr(node.slice)
+            is_raw_pointer = (
+                isinstance(node.value, ast.Name)
+                and (
+                    (self._fn is not None and node.value.id in self._fn.params)
+                    or node.value.id.endswith("_ptr")
+                    or node.value.id.endswith("_buf")
+                    or node.value.id.startswith("buf")
+                    or node.value.id.startswith("sim_")
+                )
+            )
             res = self._next_var("ld")
-            self._emit(res, "load", [base_var, idx_var], line=line)
+            if is_raw_pointer:
+                self._emit(res, "load", [base_var, idx_var], line=line)
+            else:
+                self._emit(res, "call", ["omni_item_get", base_var, idx_var], line=line)
             return res
 
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 fname = node.func.id
-                if fname == "abs" and len(node.args) == 1:
+                if fname == "len" and len(node.args) == 1:
+                    arg_v = self._lower_expr(node.args[0])
+                    res = self._next_var("len")
+                    self._emit(res, "call", ["omni_item_len", arg_v], line=line)
+                    return res
+                elif fname == "abs" and len(node.args) == 1:
                     x = self._lower_expr(node.args[0])
                     z = self._emit_const(0, line=line)
                     is_neg = self._next_var("is_neg")
@@ -922,6 +1066,20 @@ class AstToSsaLowering:
                     arg_vars = [self._lower_expr(a) for a in node.args]
                     res = self._next_var("call")
                     self._emit(res, "call", [fname] + arg_vars, line=line)
+                    return res
+            elif isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if attr == "append" and len(node.args) == 1:
+                    obj_v = self._lower_expr(node.func.value)
+                    val_v = self._lower_expr(node.args[0])
+                    res = self._next_var("appended_list")
+                    self._emit(res, "call", ["omni_list_append", obj_v, val_v], line=line)
+                    return res
+                elif attr == "get" and 1 <= len(node.args) <= 2:
+                    obj_v = self._lower_expr(node.func.value)
+                    key_v = self._lower_expr(node.args[0])
+                    res = self._next_var("get_val")
+                    self._emit(res, "call", ["omni_dict_get", obj_v, key_v], line=line)
                     return res
 
         return self._emit_const(0, line=line)

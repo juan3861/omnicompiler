@@ -298,6 +298,38 @@ class NativeObjectLinker:
         2. Build global symbol address map & exported symbol map.
         3. Patch all x86-64 (`REL32`, `ADDR64`) and ARM64 (`ARM64_CALL26`) relocation slots.
         """
+        # Auto-synthesize runtime collection symbol thunks if any module requires them
+        try:
+            from runtime.native_heap import NATIVE_COLLECTION_SYMBOLS
+        except ImportError:
+            NATIVE_COLLECTION_SYMBOLS = {}
+
+        defined_syms = set()
+        for mod in self.modules:
+            for s in mod.symbols:
+                defined_syms.add(s)
+
+        needed_runtime_syms = set()
+        for mod in self.modules:
+            for reloc in mod.relocations:
+                if reloc.symbol_name not in defined_syms and reloc.symbol_name in NATIVE_COLLECTION_SYMBOLS:
+                    needed_runtime_syms.add(reloc.symbol_name)
+
+        if needed_runtime_syms:
+            if not hasattr(self, "_active_callbacks"):
+                self._active_callbacks = []
+            runtime_mod = ObjectModule("__omni_runtime_thunks__")
+            for sym in sorted(needed_runtime_syms):
+                fn_meta = NATIVE_COLLECTION_SYMBOLS[sym]
+                fn_obj, arg_types, res_type = fn_meta
+                c_fn = ctypes.CFUNCTYPE(res_type, *arg_types)(fn_obj)
+                self._active_callbacks.append(c_fn)
+                addr = ctypes.cast(c_fn, ctypes.c_void_p).value
+                # x86-64: mov r11, <addr>; jmp r11; ret
+                thunk_bytes = b"\x49\xbb" + struct.pack("<Q", addr) + b"\x41\xff\xe3\xc3"
+                runtime_mod.add_symbol(sym, thunk_bytes, is_exported=True)
+            self.modules.append(runtime_mod)
+
         combined_text = bytearray()
         module_text_offsets: Dict[int, int] = {}
         global_symbol_table: Dict[str, int] = {}

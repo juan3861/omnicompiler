@@ -937,6 +937,18 @@ class Arm64CodeGenerator:
                     # CSEL X9, X10, X11, NE(1) -> 0x9A8B1149
                     code.extend(_a64_u32(0x9A8B1149))
                     store_res(inst.result, 9)
+                elif op == "load":
+                    load_op(inst.operands[0], 9)   # base ptr in X9
+                    load_op(inst.operands[1], 10)  # index in X10
+                    # LDR X11, [X9, X10, LSL #3] -> 0xF8607800 | (10 << 16) | (9 << 5) | 11
+                    code.extend(_a64_u32(0xF8607800 | (10 << 16) | (9 << 5) | 11))
+                    store_res(inst.result, 11)
+                elif op == "store":
+                    load_op(inst.operands[0], 9)   # base ptr in X9
+                    load_op(inst.operands[1], 10)  # index in X10
+                    load_op(inst.operands[2], 11)  # value in X11
+                    # STR X11, [X9, X10, LSL #3] -> 0xF8207800 | (10 << 16) | (9 << 5) | 11
+                    code.extend(_a64_u32(0xF8207800 | (10 << 16) | (9 << 5) | 11))
                 elif op == "call":
                     callee = str(inst.operands[0])
                     for a_i, a_op in enumerate(inst.operands[1:9]):

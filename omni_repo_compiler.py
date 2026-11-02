@@ -35,7 +35,12 @@ from compiler.wasm_backend import WasmBackend
 from compiler.audit_ledger import create_compilation_audit_ledger, save_audit_ledger
 
 
-NATIVE_BUILTIN_CALLS = frozenset({"abs", "min", "max", "int", "range"})
+NATIVE_BUILTIN_CALLS = frozenset({
+    "abs", "min", "max", "int", "range", "len",
+    "omni_alloc", "omni_list_new", "omni_list_len", "omni_list_get", "omni_list_set", "omni_list_append",
+    "omni_dict_new", "omni_dict_set", "omni_dict_get", "omni_dict_len",
+    "omni_item_get", "omni_item_set", "omni_item_len",
+})
 
 
 def _extract_called_names(fn_def: ast.FunctionDef) -> Set[str]:
@@ -49,14 +54,13 @@ def _extract_called_names(fn_def: ast.FunctionDef) -> Set[str]:
 
 def _has_only_numeric_cfg_syntax(fn_def: ast.FunctionDef) -> bool:
     """
-    Returns True if `fn_def` uses numeric/integer/pointer/CFG Python constructs
-    that compile cleanly to native x86-64/ARM64 machine code without Python runtime objects.
+    Returns True if `fn_def` uses numeric/integer/pointer/CFG and native composite collections (list/dict)
+    that compile cleanly to native x86-64/ARM64 machine code via OmniCompiler Native Heap.
     """
     for node in ast.walk(fn_def):
         if isinstance(
             node,
             (
-                ast.Dict,
                 ast.Set,
                 ast.ListComp,
                 ast.DictComp,
@@ -75,9 +79,12 @@ def _has_only_numeric_cfg_syntax(fn_def: ast.FunctionDef) -> bool:
             ),
         ):
             return False
-        if isinstance(node, ast.Call) and not isinstance(node.func, ast.Name):
-            # Method call on Python object (`obj.append(...)`) requires Python runtime
-            return False
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr not in ("append", "get"):
+                    return False
+            elif not isinstance(node.func, ast.Name):
+                return False
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes, float)):
             # Ignore module/function docstring
             continue
