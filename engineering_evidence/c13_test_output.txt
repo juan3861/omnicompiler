@@ -1,0 +1,22 @@
+test_01_native_string_sso_and_heap_representation (test_alpha_c13_stateful_selection.TestAlphaC13StatefulSelection.test_01_native_string_sso_and_heap_representation)
+Validates SSO (<= 15 bytes inline) and Heap (> 15 bytes) binary layouts. ... ok
+test_02_native_string_zero_copy_slicing_and_equality (test_alpha_c13_stateful_selection.TestAlphaC13StatefulSelection.test_02_native_string_zero_copy_slicing_and_equality)
+Validates zero-copy slice descriptors, concatenation, equality, and startswith. ... ok
+test_03_ssa_string_lowering_and_jit_execution (test_alpha_c13_stateful_selection.TestAlphaC13StatefulSelection.test_03_ssa_string_lowering_and_jit_execution)
+Validates AST to SSA IR lowering of string constants, slicing, and method calls. ... ok
+test_04_thin_lto_cross_repo_leaf_inlining_and_const_folding (test_alpha_c13_stateful_selection.TestAlphaC13StatefulSelection.test_04_thin_lto_cross_repo_leaf_inlining_and_const_folding)
+Validates ThinLTO cross-repository constant-return folding and leaf inlining. ... ok
+test_05_stateful_selection_ledger_anti_replay (test_alpha_c13_stateful_selection.TestAlphaC13StatefulSelection.test_05_stateful_selection_ledger_anti_replay)
+Validates evaluation ticket lifecycle, single-use burning, and replay protection. ... ok
+test_06_holm_bonferroni_fwer_and_pareto_promotion (test_alpha_c13_stateful_selection.TestAlphaC13StatefulSelection.test_06_holm_bonferroni_fwer_and_pareto_promotion)
+Validates Holm-Bonferroni FWER control and (Q, F, C, L, K, P) Pareto evaluation. ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.447s
+
+OK
+
+RESULT_SUCCESS=True
+TESTS_RUN=6
+ERRORS=0
+FAILURES=0

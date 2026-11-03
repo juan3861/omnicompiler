@@ -1,0 +1,35 @@
+{
+  "decision": "PROMOTED",
+  "protocol": "ALPHA-C13-STATEFUL-SELECTION",
+  "baseline_commit": "2d4935a",
+  "candidate_version": "13.0.0",
+  "evaluated_at": "2026-11-02T21:45:00Z",
+  "pareto_vector": {
+    "Q_quality_score": 0.985,
+    "F_critical_failures": 0,
+    "C_cost_reduction_pct": 14.2,
+    "L_latency_reduction_pct": 18.7,
+    "K_handoffs": 1,
+    "P_code_efficiency_score": 0.96
+  },
+  "fwer_control": {
+    "method": "Holm-Bonferroni",
+    "family_alpha": 0.05,
+    "hypotheses_tested": 6,
+    "significant_rejections": 6
+  },
+  "gates_status": {
+    "GATE-01": "PASS",
+    "GATE-02": "PASS",
+    "GATE-03": "PASS",
+    "GATE-04": "PASS",
+    "GATE-05": "PASS",
+    "GATE-06": "PASS",
+    "GATE-07": "PASS",
+    "GATE-08": "PASS",
+    "GATE-09": "PASS",
+    "GATE-10": "PASS"
+  },
+  "authorized_by": "Independent Adversarial Auditor & Lead System Architect",
+  "rationale": "Candidate strictly dominates baseline across Quality, Zero-Failure, and Latency without violating resource constraints or relying on CPython runtime headers."
+}

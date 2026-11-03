@@ -1,0 +1,49 @@
+{
+  "version": "1.0",
+  "protocol": "ALPHA-C13-STATEFUL-SELECTION",
+  "orchestrator_session": "SESSION-ORCHESTRATOR-c406d4a9",
+  "issued_at": "2026-11-02T18:30:00Z",
+  "expires_at": "2026-11-02T22:30:00Z",
+  "approvals": [
+    {
+      "approval_id": "APPR-C13-001-STRINGS",
+      "action": "CREATE_MODULE",
+      "target_file": "runtime/native_strings.py",
+      "scope": "Add C-ABI Small String Optimization and zero-copy slice descriptors",
+      "allowed_methods": ["WRITE", "TEST", "AUDIT"],
+      "single_use": true,
+      "consumed": false,
+      "token_hash": "a17f69b82c3e1045da10b5f12e84c98e10492817293847291029384719283746"
+    },
+    {
+      "approval_id": "APPR-C13-002-THINLTO",
+      "action": "CREATE_MODULE",
+      "target_file": "compiler/thin_lto.py",
+      "scope": "Implement cross-repo summary index and inter-procedural constant propagation",
+      "allowed_methods": ["WRITE", "TEST", "AUDIT"],
+      "single_use": true,
+      "consumed": false,
+      "token_hash": "b28e70c93d4f2156eb21c6f23f95d09f21503928304958302130495820394857"
+    },
+    {
+      "approval_id": "APPR-C13-003-STATEFUL-LEDGER",
+      "action": "CREATE_MODULE",
+      "target_file": "validation/stateful_selection_ledger.py",
+      "scope": "Enforce single-use non-replayable evaluation tickets and Holm-Bonferroni correction",
+      "allowed_methods": ["WRITE", "TEST", "AUDIT"],
+      "single_use": true,
+      "consumed": false,
+      "token_hash": "c39f81d04e5a3267fc32d7a34a06e1a032614039415069413241506931405968"
+    },
+    {
+      "approval_id": "APPR-C13-004-TEST-SUITE",
+      "action": "CREATE_TEST_SUITE",
+      "target_file": "tests/test_alpha_c13_stateful_selection.py",
+      "scope": "Comprehensive test suite for C13 deliverables",
+      "allowed_methods": ["WRITE", "EXECUTE", "AUDIT"],
+      "single_use": true,
+      "consumed": false,
+      "token_hash": "d40a92e15f6b4378ad43e8b45b17f2b143725140526170524352617042516079"
+    }
+  ]
+}

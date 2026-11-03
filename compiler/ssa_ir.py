@@ -285,7 +285,13 @@ class AstToSsaLowering:
                 return env.get(node.id, SSAVar(node.id, 0))
 
             elif isinstance(node, ast.Constant):
-                val = int(node.value) if isinstance(node.value, bool) else node.value
+                if isinstance(node.value, bool):
+                    val = int(node.value)
+                elif isinstance(node.value, str):
+                    from runtime.native_strings import omni_str_new_from_bytes
+                    val = omni_str_new_from_bytes(node.value.encode("utf-8"))
+                else:
+                    val = node.value
                 const_var = self._next_var("c")
                 entry.add_instruction(SSAInstruction(const_var, "const", [val], source_line=line))
                 return const_var
@@ -914,6 +920,11 @@ class AstToSsaLowering:
                 return self._emit_const(1 if node.value else 0, line=line)
             elif isinstance(node.value, int):
                 return self._emit_const(node.value, line=line)
+            elif isinstance(node.value, str):
+                from runtime.native_strings import omni_str_new_from_bytes
+                raw = node.value.encode("utf-8")
+                ptr = omni_str_new_from_bytes(raw)
+                return self._emit_const(ptr, line=line)
             return self._emit_const(0, line=line)
 
         elif isinstance(node, ast.UnaryOp):
@@ -1008,6 +1019,12 @@ class AstToSsaLowering:
 
         elif isinstance(node, ast.Subscript):
             base_var = self._lower_expr(node.value)
+            if isinstance(node.slice, ast.Slice):
+                start_v = self._lower_expr(node.slice.lower) if node.slice.lower is not None else self._emit_const(0, line=line)
+                stop_v = self._lower_expr(node.slice.upper) if node.slice.upper is not None else self._emit_const(0x7fffffff, line=line)
+                res = self._next_var("slice")
+                self._emit(res, "call", ["omni_str_slice", base_var, start_v, stop_v], line=line)
+                return res
             idx_var = self._lower_expr(node.slice)
             is_raw_pointer = (
                 isinstance(node.value, ast.Name)
@@ -1081,8 +1098,18 @@ class AstToSsaLowering:
                     res = self._next_var("get_val")
                     self._emit(res, "call", ["omni_dict_get", obj_v, key_v], line=line)
                     return res
+                elif attr == "startswith" and len(node.args) == 1:
+                    obj_v = self._lower_expr(node.func.value)
+                    pref_v = self._lower_expr(node.args[0])
+                    res = self._next_var("sw")
+                    self._emit(res, "call", ["omni_str_startswith", obj_v, pref_v], line=line)
+                    return res
 
         return self._emit_const(0, line=line)
+
+
+# Backward compatibility alias
+ASTToSSAConverter = AstToSsaLowering
 
 
 # ==============================================================================
@@ -1194,6 +1221,18 @@ def optimize_ssa(fn: SSAFunction) -> SSAFunction:
                 if inst.opcode == "const" and inst.result and len(inst.operands) == 1 and isinstance(inst.operands[0], int):
                     const_map[inst.result] = inst.operands[0]
                     continue
+
+                if inst.opcode == "mov" and inst.result and len(inst.operands) == 1:
+                    src = inst.operands[0]
+                    if isinstance(src, int):
+                        inst.opcode = "const"
+                        const_map[inst.result] = src
+                        changed = True
+                        continue
+                    elif isinstance(src, SSAVar):
+                        copy_map[inst.result] = src
+                        changed = True
+                        continue
 
                 if inst.result and len(inst.operands) == 2 and inst.opcode in (
                     "add", "sub", "mul", "sdiv", "srem", "shl", "shr", "and", "or", "xor",

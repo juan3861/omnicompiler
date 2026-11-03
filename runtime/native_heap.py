@@ -253,6 +253,26 @@ def omni_dict_len(dict_ptr: int) -> int:
 def omni_item_get(container_ptr: int, key_or_idx: int) -> int:
     if container_ptr == 0:
         return 0
+    # Check for native string tags
+    tag_sso = ctypes.c_uint32.from_address(container_ptr + 20).value
+    if tag_sso == 0x53545230:
+        from runtime.native_strings import omni_str_get_byte
+        return omni_str_get_byte(container_ptr, key_or_idx)
+    tag_heap = ctypes.c_uint32.from_address(container_ptr + 4).value
+    if tag_heap == 0x53545231:
+        from runtime.native_strings import omni_str_get_byte
+        return omni_str_get_byte(container_ptr, key_or_idx)
+    tag_slice = ctypes.c_uint32.from_address(container_ptr + 24).value
+    if tag_slice == 0x53545232:
+        base_p = ctypes.c_int64.from_address(container_ptr).value
+        start = ctypes.c_int64.from_address(container_ptr + 8).value
+        slen = ctypes.c_int64.from_address(container_ptr + 16).value
+        if key_or_idx < 0:
+            key_or_idx += slen
+        if 0 <= key_or_idx < slen and base_p != 0:
+            return ctypes.c_uint8.from_address(base_p + start + key_or_idx).value
+        return 0
+
     header_val = ctypes.c_int64.from_address(container_ptr).value
     if header_val < 0:
         return omni_dict_get(container_ptr, key_or_idx)
@@ -271,6 +291,19 @@ def omni_item_set(container_ptr: int, key_or_idx: int, val: int) -> int:
 def omni_item_len(container_ptr: int) -> int:
     if container_ptr == 0:
         return 0
+    # Check for native string tags
+    tag_sso = ctypes.c_uint32.from_address(container_ptr + 20).value
+    if tag_sso == 0x53545230:
+        from runtime.native_strings import omni_str_len
+        return omni_str_len(container_ptr)
+    tag_heap = ctypes.c_uint32.from_address(container_ptr + 4).value
+    if tag_heap == 0x53545231:
+        from runtime.native_strings import omni_str_len
+        return omni_str_len(container_ptr)
+    tag_slice = ctypes.c_uint32.from_address(container_ptr + 24).value
+    if tag_slice == 0x53545232:
+        return ctypes.c_int64.from_address(container_ptr + 16).value
+
     return ctypes.c_int64.from_address(container_ptr + 8).value
 
 
@@ -290,3 +323,10 @@ NATIVE_COLLECTION_SYMBOLS: Dict[str, Tuple[Any, List[Any], Any]] = {
     "omni_item_set": (omni_item_set, [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64], ctypes.c_int64),
     "omni_item_len": (omni_item_len, [ctypes.c_int64], ctypes.c_int64),
 }
+
+# Auto-merge native string symbols
+try:
+    from runtime.native_strings import NATIVE_STRING_SYMBOLS
+    NATIVE_COLLECTION_SYMBOLS.update(NATIVE_STRING_SYMBOLS)
+except ImportError:
+    pass

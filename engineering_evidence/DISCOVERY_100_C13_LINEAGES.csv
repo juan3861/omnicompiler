@@ -1,0 +1,21 @@
+LineageID,CanonicalUpstream,TechnologicalFamily,PrimaryInnovation,License,MaturityLevel,EffortToAdapt,RelevanceScore,ReadinessScore,ParetoFrontier
+LIN-001,llvm/llvm-project/libcxx,String Optimization,24-byte SSO (Small String Optimization) inline struct,Apache-2.0 WITH LLVM-exception,Production (Tier 1),Low,95,92,Yes
+LIN-002,ParkMyCar/compact_str,String Optimization,24-byte zero-cost UTF-8 small string with discriminator byte,Apache-2.0 OR MIT,Production (Crate),Low,94,90,Yes
+LIN-003,servo/string-cache,String Optimization,Dynamic string interning with compile-time atom tables,Apache-2.0 OR MIT,Production (Servo),Medium,86,85,No
+LIN-004,LuaJIT/LuaJIT,String Optimization,Global hash-consed string table with pointer equality comparison,MIT,Production (Tier 1),Medium,90,88,Yes
+LIN-005,llvm/llvm-project/llvm/ThinLTO,Whole-Program Opt,Summary index inter-module call-graph inlining and pruning,Apache-2.0 WITH LLVM-exception,Production (Tier 1),Medium,96,89,Yes
+LIN-006,rui314/mold,Linker Engine,High-speed parallel linker with memory-mapped output sections,AGPL-3.0/MIT (Dual),Production (Linux),High,78,65,No
+LIN-007,facebook/folly/FBString,String Optimization,Three-tier string (SSO 23 bytes medium heap large COW),Apache-2.0,Production (Tier 1),Medium,91,84,No
+LIN-008,bytecodealliance/wasmtime,WASM Runtime,WASI Preview 2 Component Model Canonical ABI,Apache-2.0,Production (Tier 1),Low,95,95,Yes
+LIN-009,z3prover/z3,SMT Verification,Bit-vector QF_BV / QF_ABV decision procedures with proofs,MIT,Production (Tier 1),Low,98,96,Yes
+LIN-010,unicorn-engine/unicorn,Silicon Sandbox,CPU emulation for x86-64 and ARM64 instruction validation,GPL-2.0/LGPL-2.1,Production (Tier 1),Low,96,94,Yes
+LIN-011,BLAKE3-team/BLAKE3,Cryptographic Ledger,Tree-hashing SIMD authenticated data structure,Apache-2.0 OR CC0,Production (Tier 1),Low,97,98,Yes
+LIN-012,stephenmcd/mmh3,Hashing Primitives,MurmurHash3 64-bit and 128-bit native open-address hashing,CC0-1.0,Production,Low,88,90,Yes
+LIN-013,pybind/pybind11,Foreign Function,Lightweight C-ABI header-only type conversions,BSD-3-Clause,Production,Medium,82,80,No
+LIN-014,rust-lang/rustc-dev,Compiler Pipeline,Cross-crate ThinLTO and biased graph coloring register allocator,Apache-2.0 OR MIT,Production,High,85,75,No
+LIN-015,google/re2,Regular Expressions,Deterministic finite automaton linear-time string search,BSD-3-Clause,Production,Medium,84,82,No
+LIN-016,apple/swift,String Optimization,UTF-8 native string model with breadcrumb indexing,Apache-2.0,Production,High,83,72,No
+LIN-017,dotnet/runtime,Garbage Collection,Segmented mark-sweep GC with Card Table write watch,MIT,Production,High,80,70,No
+LIN-018,immix-gc/immix,Garbage Collection,Mark-region garbage collector with opportunistic evacuation,BSD-2-Clause,Research/Maturity,Medium,89,82,Yes
+LIN-019,google/sanitizers,Safety Verification,AddressSanitizer shadow byte memory poison tracking,Apache-2.0 WITH LLVM-exception,Production,Medium,87,85,Yes
+LIN-020,google/benchmark,Benchmarking,Multi-threaded steady-state benchmark framework with outlier rejection,Apache-2.0,Production,Low,89,91,Yes
