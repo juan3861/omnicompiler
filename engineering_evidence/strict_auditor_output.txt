@@ -1,9 +1,9 @@
-[00:42:04] [OMEGA AUDITOR] Instanciado. Teatro T�cnico n�o � mais tolerado.
+[04:59:52] [OMEGA AUDITOR] Instanciado. Teatro T�cnico n�o � mais tolerado.
 
 ================================================================================
  [AETHERMIND APOTHEOSIS] GUARDI�O ESTrito DE SA�DA (OMEGA PROTOCOL)
 ================================================================================
-   -> [AUDITORIA L�GICA]: Testando script F:\repository-compiler\run_c15_tests.py emp�ricamente...
+   -> [AUDITORIA L�GICA]: Testando script run_full_regression.py emp�ricamente...
    -> [SUCESSO L�GICO]: O script rodou at� a conclus�o. Sem fuma�a.
 
 [VEREDITO DO AUDITOR OMEGA]: APROVADO. A IA tem a permiss�o de notificar o Mestre.

@@ -233,8 +233,25 @@ class NativeJitCompiler:
         callable_fn._jit_mem = mem
         return callable_fn, mem, raw_code.hex()
 
-    def compile_ssa(self, ssa_fn: SSAFunction, extra_symbols: Optional[Dict[str, int]] = None) -> Tuple[Any, NativeJitMemory, str]:
+    def compile_ssa(
+        self,
+        ssa_fn: SSAFunction,
+        extra_symbols: Optional[Dict[str, int]] = None,
+        optimize_passes: bool = True,
+    ) -> Tuple[Any, NativeJitMemory, str]:
         """Compiles an arbitrary multi-block `SSAFunction` into W^X executable RAM, resolving runtime collections."""
+        if optimize_passes:
+            try:
+                from compiler.stack_promotion import StackPromotionPass
+                ssa_fn, _ = StackPromotionPass().promote_function(ssa_fn)
+            except Exception:
+                pass
+            try:
+                from compiler.loop_vectorizer import LoopVectorizerPass
+                ssa_fn, _ = LoopVectorizerPass().vectorize_function(ssa_fn)
+            except Exception:
+                pass
+
         from runtime.native_heap import NATIVE_COLLECTION_SYMBOLS
         artifact = self.codegen.compile_function(ssa_fn)
         raw_code = bytearray(artifact.code_bytes)

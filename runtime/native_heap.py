@@ -337,3 +337,10 @@ try:
     NATIVE_COLLECTION_SYMBOLS.update(NATIVE_SIMD_SYMBOLS)
 except ImportError:
     pass
+
+# Auto-merge native FFI symbols
+try:
+    from runtime.native_ffi import NATIVE_FFI_SYMBOLS
+    NATIVE_COLLECTION_SYMBOLS.update(NATIVE_FFI_SYMBOLS)
+except ImportError:
+    pass
