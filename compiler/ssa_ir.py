@@ -1079,6 +1079,23 @@ class AstToSsaLowering:
                     return res
                 elif fname == "int" and len(node.args) == 1:
                     return self._lower_expr(node.args[0])
+                elif fname == "sum" and len(node.args) == 1:
+                    arg_v = self._lower_expr(node.args[0])
+                    res = self._next_var("sum")
+                    self._emit(res, "call", ["omni_list_sum", arg_v], line=line)
+                    return res
+                elif fname == "vec_add" and len(node.args) == 2:
+                    a_v = self._lower_expr(node.args[0])
+                    b_v = self._lower_expr(node.args[1])
+                    res = self._next_var("vec_add")
+                    self._emit(res, "call", ["omni_list_vec_add", a_v, b_v], line=line)
+                    return res
+                elif fname == "vec_dot" and len(node.args) == 2:
+                    a_v = self._lower_expr(node.args[0])
+                    b_v = self._lower_expr(node.args[1])
+                    res = self._next_var("vec_dot")
+                    self._emit(res, "call", ["omni_list_vec_dot", a_v, b_v], line=line)
+                    return res
                 else:
                     arg_vars = [self._lower_expr(a) for a in node.args]
                     res = self._next_var("call")

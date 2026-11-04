@@ -1,0 +1,22 @@
+test_01_multiblock_thin_lto_branching_inline (test_alpha_c14_multiblock_lto_simd.TestAlphaC14MultiBlockLtoSimd.test_01_multiblock_thin_lto_branching_inline)
+Validates multi-block CFG inlining for a branching clamp function. ... ok
+test_02_multiblock_thin_lto_abs_diff (test_alpha_c14_multiblock_lto_simd.TestAlphaC14MultiBlockLtoSimd.test_02_multiblock_thin_lto_abs_diff)
+Validates multi-block inlining with binary subtraction branches. ... ok
+test_03_native_simd_vector_add_on_omnilist (test_alpha_c14_multiblock_lto_simd.TestAlphaC14MultiBlockLtoSimd.test_03_native_simd_vector_add_on_omnilist)
+Validates hardware/vectorized addition on 1000-element contiguous OmniList buffers. ... ok
+test_04_native_simd_dot_product_and_reduction (test_alpha_c14_multiblock_lto_simd.TestAlphaC14MultiBlockLtoSimd.test_04_native_simd_dot_product_and_reduction)
+Validates vector dot product and parallel reduction sum. ... ok
+test_05_ssa_vector_lowering_and_calls (test_alpha_c14_multiblock_lto_simd.TestAlphaC14MultiBlockLtoSimd.test_05_ssa_vector_lowering_and_calls)
+Validates AST to SSA IR lowering of vector primitives: sum, vec_add, vec_dot. ... ok
+test_06_escape_analysis_local_promotion (test_alpha_c14_multiblock_lto_simd.TestAlphaC14MultiBlockLtoSimd.test_06_escape_analysis_local_promotion)
+Validates escape analysis distinguishing non-escaping local buffers from escaping ones. ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.019s
+
+OK
+
+RESULT_SUCCESS=True
+TESTS_RUN=6
+ERRORS=0
+FAILURES=0

@@ -330,3 +330,10 @@ try:
     NATIVE_COLLECTION_SYMBOLS.update(NATIVE_STRING_SYMBOLS)
 except ImportError:
     pass
+
+# Auto-merge native SIMD collection symbols
+try:
+    from runtime.native_collections_simd import NATIVE_SIMD_SYMBOLS
+    NATIVE_COLLECTION_SYMBOLS.update(NATIVE_SIMD_SYMBOLS)
+except ImportError:
+    pass

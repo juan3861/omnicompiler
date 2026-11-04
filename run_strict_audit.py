@@ -7,10 +7,12 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+target_script = sys.argv[1] if len(sys.argv) > 1 else r"F:\repository-compiler\run_c14_tests.py"
+
 cmd = [
     r"C:\Users\juanp\AppData\Local\Programs\Python\Python311\python.exe",
     r"F:\AetherMind_Apotheosis_Final\aethermind_apotheosis\AetherMind_Strict_Auditor.py",
-    r"F:\repository-compiler\run_c13_tests.py"
+    target_script,
 ]
 result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
