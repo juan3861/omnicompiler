@@ -1,0 +1,18 @@
+test_01_stack_promotion_local_omnilist (test_alpha_c15_stack_promotion.TestAlphaC15StackPromotion.test_01_stack_promotion_local_omnilist)
+Validates that a non-escaping local list is promoted from heap to stack alloca. ... ok
+test_02_escaping_list_not_promoted (test_alpha_c15_stack_promotion.TestAlphaC15StackPromotion.test_02_escaping_list_not_promoted)
+Validates that an escaping list is NOT promoted to stack to prevent dangling pointers. ... ok
+test_03_native_jit_alloca_execution (test_alpha_c15_stack_promotion.TestAlphaC15StackPromotion.test_03_native_jit_alloca_execution)
+Validates hardware execution of an SSA function using stack alloca memory. ... ok
+test_04_arm64_alloca_bytecode_emission (test_alpha_c15_stack_promotion.TestAlphaC15StackPromotion.test_04_arm64_alloca_bytecode_emission)
+Validates that ARM64 compiler emits sub X9, X29, #disp for alloca. ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.012s
+
+OK
+
+RESULT_SUCCESS=True
+TESTS_RUN=4
+ERRORS=0
+FAILURES=0

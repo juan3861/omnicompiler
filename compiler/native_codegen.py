@@ -278,11 +278,14 @@ class X64CodeGenerator:
                     register_var(op)
 
         # Determine Leaf Register-Resident Mode vs General Stack-Frame Mode
+        alloca_insts = [inst for b in fn.blocks for inst in b.instructions if inst.opcode == "alloca"]
+        has_alloca = len(alloca_insts) > 0
         alloc = ChaitinBriggsAllocator(LEAF_ALLOC_REGS).allocate(fn)
-        leaf_mode = (not has_calls) and alloc["success"] and len(fn.params) <= len(self.param_regs)
+        leaf_mode = (not has_calls) and (not has_alloca) and alloc["success"] and len(fn.params) <= len(self.param_regs)
 
         reg_map: Dict[SSAVar, str] = {}
         slot_map: Dict[SSAVar, int] = {}
+        alloca_map: Dict[SSAVar, int] = {}
         used_callee_saved: List[str] = []
 
         if leaf_mode:
@@ -296,12 +299,20 @@ class X64CodeGenerator:
         else:
             for idx, v in enumerate(all_vars):
                 slot_map[v] = -8 * (idx + 1)
+            current_disp = len(all_vars) * 8
+            for inst in alloca_insts:
+                sz = inst.operands[0] if inst.operands and isinstance(inst.operands[0], int) else 32
+                aligned_sz = ((sz + 15) // 16) * 16
+                current_disp += aligned_sz
+                if inst.result:
+                    alloca_map[inst.result] = current_disp
+
             max_call_args = max(
                 [len(inst.operands) - 1 for b in fn.blocks for inst in b.instructions if inst.opcode == "call"] + [0]
             )
             extra_stack_args = max(0, max_call_args - len(self.param_regs)) * 8
             shadow_bytes = 32 if (self.is_windows and has_calls) else 0
-            raw_bytes = len(all_vars) * 8 + shadow_bytes + extra_stack_args
+            raw_bytes = current_disp + shadow_bytes + extra_stack_args
             # After `push rbp`, RSP % 16 == 0, so keeping frame_size a multiple of 16 keeps RSP 16-byte aligned!
             frame_size = ((raw_bytes + 15) // 16) * 16
 
@@ -516,6 +527,16 @@ class X64CodeGenerator:
                     resolve_operand_to_reg(inst.operands[2], "rax")  # value
                     # REX.W=1, R=0(rax), X=0(rcx), B=1(r11) -> 0x49; SIB: scale=8(0xC0), idx=rcx(1<<3), base=r11(3) -> 0xCB
                     buf.emit(b"\x49\x89\x04\xcb")                    # mov [r11 + rcx*8], rax
+
+                elif op == "alloca":
+                    disp = alloca_map.get(inst.result, 16)
+                    if disp <= 127:
+                        # lea rax, [rbp - disp] -> 48 8d 45 <sbyte>
+                        buf.emit(b"\x48\x8d\x45" + struct.pack("<b", -disp))
+                    else:
+                        # lea rax, [rbp - disp] -> 48 8d 85 <int32>
+                        buf.emit(b"\x48\x8d\x85" + struct.pack("<i", -disp))
+                    write_result_from_reg(inst.result, "rax")
 
                 elif op == "call":
                     callee = str(inst.operands[0])
@@ -792,8 +813,18 @@ class Arm64CodeGenerator:
                     reg_v(op)
 
         slot_idx_map: Dict[SSAVar, int] = {v: i for i, v in enumerate(all_vars)}
-        # 16 bytes for saved X29/X30 + 8 bytes per variable, 16-byte aligned (max 504 for single STP/SUB imm12)
-        frame_size = ((16 + len(all_vars) * 8 + 15) // 16) * 16
+        alloca_insts = [inst for b in fn.blocks for inst in b.instructions if inst.opcode == "alloca"]
+        alloca_map: Dict[SSAVar, int] = {}
+        curr_disp = 16 + len(all_vars) * 8
+        for inst in alloca_insts:
+            sz = inst.operands[0] if inst.operands and isinstance(inst.operands[0], int) else 32
+            aligned_sz = ((sz + 15) // 16) * 16
+            curr_disp += aligned_sz
+            if inst.result:
+                alloca_map[inst.result] = curr_disp
+
+        # 16 bytes for saved X29/X30 + variables + alloca, 16-byte aligned
+        frame_size = ((curr_disp + 15) // 16) * 16
         frame_size = max(16, frame_size)
 
         code = bytearray()
@@ -949,6 +980,11 @@ class Arm64CodeGenerator:
                     load_op(inst.operands[2], 11)  # value in X11
                     # STR X11, [X9, X10, LSL #3] -> 0xF8207800 | (10 << 16) | (9 << 5) | 11
                     code.extend(_a64_u32(0xF8207800 | (10 << 16) | (9 << 5) | 11))
+                elif op == "alloca":
+                    disp = alloca_map.get(inst.result, 16)
+                    # SUB X9, X29, #disp -> 0xD1000000 | ((disp & 0xFFF) << 10) | (29 << 5) | 9
+                    code.extend(_a64_u32(0xD1000000 | ((disp & 0xFFF) << 10) | (29 << 5) | 9))
+                    store_res(inst.result, 9)
                 elif op == "call":
                     callee = str(inst.operands[0])
                     for a_i, a_op in enumerate(inst.operands[1:9]):
