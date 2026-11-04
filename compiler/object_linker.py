@@ -268,6 +268,20 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
 # Static Multi-Module Linker
 # ==============================================================================
 
+# Freestanding native x86-64 machine code kernels for runtime collection operations
+# Enables freestanding standalone binaries (.exe / ELF) to execute without host Python runtime.
+NATIVE_FREESTANDING_KERNELS_X64: Dict[str, bytes] = {
+    "omni_list_len": bytes.fromhex("4885c97405488b4108c331c0c3"),
+    "omni_list_get": bytes.fromhex("4885c97406488b44d110c331c0c3"),
+    "omni_list_set": bytes.fromhex("4885c974154c8944d110483b51087209488d4201488941084889c8c331c0c3"),
+    "omni_item_len": bytes.fromhex("4885c97405488b4108c331c0c3"),
+    "omni_item_get": bytes.fromhex("4885c97406488b44d110c331c0c3"),
+    "omni_item_set": bytes.fromhex("4885c974154c8944d110483b51087209488d4201488941084889c8c331c0c3"),
+    "omni_str_len": bytes.fromhex("4885c974100fb601a880750483e07fc3488b4108c331c0c3"),
+    "omni_list_sum": bytes.fromhex("4885c97418488b51084885d2741031c04531c04a0344c11049ffc04939d07cf2c331c0c3"),
+}
+
+
 class NativeObjectLinker:
     """
     Combines and resolves multiple `ObjectModule`s into fully linked native executables
@@ -320,14 +334,19 @@ class NativeObjectLinker:
                 self._active_callbacks = []
             runtime_mod = ObjectModule("__omni_runtime_thunks__")
             for sym in sorted(needed_runtime_syms):
-                fn_meta = NATIVE_COLLECTION_SYMBOLS[sym]
-                fn_obj, arg_types, res_type = fn_meta
-                c_fn = ctypes.CFUNCTYPE(res_type, *arg_types)(fn_obj)
-                self._active_callbacks.append(c_fn)
-                addr = ctypes.cast(c_fn, ctypes.c_void_p).value
-                # x86-64: mov r11, <addr>; jmp r11; ret
-                thunk_bytes = b"\x49\xbb" + struct.pack("<Q", addr) + b"\x41\xff\xe3\xc3"
-                runtime_mod.add_symbol(sym, thunk_bytes, is_exported=True)
+                if sym in NATIVE_FREESTANDING_KERNELS_X64:
+                    # Emit pure freestanding silicon machine code (zero transient host pointers)
+                    kernel_code = NATIVE_FREESTANDING_KERNELS_X64[sym]
+                    runtime_mod.add_symbol(sym, kernel_code, is_exported=True)
+                else:
+                    fn_meta = NATIVE_COLLECTION_SYMBOLS[sym]
+                    fn_obj, arg_types, res_type = fn_meta
+                    c_fn = ctypes.CFUNCTYPE(res_type, *arg_types)(fn_obj)
+                    self._active_callbacks.append(c_fn)
+                    addr = ctypes.cast(c_fn, ctypes.c_void_p).value
+                    # x86-64: mov r11, <addr>; jmp r11; ret
+                    thunk_bytes = b"\x49\xbb" + struct.pack("<Q", addr) + b"\x41\xff\xe3\xc3"
+                    runtime_mod.add_symbol(sym, thunk_bytes, is_exported=True)
             self.modules.append(runtime_mod)
 
         combined_text = bytearray()

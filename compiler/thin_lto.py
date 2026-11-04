@@ -83,8 +83,8 @@ class ThinLtoSummaryIndex:
 class ThinLtoOptimizer:
     """Performs inter-procedural whole-program optimizations using the summary index."""
 
-    def __init__(self, index: ThinLtoSummaryIndex):
-        self.index = index
+    def __init__(self, index: Optional[ThinLtoSummaryIndex] = None):
+        self.index = index if index is not None else ThinLtoSummaryIndex()
 
     def build_summary_from_ssa(self, ssa_fn: SSAFunction, repo_name: str = "main") -> FunctionSummary:
         """Constructs a FunctionSummary from an SSAFunction."""
@@ -122,6 +122,13 @@ class ThinLtoOptimizer:
             ssa_fn=ssa_fn,
         )
         self.index.add_function_summary(summary)
+        return summary
+
+    def build_function_summary(self, name: str, repo_name: str, ast_fn: Any, ssa_fn: SSAFunction) -> FunctionSummary:
+        summary = self.build_summary_from_ssa(ssa_fn, repo_name=repo_name)
+        if summary.name != name:
+            summary.name = name
+            self.index.add_function_summary(summary)
         return summary
 
     def _inline_multiblock_callee(
@@ -362,3 +369,7 @@ class ThinLtoOptimizer:
 
         optimized_fn = optimize_ssa(ssa_fn)
         return optimized_fn, stats
+
+
+# Canonical Alias
+ThinLTOOptimizer = ThinLtoOptimizer

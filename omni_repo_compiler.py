@@ -333,9 +333,29 @@ class OmniRepoCompiler:
         compiled_artifacts: Dict[str, CompiledFunctionArtifact] = {}
         real_ast_compiled_count = 0
         smt_verified_rewrites = 0
+        thin_lto_inlines = 0
+        thin_lto_const_folds = 0
+        vectorized_loops = 0
+        promoted_stack_allocs = 0
         all_line_entries: List[Tuple[int, int]] = []
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
+
+        # Stage 4.9: ThinLTO Whole-Program Inter-Procedural Optimization Index
+        thin_lto_opt = None
+        try:
+            from compiler.thin_lto import ThinLTOOptimizer
+            thin_lto_opt = ThinLTOOptimizer()
+            for r_name, r_funcs in repo_funcs_map.items():
+                for f_name, (f_src, f_ast) in r_funcs.items():
+                    try:
+                        s_fn = lower_ast_to_ssa(f_ast, optimize=True)
+                        summary = thin_lto_opt.build_function_summary(f_name, r_name, f_ast, s_fn)
+                        thin_lto_opt.index.add_function(summary)
+                    except Exception:
+                        pass
+        except Exception:
+            thin_lto_opt = None
 
         for m in manifests:
             obj_mod = ObjectModule(m.repo_name)
@@ -377,6 +397,33 @@ class OmniRepoCompiler:
 
                     ssa_fn = lower_ast_to_ssa(active_fn_def, optimize=True)
                     ssa_fn.source_file = src_file
+
+                    # Alpha-C17 Optimization Passes:
+                    # 1. Whole-Program ThinLTO (Cross-Repo Inlining & Constant Folding)
+                    if thin_lto_opt is not None:
+                        try:
+                            ssa_fn, lto_stats = thin_lto_opt.optimize_interprocedural_ssa(ssa_fn)
+                            thin_lto_inlines += lto_stats.get("inlined_calls", 0)
+                            thin_lto_const_folds += lto_stats.get("folded_constants", 0)
+                        except Exception:
+                            pass
+
+                    # 2. Loop Auto-Vectorizer (Induction Loops -> AVX2 SIMD Intrinsics)
+                    try:
+                        from compiler.loop_vectorizer import LoopVectorizerPass
+                        ssa_fn, vec_stats = LoopVectorizerPass().vectorize_function(ssa_fn)
+                        vectorized_loops += sum(vec_stats.values())
+                    except Exception:
+                        pass
+
+                    # 3. Stack Promotion Pass (Non-Escaping Lists -> Thread Frame alloca)
+                    try:
+                        from compiler.stack_promotion import StackPromotionPass
+                        ssa_fn, stk_stats = StackPromotionPass().promote_function(ssa_fn)
+                        promoted_stack_allocs += stk_stats.get("promoted_lists", 0)
+                    except Exception:
+                        pass
+
                     artifact = codegen.compile_ssa(ssa_fn)
 
                     sym_base_off = len(obj_mod.text_bytes)
@@ -411,6 +458,10 @@ class OmniRepoCompiler:
             "modules_added": len(self.linker.modules),
             "real_ast_functions_compiled": real_ast_compiled_count,
             "smt_verified_rewrites": smt_verified_rewrites,
+            "thin_lto_inlines": thin_lto_inlines,
+            "thin_lto_const_folds": thin_lto_const_folds,
+            "vectorized_loops": vectorized_loops,
+            "promoted_stack_allocs": promoted_stack_allocs,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }

@@ -8,6 +8,7 @@ test_modules = [
     "tests.test_alpha_c14_multiblock_lto_simd",
     "tests.test_alpha_c15_stack_promotion",
     "tests.test_alpha_c16_autovec_and_ffi",
+    "tests.test_alpha_c17_aot_compiler",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]
