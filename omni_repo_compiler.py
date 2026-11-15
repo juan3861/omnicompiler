@@ -340,6 +340,9 @@ class OmniRepoCompiler:
         irc_coalesced_moves = 0
         polyhedral_tiled_loops = 0
         unrolled_loops = 0
+        gvn_eliminated_exprs = 0
+        sccp_folded_branches = 0
+        specialized_functions = 0
         all_line_entries: List[Tuple[int, int]] = []
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
@@ -443,6 +446,22 @@ class OmniRepoCompiler:
                     except Exception:
                         pass
 
+                    # 6. Sparse Conditional Constant Propagation (SCCP) & Dead Branch Pruning
+                    try:
+                        from compiler.ip_sccp_gvn import SCCPPass
+                        ssa_fn, sccp_stats = SCCPPass().run_on_function(ssa_fn)
+                        sccp_folded_branches += sccp_stats.get("sccp_folded_branches", 0)
+                    except Exception:
+                        pass
+
+                    # 7. Dominator-Tree Scoped Global Value Numbering (GVN)
+                    try:
+                        from compiler.ip_sccp_gvn import GlobalValueNumberingPass
+                        ssa_fn, gvn_stats = GlobalValueNumberingPass().run_on_function(ssa_fn)
+                        gvn_eliminated_exprs += gvn_stats.get("gvn_eliminated_exprs", 0)
+                    except Exception:
+                        pass
+
                     artifact = codegen.compile_ssa(ssa_fn)
                     irc_coalesced_moves += getattr(artifact, "coalesced_moves", 0)
 
@@ -485,6 +504,9 @@ class OmniRepoCompiler:
             "irc_coalesced_moves": irc_coalesced_moves,
             "polyhedral_tiled_loops": polyhedral_tiled_loops,
             "unrolled_loops": unrolled_loops,
+            "gvn_eliminated_exprs": gvn_eliminated_exprs,
+            "sccp_folded_branches": sccp_folded_branches,
+            "specialized_functions": specialized_functions,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }
