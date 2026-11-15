@@ -352,6 +352,8 @@ class OmniRepoCompiler:
         sroa_replaced_allocas = 0
         sroa_eliminated_mem_ops = 0
         devirtualized_calls = 0
+        smt_pass_proofs = 0
+        smt_pass_rollbacks = 0
         all_line_entries: List[Tuple[int, int]] = []
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
@@ -455,19 +457,37 @@ class OmniRepoCompiler:
                     except Exception:
                         pass
 
-                    # 6. Sparse Conditional Constant Propagation (SCCP) & Dead Branch Pruning
+                    # 6. Sparse Conditional Constant Propagation (SCCP) & Dead Branch Pruning (SMT-Verified)
                     try:
                         from compiler.ip_sccp_gvn import SCCPPass
-                        ssa_fn, sccp_stats = SCCPPass().run_on_function(ssa_fn)
-                        sccp_folded_branches += sccp_stats.get("sccp_folded_branches", 0)
+                        from validation.ssa_translation_validator import VerifiedPassRunner
+                        runner = VerifiedPassRunner()
+                        ssa_fn, sccp_stats, v_sccp = runner.run_verified_pass(
+                            ssa_fn, SCCPPass().run_on_function
+                        )
+                        if v_sccp.get("verified"):
+                            smt_pass_proofs += 1
+                        if v_sccp.get("rolled_back"):
+                            smt_pass_rollbacks += 1
+                        else:
+                            sccp_folded_branches += sccp_stats.get("sccp_folded_branches", 0)
                     except Exception:
                         pass
 
-                    # 7. Dominator-Tree Scoped Global Value Numbering (GVN)
+                    # 7. Dominator-Tree Scoped Global Value Numbering (GVN) (SMT-Verified)
                     try:
                         from compiler.ip_sccp_gvn import GlobalValueNumberingPass
-                        ssa_fn, gvn_stats = GlobalValueNumberingPass().run_on_function(ssa_fn)
-                        gvn_eliminated_exprs += gvn_stats.get("gvn_eliminated_exprs", 0)
+                        from validation.ssa_translation_validator import VerifiedPassRunner
+                        runner = VerifiedPassRunner()
+                        ssa_fn, gvn_stats, v_gvn = runner.run_verified_pass(
+                            ssa_fn, GlobalValueNumberingPass().run_on_function
+                        )
+                        if v_gvn.get("verified"):
+                            smt_pass_proofs += 1
+                        if v_gvn.get("rolled_back"):
+                            smt_pass_rollbacks += 1
+                        else:
+                            gvn_eliminated_exprs += gvn_stats.get("gvn_eliminated_exprs", 0)
                     except Exception:
                         pass
 
@@ -579,6 +599,8 @@ class OmniRepoCompiler:
             "sroa_replaced_allocas": sroa_replaced_allocas,
             "sroa_eliminated_mem_ops": sroa_eliminated_mem_ops,
             "devirtualized_calls": devirtualized_calls,
+            "smt_pass_proofs": smt_pass_proofs,
+            "smt_pass_rollbacks": smt_pass_rollbacks,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }
