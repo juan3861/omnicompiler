@@ -349,6 +349,9 @@ class OmniRepoCompiler:
         tco_converted_calls = 0
         reordered_blocks = 0
         peephole_bytes_saved = 0
+        sroa_replaced_allocas = 0
+        sroa_eliminated_mem_ops = 0
+        devirtualized_calls = 0
         all_line_entries: List[Tuple[int, int]] = []
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
@@ -476,6 +479,15 @@ class OmniRepoCompiler:
                     except Exception:
                         pass
 
+                    # 8b. Scalar Replacement of Aggregates (SROA: Non-Escaping Constant-Indexed Allocas -> Pure Registers)
+                    try:
+                        from compiler.sroa_and_devirt import SROAPass
+                        ssa_fn, sroa_stats = SROAPass().run_on_function(ssa_fn)
+                        sroa_replaced_allocas += sroa_stats.get("sroa_replaced_allocas", 0)
+                        sroa_eliminated_mem_ops += sroa_stats.get("sroa_eliminated_mem_ops", 0)
+                    except Exception:
+                        pass
+
                     # 9. Alias-Guided Dead Store Elimination (DSE) & Store-to-Load Forwarding
                     try:
                         from compiler.licm_and_dse import DSEPass
@@ -564,6 +576,9 @@ class OmniRepoCompiler:
             "tco_converted_calls": tco_converted_calls,
             "reordered_blocks": reordered_blocks,
             "peephole_bytes_saved": peephole_bytes_saved,
+            "sroa_replaced_allocas": sroa_replaced_allocas,
+            "sroa_eliminated_mem_ops": sroa_eliminated_mem_ops,
+            "devirtualized_calls": devirtualized_calls,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }

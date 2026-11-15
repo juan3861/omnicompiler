@@ -14,6 +14,7 @@ test_modules = [
     "tests.test_alpha_c20_ipsccp_gvn",
     "tests.test_alpha_c21_licm_dse",
     "tests.test_alpha_c22_tco_layout",
+    "tests.test_alpha_c23_sroa_devirt",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]
