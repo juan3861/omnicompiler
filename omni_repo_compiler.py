@@ -338,6 +338,8 @@ class OmniRepoCompiler:
         vectorized_loops = 0
         promoted_stack_allocs = 0
         irc_coalesced_moves = 0
+        polyhedral_tiled_loops = 0
+        unrolled_loops = 0
         all_line_entries: List[Tuple[int, int]] = []
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
@@ -425,6 +427,22 @@ class OmniRepoCompiler:
                     except Exception:
                         pass
 
+                    # 4. Polyhedral Loop Tiler Pass (Affine Nested Loops -> Cache-Tiled Domains)
+                    try:
+                        from compiler.polyhedral_tiler import PolyhedralLoopTilerPass
+                        ssa_fn, tile_stats = PolyhedralLoopTilerPass().tile_function(ssa_fn)
+                        polyhedral_tiled_loops += tile_stats.get("polyhedral_tiled_loops", 0)
+                    except Exception:
+                        pass
+
+                    # 5. Loop Unrolling Pass (High-Throughput Multi-Accumulator Interleaving)
+                    try:
+                        from compiler.polyhedral_tiler import LoopUnrollPass
+                        ssa_fn, unroll_stats = LoopUnrollPass(unroll_factor=4).unroll_function(ssa_fn)
+                        unrolled_loops += unroll_stats.get("unrolled_loops", 0)
+                    except Exception:
+                        pass
+
                     artifact = codegen.compile_ssa(ssa_fn)
                     irc_coalesced_moves += getattr(artifact, "coalesced_moves", 0)
 
@@ -465,6 +483,8 @@ class OmniRepoCompiler:
             "vectorized_loops": vectorized_loops,
             "promoted_stack_allocs": promoted_stack_allocs,
             "irc_coalesced_moves": irc_coalesced_moves,
+            "polyhedral_tiled_loops": polyhedral_tiled_loops,
+            "unrolled_loops": unrolled_loops,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }

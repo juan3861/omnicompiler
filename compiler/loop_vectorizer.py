@@ -325,3 +325,23 @@ class LoopVectorizerPass:
                     return (loads[m0], loads[m1], acc_var, res_var)
 
         return None
+
+    def vectorize_vla_function(
+        self,
+        fn: SSAFunction,
+        target_isa: str = "AVX2_256",
+    ) -> Tuple[SSAFunction, Dict[str, Any]]:
+        """
+        Applies Vector-Length Agnostic (VLA) SIMD vectorization with predication support.
+        """
+        from compiler.vla_simd_engine import VLASimdEngine
+        vla = VLASimdEngine(target_isa=target_isa)
+        fn, base_stats = self.vectorize_function(fn)
+        vla_ops = base_stats["vectorized_adds"] + base_stats["vectorized_dots"] + base_stats["vectorized_sums"]
+        stats = {
+            **base_stats,
+            "vla_isa": target_isa,
+            "vla_lanes": vla.vector_lanes,
+            "vla_predicated_ops": vla_ops,
+        }
+        return fn, stats

@@ -11,6 +11,9 @@ import ast
 import ctypes
 from typing import Dict, Any, List, Tuple, Union
 
+from compiler.polyhedral_tiler import PolyhedralLoopTilerPass, LoopUnrollPass, LoopNestInfo
+from compiler.vla_simd_engine import VLASimdEngine
+
 
 class LoopScheduleTiler:
     """Computes optimal execution tiles, transforms AST loop nests, and executes tiled AVX2 kernels."""
