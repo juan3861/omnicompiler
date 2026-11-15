@@ -190,11 +190,30 @@ class LLVMBackend:
                     lines.append(f"    {lhs} = add i64 0, {v1}")
                     last_val = lhs
 
-                elif opcode in ("add", "sub", "mul", "imul", "sdiv", "div", "srem", "shl", "shr", "and", "or", "xor"):
+                elif opcode == "neg":
+                    v1 = ops[0] if ops else "0"
+                    lines.append(f"    {lhs} = sub i64 0, {v1}")
+                    last_val = lhs
+
+                elif opcode == "not":
+                    v1 = ops[0] if ops else "0"
+                    cmp_v = next_aux("not_cmp")
+                    lines.append(f"    {cmp_v} = icmp eq i64 {v1}, 0")
+                    lines.append(f"    {lhs} = zext i1 {cmp_v} to i64")
+                    last_val = lhs
+
+                elif opcode == "alloca":
+                    sz = ops[0] if ops else "64"
+                    ptr_v = next_aux("alloca_ptr")
+                    lines.append(f"    {ptr_v} = alloca i8, i64 {sz}, align 8")
+                    lines.append(f"    {lhs} = ptrtoint ptr {ptr_v} to i64")
+                    last_val = lhs
+
+                elif opcode in ("add", "sub", "mul", "imul", "sdiv", "div", "srem", "shl", "shr", "sar", "and", "or", "xor"):
                     llvm_op = {
                         "add": "add", "sub": "sub", "mul": "mul", "imul": "mul",
                         "sdiv": "sdiv", "div": "sdiv", "srem": "srem",
-                        "shl": "shl", "shr": "ashr",
+                        "shl": "shl", "shr": "ashr", "sar": "ashr",
                         "and": "and", "or": "or", "xor": "xor",
                     }[opcode]
                     v1 = ops[0] if len(ops) > 0 else "0"

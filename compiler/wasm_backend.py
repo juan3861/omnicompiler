@@ -84,6 +84,7 @@ class WasmBackend:
         "srem": "i64.rem_s",
         "shl": "i64.shl",
         "shr": "i64.shr_s",
+        "sar": "i64.shr_s",
         "and": "i64.and",
         "or": "i64.or",
         "xor": "i64.xor",
@@ -116,11 +117,16 @@ class WasmBackend:
         return WASMTIME_AVAILABLE and self._engine is not None
 
     def compile_wat(self, wat_text: str) -> bytes:
-        """Compiles WebAssembly Text format (WAT) to binary bytecode (.wasm)."""
+        """Compiles WebAssembly Text format (WAT) to Wasmtime serialized machine code."""
         if not self.is_available:
             raise RuntimeError("Wasmtime engine is not available on this system.")
         module = Module(self._engine, wat_text)
         return bytes(module.serialize())
+
+    def wat_to_wasm(self, wat_text: str) -> bytes:
+        """Compiles WebAssembly Text format (WAT) to standard portable .wasm binary (0x00 'asm')."""
+        import wasmtime
+        return bytes(wasmtime.wat2wasm(wat_text))
 
     def execute_wasm(
         self,
@@ -182,16 +188,11 @@ class WasmBackend:
     # ------------------------------------------------------------------
     # Multi-Block Omni-SSA -> Structured WAT Lowering
     # ------------------------------------------------------------------
-    def ssa_to_wat(self, ssa_func: SSAFunction) -> str:
-        """
-        Lowers single-block AND arbitrary multi-block `SSAFunction` CFGs (loops, branches,
-        Phi nodes, recursion) into structured WebAssembly Text (WAT) with Linear Memory.
-        """
+    def _ssa_function_to_wat_func(self, ssa_func: SSAFunction) -> str:
+        """Lowers a single `SSAFunction` into a `(func ...)` WAT definition."""
         param_set = set(ssa_func.params)
         params_str = " ".join(f"(param ${p} i64)" for p in ssa_func.params)
         wat_lines = [
-            "(module",
-            '  (memory (export "memory") 2)',
             f'  (func ${ssa_func.name} (export "{ssa_func.name}") {params_str} (result i64)',
         ]
 
@@ -274,6 +275,16 @@ class WasmBackend:
                 elif opcode in ("const", "mov"):
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
                     set_result(inst.result, indent)
+                elif opcode == "neg":
+                    wat_lines.append(f"{indent}i64.const 0")
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    wat_lines.append(f"{indent}i64.sub")
+                    set_result(inst.result, indent)
+                elif opcode == "not":
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    wat_lines.append(f"{indent}i64.eqz")
+                    wat_lines.append(f"{indent}i64.extend_i32_u")
+                    set_result(inst.result, indent)
                 elif opcode in self.WASM_BINOP_MAP:
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[1])}")
@@ -325,7 +336,10 @@ class WasmBackend:
                     wat_lines.append(f"{indent}  )")
                     wat_lines.append(f"{indent})")
                 elif opcode == "ret":
-                    wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    if inst.operands:
+                        wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    else:
+                        wat_lines.append(f"{indent}i64.const 0")
                     wat_lines.append(f"{indent}return")
 
         if not is_multiblock:
@@ -353,8 +367,30 @@ class WasmBackend:
             wat_lines.append("    i64.const 0")
 
         wat_lines.append("  )")
-        wat_lines.append(")")
         return "\n".join(wat_lines)
+
+    def ssa_to_wat(self, ssa_func: SSAFunction) -> str:
+        """
+        Lowers single-block AND arbitrary multi-block `SSAFunction` CFGs (loops, branches,
+        Phi nodes, recursion) into structured WebAssembly Text (WAT) with Linear Memory.
+        """
+        return "\n".join([
+            "(module",
+            '  (memory (export "memory") 2)',
+            self._ssa_function_to_wat_func(ssa_func),
+            ")",
+        ])
+
+    def ssa_module_to_wat(self, ssa_funcs: List[SSAFunction]) -> str:
+        """Lowers multiple `SSAFunction`s into a unified multi-export WAT module."""
+        parts = [
+            "(module",
+            '  (memory (export "memory") 2)',
+        ]
+        for fn in ssa_funcs:
+            parts.append(self._ssa_function_to_wat_func(fn))
+        parts.append(")")
+        return "\n".join(parts)
 
     # ------------------------------------------------------------------
     # WASI Preview 2 / Component Model Canonical ABI Bridge (`cabi_realloc`)
