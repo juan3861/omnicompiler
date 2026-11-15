@@ -304,6 +304,29 @@ class WasmBackend:
                     wat_lines.append(f"{indent}i64.ne")
                     wat_lines.append(f"{indent}select")
                     set_result(inst.result, indent)
+                elif opcode == "load":
+                    base_op = inst.operands[0] if len(inst.operands) > 0 else 0
+                    idx_op = inst.operands[1] if len(inst.operands) > 1 else 0
+                    wat_lines.append(f"{indent}{emit_operand(base_op)}")
+                    wat_lines.append(f"{indent}{emit_operand(idx_op)}")
+                    wat_lines.append(f"{indent}i64.const 3")
+                    wat_lines.append(f"{indent}i64.shl")
+                    wat_lines.append(f"{indent}i64.add")
+                    wat_lines.append(f"{indent}i32.wrap_i64")
+                    wat_lines.append(f"{indent}i64.load")
+                    set_result(inst.result, indent)
+                elif opcode == "store":
+                    base_op = inst.operands[0] if len(inst.operands) > 0 else 0
+                    idx_op = inst.operands[1] if len(inst.operands) > 1 else 0
+                    val_op = inst.operands[2] if len(inst.operands) > 2 else 0
+                    wat_lines.append(f"{indent}{emit_operand(base_op)}")
+                    wat_lines.append(f"{indent}{emit_operand(idx_op)}")
+                    wat_lines.append(f"{indent}i64.const 3")
+                    wat_lines.append(f"{indent}i64.shl")
+                    wat_lines.append(f"{indent}i64.add")
+                    wat_lines.append(f"{indent}i32.wrap_i64")
+                    wat_lines.append(f"{indent}{emit_operand(val_op)}")
+                    wat_lines.append(f"{indent}i64.store")
                 elif opcode == "call":
                     callee = str(inst.operands[0])
                     for a in inst.operands[1:]:

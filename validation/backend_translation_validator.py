@@ -683,6 +683,49 @@ class WATToSSALifter:
             bb.add_instruction(SSAInstruction(rv, "select", [cond, t_val, f_val]))
             stack.append(rv)
             return None
+        if ln == "i32.wrap_i64":
+            if not stack:
+                return "WAT_STACK_UNDERFLOW_wrap"
+            addr_val = stack.pop()
+            if (
+                len(bb.instructions) >= 2
+                and bb.instructions[-1].opcode == "add"
+                and bb.instructions[-1].result == addr_val
+                and len(bb.instructions[-1].operands) == 2
+                and bb.instructions[-2].opcode == "shl"
+                and bb.instructions[-2].result == bb.instructions[-1].operands[1]
+                and len(bb.instructions[-2].operands) == 2
+                and bb.instructions[-2].operands[1] == 3
+            ):
+                base_op = bb.instructions[-1].operands[0]
+                idx_op = bb.instructions[-2].operands[0]
+                stack.append(("__wat_ptr__", base_op, idx_op))
+            else:
+                stack.append(("__wat_ptr__", addr_val, 0))
+            return None
+        if ln == "i64.load":
+            if not stack:
+                return "WAT_STACK_UNDERFLOW_load"
+            addr_tok = stack.pop()
+            if isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr__":
+                base_op, idx_op = addr_tok[1], addr_tok[2]
+            else:
+                base_op, idx_op = addr_tok, 0
+            rv = next_var("wld")
+            bb.add_instruction(SSAInstruction(rv, "load", [base_op, idx_op]))
+            stack.append(rv)
+            return None
+        if ln == "i64.store":
+            if len(stack) < 2:
+                return "WAT_STACK_UNDERFLOW_store"
+            val_op = stack.pop()
+            addr_tok = stack.pop()
+            if isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr__":
+                base_op, idx_op = addr_tok[1], addr_tok[2]
+            else:
+                base_op, idx_op = addr_tok, 0
+            bb.add_instruction(SSAInstruction(None, "store", [base_op, idx_op, val_op]))
+            return None
         if ln.startswith("call $"):
             callee = ln[len("call $") :].strip()
             if not func_arities or callee not in func_arities:

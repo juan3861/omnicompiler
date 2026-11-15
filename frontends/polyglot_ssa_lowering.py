@@ -673,6 +673,9 @@ class _PolyglotParser:
         if t.kind == "ID" and t.val == "if":
             return [self._parse_if_stmt()], True
 
+        if t.kind == "ID" and t.val == "switch":
+            return [self._parse_switch_stmt()], True
+
         if t.kind == "ID" and t.val == "while":
             return [self._parse_while_stmt()], True
 
@@ -799,6 +802,69 @@ class _PolyglotParser:
             )
 
         expr = self._parse_expr()
+        if isinstance(expr, ast.Subscript) and self._peek().kind == "OP":
+            nxt_op = self._peek().val
+            aug_map = {
+                "+=": ast.Add(),
+                "-=": ast.Sub(),
+                "*=": ast.Mult(),
+                "/=": ast.FloorDiv(),
+                "%=": ast.Mod(),
+                "&=": ast.BitAnd(),
+                "|=": ast.BitOr(),
+                "^=": ast.BitXor(),
+                "<<=": ast.LShift(),
+                ">>=": ast.RShift(),
+            }
+            if nxt_op == "=":
+                self._advance()
+                rhs = self._parse_expr()
+                semi = self._consume_optional_semi() if consume_semi else False
+                return (
+                    ast.Assign(
+                        targets=[
+                            ast.Subscript(
+                                value=expr.value,
+                                slice=expr.slice,
+                                ctx=ast.Store(),
+                                lineno=line,
+                            )
+                        ],
+                        value=rhs,
+                        lineno=line,
+                    ),
+                    semi,
+                )
+            if nxt_op in aug_map:
+                self._advance()
+                rhs = self._parse_expr()
+                semi = self._consume_optional_semi() if consume_semi else False
+                bin_val = ast.BinOp(
+                    left=ast.Subscript(
+                        value=expr.value,
+                        slice=expr.slice,
+                        ctx=ast.Load(),
+                        lineno=line,
+                    ),
+                    op=aug_map[nxt_op],
+                    right=rhs,
+                    lineno=line,
+                )
+                return (
+                    ast.Assign(
+                        targets=[
+                            ast.Subscript(
+                                value=expr.value,
+                                slice=expr.slice,
+                                ctx=ast.Store(),
+                                lineno=line,
+                            )
+                        ],
+                        value=bin_val,
+                        lineno=line,
+                    ),
+                    semi,
+                )
         semi = self._consume_optional_semi() if consume_semi else False
         return ast.Expr(value=expr, lineno=line), semi
 
@@ -814,6 +880,85 @@ class _PolyglotParser:
             else:
                 orelse = self._parse_block()
         return ast.If(test=cond, body=body, orelse=orelse, lineno=if_tok.line)
+
+    def _parse_switch_stmt(self) -> ast.If:
+        sw_tok = self._expect("ID", "switch")
+        disc = self._parse_condition_expr()
+        self._expect("PUNCT", "{")
+        cases: List[Tuple[Optional[ast.expr], List[ast.stmt], int]] = []
+        default_stmts: Optional[List[ast.stmt]] = None
+
+        while not self._at("PUNCT", "}") and not self._at("EOF"):
+            if self._at("ID", "case"):
+                ct = self._advance()
+                cval = self._parse_expr()
+                self._expect("OP", ":")
+                cbody: List[ast.stmt] = []
+                while (
+                    not self._at("ID", "case")
+                    and not self._at("ID", "default")
+                    and not self._at("PUNCT", "}")
+                    and not self._at("EOF")
+                ):
+                    if self._at("PUNCT", ";"):
+                        self._advance()
+                        continue
+                    parsed, _ = self._parse_stmt()
+                    for st in parsed:
+                        if isinstance(st, ast.Break):
+                            continue
+                        cbody.append(st)
+                if not cbody:
+                    cbody = [ast.Pass(lineno=ct.line)]
+                cases.append((cval, cbody, ct.line))
+            elif self._at("ID", "default"):
+                dt = self._advance()
+                self._expect("OP", ":")
+                dbody: List[ast.stmt] = []
+                while (
+                    not self._at("ID", "case")
+                    and not self._at("ID", "default")
+                    and not self._at("PUNCT", "}")
+                    and not self._at("EOF")
+                ):
+                    if self._at("PUNCT", ";"):
+                        self._advance()
+                        continue
+                    parsed, _ = self._parse_stmt()
+                    for st in parsed:
+                        if isinstance(st, ast.Break):
+                            continue
+                        dbody.append(st)
+                default_stmts = dbody or [ast.Pass(lineno=dt.line)]
+            else:
+                raise PolyglotLoweringError(
+                    f"Line {self._peek().line}: expected 'case' or 'default' inside switch"
+                )
+        self._expect("PUNCT", "}")
+
+        if not cases:
+            if default_stmts:
+                return ast.If(
+                    test=ast.Constant(value=1, lineno=sw_tok.line),
+                    body=default_stmts,
+                    orelse=[],
+                    lineno=sw_tok.line,
+                )
+            return ast.If(
+                test=ast.Constant(value=1, lineno=sw_tok.line),
+                body=[ast.Pass(lineno=sw_tok.line)],
+                orelse=[],
+                lineno=sw_tok.line,
+            )
+
+        tail: List[ast.stmt] = default_stmts or []
+        for cval, cbody, cline in reversed(cases):
+            cmp_test = ast.Compare(
+                left=disc, ops=[ast.Eq()], comparators=[cval], lineno=cline
+            )
+            node = ast.If(test=cmp_test, body=cbody, orelse=tail, lineno=cline)
+            tail = [node]
+        return tail[0]  # type: ignore[return-value]
 
     def _parse_while_stmt(self) -> ast.While:
         w_tok = self._expect("ID", "while")
