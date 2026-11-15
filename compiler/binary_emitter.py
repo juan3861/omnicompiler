@@ -746,15 +746,41 @@ class StandaloneBinaryEmitter:
         dynstr_offset = code_offset + len(code)
         dynsym_offset = self._align_up(dynstr_offset + len(dynstr), 8)
 
+        # Build SysV DT_HASH table so Linux glibc dlsym() resolves all exported symbols
+        def _elf_sysv_hash(name_bytes: bytes) -> int:
+            h = 0
+            for b in name_bytes:
+                h = (h << 4) + b
+                g = h & 0xF0000000
+                if g:
+                    h ^= (g >> 24)
+                h &= ~g
+            return h & 0xFFFFFFFF
+
+        nbucket = max(1, len(sorted_exports))
+        nchain = 1 + len(sorted_exports)
+        buckets = [0] * nbucket
+        chains = [0] * nchain
+        for idx, (sym_name, _sym_off) in enumerate(sorted_exports):
+            sym_idx = idx + 1
+            b_idx = _elf_sysv_hash(sym_name.encode("ascii")) % nbucket
+            chains[sym_idx] = buckets[b_idx]
+            buckets[b_idx] = sym_idx
+        hash_table = struct.pack(f"<II{nbucket}I{nchain}I", nbucket, nchain, *buckets, *chains)
+
+        dynamic_offset = self._align_up(dynsym_offset + len(dynsym), 8)
+        dyn_table_len = 6 * 16  # DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_NULL
+        hash_offset = self._align_up(dynamic_offset + dyn_table_len, 8)
+
         dyn_table = bytearray()
+        dyn_table.extend(struct.pack("<QQ", 4, vaddr + hash_offset))     # DT_HASH
         dyn_table.extend(struct.pack("<QQ", 5, vaddr + dynstr_offset))   # DT_STRTAB
         dyn_table.extend(struct.pack("<QQ", 6, vaddr + dynsym_offset))   # DT_SYMTAB
         dyn_table.extend(struct.pack("<QQ", 10, len(dynstr)))            # DT_STRSZ
         dyn_table.extend(struct.pack("<QQ", 11, 24))                     # DT_SYMENT
         dyn_table.extend(struct.pack("<QQ", 0, 0))                       # DT_NULL
 
-        dynamic_offset = self._align_up(dynsym_offset + len(dynsym), 8)
-        total_size = dynamic_offset + len(dyn_table)
+        total_size = hash_offset + len(hash_table)
 
         elf_ident = b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 8)
         elf_header = struct.pack(
@@ -765,7 +791,7 @@ class StandaloneBinaryEmitter:
             1,
             code_vaddr,
             64, 0, 0,
-            64, 56, 2, 64, 0, 0
+            64, 56, 3, 64, 0, 0
         )
 
         ph_load = struct.pack(
@@ -780,14 +806,23 @@ class StandaloneBinaryEmitter:
             len(dyn_table), len(dyn_table), 8
         )
 
+        ph_gnu_stack = struct.pack(
+            "<IIQQQQQQ",
+            0x6474E551,  # PT_GNU_STACK
+            6,           # PF_R | PF_W (non-executable stack required by modern glibc dlopen)
+            0, 0, 0, 0, 0, 16
+        )
+
         file_bytes = bytearray(total_size)
         file_bytes[0:64] = elf_header
         file_bytes[64:120] = ph_load
         file_bytes[120:176] = ph_dynamic
+        file_bytes[176:232] = ph_gnu_stack
         file_bytes[code_offset:code_offset + len(code)] = code
         file_bytes[dynstr_offset:dynstr_offset + len(dynstr)] = dynstr
         file_bytes[dynsym_offset:dynsym_offset + len(dynsym)] = dynsym
         file_bytes[dynamic_offset:dynamic_offset + len(dyn_table)] = dyn_table
+        file_bytes[hash_offset:hash_offset + len(hash_table)] = hash_table
 
         return bytes(file_bytes)
 
