@@ -346,6 +346,9 @@ class OmniRepoCompiler:
         licm_hoisted_insts = 0
         dse_eliminated_stores = 0
         forwarded_loads = 0
+        tco_converted_calls = 0
+        reordered_blocks = 0
+        peephole_bytes_saved = 0
         all_line_entries: List[Tuple[int, int]] = []
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
@@ -482,8 +485,36 @@ class OmniRepoCompiler:
                     except Exception:
                         pass
 
+                    # 10. Tail-Call Optimization (TCO: Self-Tail Recursion -> O(1) Stack Loop)
+                    try:
+                        from compiler.tco_and_layout import TailCallOptimizationPass
+                        ssa_fn, tco_stats = TailCallOptimizationPass().run_on_function(ssa_fn)
+                        tco_converted_calls += tco_stats.get("tco_converted_calls", 0)
+                    except Exception:
+                        pass
+
+                    # 11. Hot/Cold Basic-Block Layout Ordering
+                    try:
+                        from compiler.tco_and_layout import BlockLayoutPass
+                        ssa_fn, layout_stats = BlockLayoutPass().run_on_function(ssa_fn)
+                        reordered_blocks += layout_stats.get("reordered_blocks", 0)
+                    except Exception:
+                        pass
+
                     artifact = codegen.compile_ssa(ssa_fn)
                     irc_coalesced_moves += getattr(artifact, "coalesced_moves", 0)
+
+                    # 12. Peephole Machine Optimizer (x86-64)
+                    if effective_arch == "x86_64" and not artifact.relocations:
+                        try:
+                            from compiler.tco_and_layout import PeepholeMachineOptimizer
+                            opt_bytes, ph_stats = PeepholeMachineOptimizer().optimize_bytes(
+                                artifact.code_bytes, has_relocations=bool(artifact.relocations)
+                            )
+                            peephole_bytes_saved += ph_stats.get("peephole_bytes_saved", 0)
+                            artifact.code_bytes = opt_bytes
+                        except Exception:
+                            pass
 
                     sym_base_off = len(obj_mod.text_bytes)
                     obj_mod.add_symbol(exp.name, artifact.code_bytes, is_exported=True)
@@ -530,6 +561,9 @@ class OmniRepoCompiler:
             "licm_hoisted_insts": licm_hoisted_insts,
             "dse_eliminated_stores": dse_eliminated_stores,
             "forwarded_loads": forwarded_loads,
+            "tco_converted_calls": tco_converted_calls,
+            "reordered_blocks": reordered_blocks,
+            "peephole_bytes_saved": peephole_bytes_saved,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }
