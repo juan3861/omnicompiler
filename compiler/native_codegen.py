@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Set
 
 from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar
-from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator
+from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator, IteratedRegisterCoalescingAllocator
 
 
 @dataclass
@@ -40,6 +40,8 @@ class CompiledFunctionArtifact:
     saved_nonvolatile_regs: List[str] = field(default_factory=list)
     prologue_size: int = 0
     leaf_register_mode: bool = False
+    coalesced_moves: int = 0
+    live_across_call_count: int = 0
 
 
 # ==============================================================================
@@ -277,10 +279,13 @@ class X64CodeGenerator:
                 for op in inst.operands:
                     register_var(op)
 
-        # Determine Leaf Register-Resident Mode vs General Stack-Frame Mode
+        # Determine Leaf Register-Resident Mode vs General Stack-Frame Mode via George & Appel IRC
         alloca_insts = [inst for b in fn.blocks for inst in b.instructions if inst.opcode == "alloca"]
         has_alloca = len(alloca_insts) > 0
-        alloc = ChaitinBriggsAllocator(LEAF_ALLOC_REGS).allocate(fn)
+        alloc = IteratedRegisterCoalescingAllocator(
+            LEAF_ALLOC_REGS,
+            abi="win64" if self.is_windows else "sysv64",
+        ).allocate(fn)
         leaf_mode = (not has_calls) and (not has_alloca) and alloc["success"] and len(fn.params) <= len(self.param_regs)
 
         reg_map: Dict[SSAVar, str] = {}
@@ -612,6 +617,8 @@ class X64CodeGenerator:
             saved_nonvolatile_regs=used_callee_saved if leaf_mode else ["rbp"],
             prologue_size=prologue_size,
             leaf_register_mode=leaf_mode,
+            coalesced_moves=alloc.get("coalesced_moves", 0),
+            live_across_call_count=len(alloc.get("live_across_call", [])),
         )
 
     def emit_avx2_vector_add_i64(self) -> bytes:

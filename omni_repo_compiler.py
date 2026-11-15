@@ -337,6 +337,7 @@ class OmniRepoCompiler:
         thin_lto_const_folds = 0
         vectorized_loops = 0
         promoted_stack_allocs = 0
+        irc_coalesced_moves = 0
         all_line_entries: List[Tuple[int, int]] = []
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
@@ -425,6 +426,7 @@ class OmniRepoCompiler:
                         pass
 
                     artifact = codegen.compile_ssa(ssa_fn)
+                    irc_coalesced_moves += getattr(artifact, "coalesced_moves", 0)
 
                     sym_base_off = len(obj_mod.text_bytes)
                     obj_mod.add_symbol(exp.name, artifact.code_bytes, is_exported=True)
@@ -462,6 +464,7 @@ class OmniRepoCompiler:
             "thin_lto_const_folds": thin_lto_const_folds,
             "vectorized_loops": vectorized_loops,
             "promoted_stack_allocs": promoted_stack_allocs,
+            "irc_coalesced_moves": irc_coalesced_moves,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }

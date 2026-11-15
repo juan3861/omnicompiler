@@ -19,10 +19,20 @@ PHYSICAL_REGISTERS = [
     "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
 ]
 
+# Windows x64 ABI Caller-Saved (Volatile) vs Callee-Saved (Non-Volatile) Registers
+WIN64_CALLER_SAVED = ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"]
+WIN64_CALLEE_SAVED = ["rbx", "rsi", "rdi", "r12", "r13", "r14", "r15"]
+
+# System V AMD64 ABI Caller-Saved vs Callee-Saved Registers
+SYSV64_CALLER_SAVED = ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"]
+SYSV64_CALLEE_SAVED = ["rbx", "r12", "r13", "r14", "r15"]
+
+# ARM64 AAPCS64 Caller-Saved vs Callee-Saved General-Purpose Registers
+ARM64_CALLER_SAVED = [f"x{i}" for i in range(0, 15)]
+ARM64_CALLEE_SAVED = [f"x{i}" for i in range(19, 29)]
+
 # ARM64 Allocatable Caller/Callee General-Purpose Registers
-ARM64_PHYSICAL_REGISTERS = [
-    f"x{i}" for i in range(0, 15)
-] + [f"x{i}" for i in range(19, 29)]
+ARM64_PHYSICAL_REGISTERS = ARM64_CALLER_SAVED + ARM64_CALLEE_SAVED
 
 
 class LiveRange:
@@ -33,6 +43,7 @@ class LiveRange:
         self.start: int = 10**9
         self.end: int = -1
         self.spill_cost: float = 0.0
+        self.crosses_call: bool = False
 
     def record_def(self, pos: int, weight: float = 1.0):
         self.definitions.add(pos)
@@ -217,6 +228,7 @@ class ChaitinBriggsAllocator:
                 ranges[v].expand_span(b_lo, b_hi)
 
         # Exact instruction-level backward sweep per block to build InterferenceGraph
+        live_across_call: Set[SSAVar] = set()
         for block in fn.blocks:
             bname = block.name
             live: Set[SSAVar] = set(live_out[bname])
@@ -228,6 +240,14 @@ class ChaitinBriggsAllocator:
                     and isinstance(inst.operands[0], SSAVar)
                 )
                 copy_src = inst.operands[0] if is_copy else None
+
+                # Any variable live right after a call (except the call's own return value)
+                # must survive across the call boundary (requires callee-saved register or spill).
+                if inst.opcode == "call":
+                    for v in live:
+                        if v != inst.result:
+                            live_across_call.add(v)
+                            ranges[v].crosses_call = True
 
                 if inst.result is not None:
                     for v in live:
@@ -250,6 +270,7 @@ class ChaitinBriggsAllocator:
 
         self._last_live_in = live_in
         self._last_live_out = live_out
+        self._last_live_across_call = live_across_call
         return igraph, ranges
 
     def allocate(self, fn: SSAFunction) -> Dict[str, Any]:
@@ -259,6 +280,7 @@ class ChaitinBriggsAllocator:
         """
         self._last_live_in = {}
         self._last_live_out = {}
+        self._last_live_across_call = set()
         igraph, ranges = self.compute_liveness(fn)
 
         adj_copy = {u: set(neighbors) for u, neighbors in igraph.adj.items()}
@@ -345,9 +367,374 @@ class ChaitinBriggsAllocator:
             "spill_slot_vars": spill_slots,
             "coalesced_moves": coalesced_moves,
             "k_registers": self.k,
+            "live_across_call": sorted(str(v) for v in self._last_live_across_call),
             "live_in": {k: [str(v) for v in vs] for k, vs in self._last_live_in.items()},
             "live_out": {k: [str(v) for v in vs] for k, vs in self._last_live_out.items()},
         }
+
+
+class IteratedRegisterCoalescingAllocator:
+    """
+    George & Appel (1996) Iterated Register Coalescing (IRC) Graph Coloring Allocator
+    with ABI Caller-Saved vs. Callee-Saved Register Partitioning across Call Boundaries.
+
+    Phases:
+      1. Build: Exact CFG backward liveness, InterferenceGraph, MoveWorklists, and `live_across_call`.
+      2. Simplify: Remove low-degree (< K) non-move-related nodes onto SelectStack.
+      3. Coalesce: Conservatively merge move-related pairs (u, v) satisfying Briggs or George criterion.
+      4. Freeze: Give up coalescing on a low-degree move-related node when Simplify & Coalesce stall.
+      5. SelectSpill: Optimistically push loop-depth-weighted lowest `spill_cost / degree` high-degree node.
+      6. AssignColors: Partition physical registers by ABI call-preservation (`callee_saved` for
+         variables live across calls; `caller_saved` for short-lived temporaries).
+    """
+
+    def __init__(
+        self,
+        k_registers: Optional[List[str]] = None,
+        abi: str = "win64",
+        caller_saved: Optional[List[str]] = None,
+        callee_saved: Optional[List[str]] = None,
+    ):
+        self.abi = abi.lower()
+        if self.abi in ("arm64", "aarch64"):
+            default_regs = ARM64_PHYSICAL_REGISTERS
+            default_caller = ARM64_CALLER_SAVED
+            default_callee = ARM64_CALLEE_SAVED
+        elif self.abi in ("sysv64", "sysv", "linux", "macos"):
+            default_regs = PHYSICAL_REGISTERS
+            default_caller = SYSV64_CALLER_SAVED
+            default_callee = SYSV64_CALLEE_SAVED
+        else:
+            default_regs = PHYSICAL_REGISTERS
+            default_caller = WIN64_CALLER_SAVED
+            default_callee = WIN64_CALLEE_SAVED
+
+        self.registers = list(k_registers) if k_registers is not None else list(default_regs)
+        self.k = len(self.registers)
+
+        if caller_saved is not None and callee_saved is not None:
+            self.caller_saved = [r for r in caller_saved if r in self.registers]
+            self.callee_saved = [r for r in callee_saved if r in self.registers]
+        else:
+            self.caller_saved = [r for r in default_caller if r in self.registers]
+            self.callee_saved = [r for r in default_callee if r in self.registers]
+            # Any custom test registers (e.g. ["r0", "r1", "r2"]) not in standard ABI tables:
+            # partition first half as caller-saved and second half as callee-saved if neither matched
+            unclassified = [
+                r for r in self.registers
+                if r not in self.caller_saved and r not in self.callee_saved
+            ]
+            if unclassified:
+                if not self.caller_saved and not self.callee_saved:
+                    mid = max(1, len(unclassified) // 2)
+                    self.caller_saved = unclassified[:mid]
+                    self.callee_saved = unclassified[mid:]
+                else:
+                    self.caller_saved.extend(unclassified)
+
+    @staticmethod
+    def briggs_criterion(
+        u: SSAVar,
+        v: SSAVar,
+        adj: Dict[SSAVar, Set[SSAVar]],
+        k: int,
+    ) -> bool:
+        """
+        Briggs Conservative Coalescing Criterion:
+        Nodes u and v can be coalesced if the resulting combined node uv will have
+        fewer than K neighbors of significant degree (degree >= K).
+        """
+        combined_neighbors = (adj.get(u, set()) | adj.get(v, set())) - {u, v}
+        significant_count = 0
+        for n in combined_neighbors:
+            n_adj = adj.get(n, set())
+            # If n was adjacent to BOTH u and v, merging u and v reduces n's degree by 1
+            effective_deg = len(n_adj) - (1 if (u in n_adj and v in n_adj) else 0)
+            if effective_deg >= k:
+                significant_count += 1
+        return significant_count < k
+
+    @staticmethod
+    def george_criterion(
+        u: SSAVar,
+        v: SSAVar,
+        adj: Dict[SSAVar, Set[SSAVar]],
+        k: int,
+    ) -> bool:
+        """
+        George Conservative Coalescing Criterion:
+        Nodes u and v can be coalesced if for every neighbor t of v, either t already
+        interferes with u or t has insignificant degree (degree < K).
+        """
+        u_neighbors = adj.get(u, set())
+        for t in adj.get(v, set()):
+            if t == u:
+                continue
+            if t not in u_neighbors and len(adj.get(t, set())) >= k:
+                return False
+        return True
+
+    def allocate(self, fn: SSAFunction) -> Dict[str, Any]:
+        cb = ChaitinBriggsAllocator(self.registers)
+        igraph, ranges = cb.compute_liveness(fn)
+        live_across_call: Set[SSAVar] = set(cb._last_live_across_call)
+
+        # Active interference adjacency map (mutated during Simplify/Coalesce)
+        adj: Dict[SSAVar, Set[SSAVar]] = {u: set(nbrs) for u, nbrs in igraph.adj.items()}
+        # Complete interference adjacency map (retains edges for AssignColors)
+        full_adj: Dict[SSAVar, Set[SSAVar]] = {u: set(nbrs) for u, nbrs in igraph.adj.items()}
+
+        # Canonicalize move pairs (u, v) with deterministic ordering
+        def canon_move(a: SSAVar, b: SSAVar) -> Tuple[SSAVar, SSAVar]:
+            return (a, b) if (a.name, a.version) <= (b.name, b.version) else (b, a)
+
+        move_list: Dict[SSAVar, Set[Tuple[SSAVar, SSAVar]]] = {u: set() for u in igraph.nodes}
+        worklist_moves: Set[Tuple[SSAVar, SSAVar]] = set()
+
+        for u, partners in igraph.move_affinity.items():
+            for v in partners:
+                if u != v:
+                    m = canon_move(u, v)
+                    worklist_moves.add(m)
+                    move_list[u].add(m)
+                    move_list[v].add(m)
+
+        active_moves: Set[Tuple[SSAVar, SSAVar]] = set()
+        coalesced_moves: List[Tuple[SSAVar, SSAVar]] = []
+        constrained_moves: List[Tuple[SSAVar, SSAVar]] = []
+        frozen_moves: List[Tuple[SSAVar, SSAVar]] = []
+
+        simplify_worklist: Set[SSAVar] = set()
+        freeze_worklist: Set[SSAVar] = set()
+        spill_worklist: Set[SSAVar] = set()
+
+        coalesced_nodes: Set[SSAVar] = set()
+        select_stack: List[SSAVar] = []
+        select_stack_set: Set[SSAVar] = set()
+        alias: Dict[SSAVar, SSAVar] = {u: u for u in igraph.nodes}
+
+        def get_alias(n: SSAVar) -> SSAVar:
+            curr = n
+            while curr in coalesced_nodes and alias.get(curr, curr) != curr:
+                curr = alias[curr]
+            return curr
+
+        def node_moves(n: SSAVar) -> Set[Tuple[SSAVar, SSAVar]]:
+            return move_list.get(n, set()) & (active_moves | worklist_moves)
+
+        def move_related(n: SSAVar) -> bool:
+            return len(node_moves(n)) > 0
+
+        def adjacent(n: SSAVar) -> Set[SSAVar]:
+            return adj.get(n, set()) - (select_stack_set | coalesced_nodes)
+
+        def degree(n: SSAVar) -> int:
+            return len(adjacent(n))
+
+        # MakeWorklist
+        for n in igraph.nodes:
+            if degree(n) >= self.k:
+                spill_worklist.add(n)
+            elif move_related(n):
+                freeze_worklist.add(n)
+            else:
+                simplify_worklist.add(n)
+
+        def enable_moves(nodes: Set[SSAVar]):
+            for n in nodes:
+                for m in list(node_moves(n)):
+                    if m in active_moves:
+                        active_moves.remove(m)
+                        worklist_moves.add(m)
+
+        def decrement_degree(m: SSAVar):
+            # Called right after removing a neighbor of m
+            if m in spill_worklist and degree(m) < self.k:
+                spill_worklist.remove(m)
+                enable_moves({m} | adjacent(m))
+                if move_related(m):
+                    freeze_worklist.add(m)
+                else:
+                    simplify_worklist.add(m)
+
+        def add_work_list(u: SSAVar):
+            if u not in coalesced_nodes and u not in select_stack_set:
+                if degree(u) < self.k and not move_related(u):
+                    freeze_worklist.discard(u)
+                    simplify_worklist.add(u)
+
+        def freeze_moves(u: SSAVar):
+            for m in list(node_moves(u)):
+                x, y = m
+                if get_alias(y) == get_alias(u):
+                    v = get_alias(x)
+                else:
+                    v = get_alias(y)
+                active_moves.discard(m)
+                worklist_moves.discard(m)
+                frozen_moves.append(m)
+                if v in freeze_worklist and not move_related(v) and degree(v) < self.k:
+                    freeze_worklist.remove(v)
+                    simplify_worklist.add(v)
+
+        def combine(u: SSAVar, v: SSAVar):
+            if v in freeze_worklist:
+                freeze_worklist.remove(v)
+            else:
+                spill_worklist.discard(v)
+            coalesced_nodes.add(v)
+            alias[v] = u
+            move_list[u] |= move_list.get(v, set())
+            enable_moves({v})
+
+            if v in live_across_call:
+                live_across_call.add(u)
+                ranges[u].crosses_call = True
+            ranges[u].spill_cost += ranges[v].spill_cost
+
+            for t in list(adjacent(v)):
+                adj[u].add(t)
+                adj[t].add(u)
+                full_adj[u].add(t)
+                full_adj[t].add(u)
+                adj[t].discard(v)
+                decrement_degree(t)
+            adj[v].clear()
+
+            if degree(u) >= self.k and u in freeze_worklist:
+                freeze_worklist.remove(u)
+                spill_worklist.add(u)
+
+        # Main George & Appel Iterated Loop
+        while simplify_worklist or worklist_moves or freeze_worklist or spill_worklist:
+            if simplify_worklist:
+                n = min(simplify_worklist, key=lambda v: (v.name, v.version))
+                simplify_worklist.remove(n)
+                select_stack.append(n)
+                select_stack_set.add(n)
+                nbrs = list(adjacent(n))
+                for m in nbrs:
+                    adj[m].discard(n)
+                    decrement_degree(m)
+                adj[n].clear()
+
+            elif worklist_moves:
+                m = min(worklist_moves, key=lambda pair: (pair[0].name, pair[0].version, pair[1].name, pair[1].version))
+                worklist_moves.remove(m)
+                x = get_alias(m[0])
+                y = get_alias(m[1])
+                u, v = (x, y) if (x.name, x.version) <= (y.name, y.version) else (y, x)
+
+                if u == v:
+                    coalesced_moves.append(m)
+                    add_work_list(u)
+                elif v in adj.get(u, set()) or v in full_adj.get(u, set()):
+                    constrained_moves.append(m)
+                    add_work_list(u)
+                    add_work_list(v)
+                elif (
+                    self.briggs_criterion(u, v, adj, self.k)
+                    or self.george_criterion(u, v, adj, self.k)
+                    or self.george_criterion(v, u, adj, self.k)
+                ):
+                    coalesced_moves.append(m)
+                    combine(u, v)
+                    add_work_list(u)
+                else:
+                    active_moves.add(m)
+
+            elif freeze_worklist:
+                u = min(freeze_worklist, key=lambda v: (v.name, v.version))
+                freeze_worklist.remove(u)
+                simplify_worklist.add(u)
+                freeze_moves(u)
+
+            elif spill_worklist:
+                m = min(
+                    spill_worklist,
+                    key=lambda n: (
+                        ranges[n].spill_cost / max(1, degree(n)),
+                        n.name,
+                        n.version,
+                    ),
+                )
+                spill_worklist.remove(m)
+                simplify_worklist.add(m)
+                freeze_moves(m)
+
+        # Step 6: AssignColors with ABI Caller-Saved vs. Callee-Saved Partitioning
+        color_map: Dict[SSAVar, str] = {}
+        spilled_nodes: Set[SSAVar] = set()
+
+        while select_stack:
+            n = select_stack.pop()
+            select_stack_set.discard(n)
+            used_colors = {
+                color_map[get_alias(w)]
+                for w in full_adj.get(n, set())
+                if get_alias(w) in color_map
+            }
+
+            # Partition preference:
+            # Variables live across calls prefer callee-saved (non-volatile) registers;
+            # Variables NOT live across calls prefer caller-saved (volatile) registers.
+            if n in live_across_call:
+                preferred_order = self.callee_saved + [r for r in self.caller_saved if r not in self.callee_saved]
+            else:
+                preferred_order = self.caller_saved + [r for r in self.callee_saved if r not in self.caller_saved]
+
+            assigned_color = None
+            for reg in preferred_order:
+                if reg not in used_colors:
+                    assigned_color = reg
+                    break
+
+            if assigned_color is not None:
+                color_map[n] = assigned_color
+            else:
+                spilled_nodes.add(n)
+
+        # Propagate colors (or spills) to coalesced nodes
+        for n in sorted(coalesced_nodes, key=lambda v: (v.name, v.version)):
+            rep = get_alias(n)
+            if rep in color_map:
+                color_map[n] = color_map[rep]
+            else:
+                spilled_nodes.add(n)
+
+        spill_slots: Dict[SSAVar, int] = {}
+        for idx, spilled in enumerate(sorted(spilled_nodes, key=lambda v: (v.name, v.version))):
+            spill_slots[spilled] = -8 * (idx + 1)
+
+        used_regs = set(color_map.values())
+        callee_saved_used = [r for r in self.callee_saved if r in used_regs]
+        caller_saved_used = [r for r in self.caller_saved if r in used_regs]
+
+        return {
+            "success": len(spilled_nodes) == 0,
+            "allocator": "GeorgeAppelIRC",
+            "abi": self.abi,
+            "total_vars": len(igraph.nodes),
+            "allocated_colors": {str(var): reg for var, reg in color_map.items()},
+            "color_map": color_map,
+            "spills_count": len(spilled_nodes),
+            "spill_slots": {str(var): slot for var, slot in spill_slots.items()},
+            "spill_slot_vars": spill_slots,
+            "coalesced_moves": len(coalesced_moves),
+            "coalesced_pairs": [(str(u), str(v)) for u, v in coalesced_moves],
+            "coalesced_into": {str(v): str(get_alias(v)) for v in coalesced_nodes},
+            "constrained_moves": len(constrained_moves),
+            "frozen_moves": len(frozen_moves),
+            "live_across_call": sorted(str(v) for v in live_across_call),
+            "callee_saved_used": callee_saved_used,
+            "caller_saved_used": caller_saved_used,
+            "k_registers": self.k,
+            "live_in": {k: [str(v) for v in vs] for k, vs in cb._last_live_in.items()},
+            "live_out": {k: [str(v) for v in vs] for k, vs in cb._last_live_out.items()},
+        }
+
+
+IRCAllocator = IteratedRegisterCoalescingAllocator
 
 
 class LinearScanAllocator:
