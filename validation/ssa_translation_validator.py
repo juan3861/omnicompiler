@@ -55,10 +55,12 @@ class SSATranslationValidator:
         enable_memory_theory: bool = False,
         max_loop_unroll: int = 0,
         enable_inductive_loops: bool = False,
+        enable_call_congruence: bool = False,
     ):
         self.enable_memory_theory = enable_memory_theory
         self.max_loop_unroll = max(0, int(max_loop_unroll))
         self.enable_inductive_loops = bool(enable_inductive_loops)
+        self.enable_call_congruence = bool(enable_call_congruence)
 
     def _topological_blocks(self, fn: SSAFunction) -> Optional[List[BasicBlock]]:
         """
@@ -125,7 +127,18 @@ class SSATranslationValidator:
             ops |= SUPPORTED_Z3_MEMORY_OPCODES
         if self.max_loop_unroll > 0:
             ops |= SUPPORTED_Z3_METADATA_OPCODES
+        if self.enable_call_congruence:
+            ops.add("call")
         return frozenset(ops)
+
+    def _eval_call_uf(self, callee: str, arg_exprs: List[z3.BitVecRef]) -> z3.BitVecRef:
+        bv64 = z3.BitVecSort(64)
+        arity = len(arg_exprs)
+        uf_name = f"uf_call_{callee}_{arity}"
+        if arity == 0:
+            return z3.Const(uf_name, bv64)
+        uf = z3.Function(uf_name, *([bv64] * arity), bv64)
+        return uf(*arg_exprs)
 
     def _encode_function_symbolic(
         self,
@@ -434,6 +447,21 @@ class SSATranslationValidator:
                         if c is None or vt is None or vf is None:
                             return {"error": "UNRESOLVED_SELECT"}
                         env_levels[lvl][inst.result] = z3.If(c != 0, vt, vf)
+
+                    elif op == "call":
+                        if not inst.operands:
+                            return {"error": "INVALID_CALL"}
+                        callee = str(inst.operands[0])
+                        if callee.startswith("omni_"):
+                            return {"error": f"UNSUPPORTED_IMPURE_CALL_{callee}"}
+                        arg_exprs: List[z3.BitVecRef] = []
+                        for a in inst.operands[1:]:
+                            av = eval_op(a)
+                            if av is None:
+                                return {"error": f"UNRESOLVED_CALL_ARG_{callee}"}
+                            arg_exprs.append(av)
+                        if inst.result is not None:
+                            env_levels[lvl][inst.result] = self._eval_call_uf(callee, arg_exprs)
 
                     elif op == "br":
                         if not inst.operands:
@@ -806,6 +834,21 @@ class SSATranslationValidator:
                     if c is None or vt is None or vf is None:
                         return {"error": "UNRESOLVED_SELECT"}
                     local_env[inst.result] = z3.If(c != 0, vt, vf)
+
+                elif op == "call":
+                    if not inst.operands:
+                        return {"error": "INVALID_CALL"}
+                    callee = str(inst.operands[0])
+                    if callee.startswith("omni_"):
+                        return {"error": f"UNSUPPORTED_IMPURE_CALL_{callee}"}
+                    arg_exprs: List[z3.BitVecRef] = []
+                    for a in inst.operands[1:]:
+                        av = eval_op(a)
+                        if av is None:
+                            return {"error": f"UNRESOLVED_CALL_ARG_{callee}"}
+                        arg_exprs.append(av)
+                    if inst.result is not None:
+                        local_env[inst.result] = self._eval_call_uf(callee, arg_exprs)
 
                 elif op == "br":
                     if not inst.operands:

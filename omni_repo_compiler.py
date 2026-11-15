@@ -155,16 +155,22 @@ class OmniRepoCompiler:
     def _scan_repo_asts(
         self, repo_path: str
     ) -> Tuple[List[Tuple[str, ast.Module]], Dict[str, Tuple[str, ast.FunctionDef]], Dict[str, str]]:
+        from frontends.polyglot_ssa_lowering import (
+            SUPPORTED_POLYGLOT_EXTENSIONS,
+            parse_polyglot_file_to_ast,
+        )
+
         parsed_modules: List[Tuple[str, ast.Module]] = []
         funcs: Dict[str, Tuple[str, ast.FunctionDef]] = {}
         aliases: Dict[str, str] = {}
-        skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
+        skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", "target"}
 
         for root, dirs, files in os.walk(repo_path):
             dirs[:] = [d for d in dirs if d not in skip_dirs]
             for f in sorted(files):
+                full_f = os.path.join(root, f)
+                ext = os.path.splitext(f)[1].lower()
                 if f.endswith(".py"):
-                    full_f = os.path.join(root, f)
                     try:
                         with open(full_f, "r", encoding="utf-8") as py_f:
                             src = py_f.read()
@@ -180,6 +186,15 @@ class OmniRepoCompiler:
                                 and isinstance(node.value, ast.Name)
                             ):
                                 aliases[node.targets[0].id] = node.value.id
+                    except Exception:
+                        pass
+                elif ext in SUPPORTED_POLYGLOT_EXTENSIONS:
+                    try:
+                        parsed = parse_polyglot_file_to_ast(full_f, strict=False)
+                        if parsed.functions:
+                            parsed_modules.append((full_f, parsed.module))
+                            for fn_node in parsed.functions:
+                                funcs[fn_node.name] = (full_f, fn_node)
                     except Exception:
                         pass
         return parsed_modules, funcs, aliases
@@ -673,6 +688,10 @@ class OmniRepoCompiler:
                 wf.write(wasm_bytes)
 
             exported_wasm_syms = sorted({f.name for f in wasm_funcs})
+            vla_meta_wasm = None
+            if vectorized_loops > 0:
+                from compiler.vla_simd_engine import VLASimdEngine
+                vla_meta_wasm = VLASimdEngine(target_isa="AVX2_256").emit_x86_vmaskmov_metadata()
             results["stages"]["codegen"] = {
                 "modules_added": len(manifests),
                 "real_ast_functions_compiled": len(ssa_program),
@@ -680,6 +699,7 @@ class OmniRepoCompiler:
                 "thin_lto_inlines": thin_lto_inlines,
                 "thin_lto_const_folds": thin_lto_const_folds,
                 "vectorized_loops": vectorized_loops,
+                "vla_simd_metadata": vla_meta_wasm,
                 "promoted_stack_allocs": promoted_stack_allocs,
                 "irc_coalesced_moves": irc_coalesced_moves,
                 "polyhedral_tiled_loops": polyhedral_tiled_loops,
@@ -874,6 +894,17 @@ class OmniRepoCompiler:
             "verdicts": backend_verdicts,
         }
 
+        vla_simd_metadata = None
+        if vectorized_loops > 0:
+            from compiler.vla_simd_engine import VLASimdEngine
+            isa = "SVE_SCALABLE" if effective_arch == "arm64" else "AVX2_256"
+            vla_engine = VLASimdEngine(target_isa=isa)
+            vla_simd_metadata = (
+                vla_engine.emit_arm64_sve_metadata()
+                if effective_arch == "arm64"
+                else vla_engine.emit_x86_vmaskmov_metadata()
+            )
+
         results["stages"]["codegen"] = {
             "backend": resolved_backend,
             "modules_added": len(self.linker.modules),
@@ -882,6 +913,7 @@ class OmniRepoCompiler:
             "thin_lto_inlines": thin_lto_inlines,
             "thin_lto_const_folds": thin_lto_const_folds,
             "vectorized_loops": vectorized_loops,
+            "vla_simd_metadata": vla_simd_metadata,
             "promoted_stack_allocs": promoted_stack_allocs,
             "irc_coalesced_moves": irc_coalesced_moves,
             "polyhedral_tiled_loops": polyhedral_tiled_loops,

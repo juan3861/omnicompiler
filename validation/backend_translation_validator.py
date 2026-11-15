@@ -275,6 +275,21 @@ class LLVMIRToSSALifter:
                 cur_bb.add_instruction(SSAInstruction(res_v, ssa_op, [parse_val(m_bin.group(2)), parse_val(m_bin.group(3))]))
                 continue
 
+            m_call = re.match(r"^call\s+i64\s+@([A-Za-z0-9_.$]+)\((.*)\)$", rhs)
+            if m_call:
+                callee = m_call.group(1)
+                raw_args = m_call.group(2).strip()
+                call_args: List[Any] = []
+                if raw_args:
+                    for part in raw_args.split(","):
+                        toks = part.strip().split()
+                        if not toks:
+                            return None, f"INVALID_LLVM_CALL_ARG_{ln}"
+                        call_args.append(parse_val(toks[-1]))
+                res_v = get_or_create_var(lhs_tok)
+                cur_bb.add_instruction(SSAInstruction(res_v, "call", [callee] + call_args))
+                continue
+
             return None, f"UNSUPPORTED_LLVM_OP_{rhs}"
 
         for bname in block_order:
@@ -348,10 +363,58 @@ class WATToSSALifter:
             idx = end
 
     @classmethod
+    def _extract_func_arities(cls, wat: str) -> Dict[str, int]:
+        arities: Dict[str, int] = {}
+        idx = 0
+        while True:
+            pos = wat.find("(func ", idx)
+            if pos == -1:
+                break
+            depth = 0
+            end = pos
+            while end < len(wat):
+                ch = wat[end]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end += 1
+                        break
+                end += 1
+            chunk = wat[pos:end]
+            chunk_lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+            if chunk_lines:
+                hdr = chunk_lines[0]
+                m_sym = re.search(r"\(func\s+\$([^\s()]+)", hdr)
+                m_exp = re.search(r'\(export\s+"([^"]+)"\)', hdr)
+                # Count leading (param ...) declarations before body/local
+                sig_text = [hdr]
+                for ln in chunk_lines[1:]:
+                    if ln.startswith("(param ") or ln.startswith("(result "):
+                        sig_text.append(ln)
+                    elif ln.startswith("(local "):
+                        break
+                    else:
+                        break
+                joined_sig = " ".join(sig_text)
+                param_cnt = 0
+                for p_inner in re.findall(r"\(param\b([^)]*)\)", joined_sig):
+                    toks = [tk for tk in p_inner.split() if tk in ("i64", "i32", "f64", "f32")]
+                    param_cnt += len(toks) if toks else 1
+                if m_sym:
+                    arities[m_sym.group(1)] = param_cnt
+                if m_exp:
+                    arities[m_exp.group(1)] = param_cnt
+            idx = end
+        return arities
+
+    @classmethod
     def lift_function(cls, wat: str, target_name: Optional[str] = None) -> Tuple[Optional[SSAFunction], Optional[str]]:
         chunk = cls._extract_func_block(wat, target_name=target_name)
         if chunk is None:
             return None, "WAT_FUNC_NOT_FOUND"
+        func_arities = cls._extract_func_arities(wat)
 
         lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
         header = lines[0]
@@ -404,7 +467,9 @@ class WATToSSALifter:
             for loc in local_names:
                 env.setdefault(loc, 0)
 
-            err = cls._lower_wat_block_lines(body_lines, entry, env, next_var, has_return_ref=[False])
+            err = cls._lower_wat_block_lines(
+                body_lines, entry, env, next_var, has_return_ref=[False], func_arities=func_arities
+            )
             if err:
                 return None, err
             return ssa_fn, None
@@ -495,6 +560,7 @@ class WATToSSALifter:
             err = cls._lower_wat_multiblock_arm(
                 dispatch_chunks[b_idx], b_idx, bb, env, block_objs,
                 next_var, edge_writes, preds_of, edges_by_src,
+                func_arities=func_arities,
             )
             if err:
                 return None, err
@@ -558,6 +624,7 @@ class WATToSSALifter:
         env: Dict[str, Any],
         next_var,
         pending_edge_locs: Optional[Dict[str, Any]] = None,
+        func_arities: Optional[Dict[str, int]] = None,
     ) -> Optional[str]:
         if ln.startswith("i64.const "):
             stack.append(int(ln.split()[1]))
@@ -616,6 +683,18 @@ class WATToSSALifter:
             bb.add_instruction(SSAInstruction(rv, "select", [cond, t_val, f_val]))
             stack.append(rv)
             return None
+        if ln.startswith("call $"):
+            callee = ln[len("call $") :].strip()
+            if not func_arities or callee not in func_arities:
+                return f"UNKNOWN_WAT_CALL_ARITY_{callee}"
+            arity = func_arities[callee]
+            if len(stack) < arity:
+                return f"WAT_STACK_UNDERFLOW_call_{callee}"
+            call_args = [stack.pop() for _ in range(arity)][::-1]
+            rv = next_var("wcall")
+            bb.add_instruction(SSAInstruction(rv, "call", [callee] + call_args))
+            stack.append(rv)
+            return None
         if ln == "return":
             rv = stack.pop() if stack else 0
             bb.add_instruction(SSAInstruction(None, "ret", [rv]))
@@ -630,12 +709,13 @@ class WATToSSALifter:
         env: Dict[str, Any],
         next_var,
         has_return_ref: List[bool],
+        func_arities: Optional[Dict[str, int]] = None,
     ) -> Optional[str]:
         stack: List[Any] = []
         for ln in body_lines:
             if ln == "return":
                 has_return_ref[0] = True
-            err = cls._eval_wat_step(ln, stack, bb, env, next_var)
+            err = cls._eval_wat_step(ln, stack, bb, env, next_var, func_arities=func_arities)
             if err:
                 return err
         if not has_return_ref[0]:
@@ -655,6 +735,7 @@ class WATToSSALifter:
         edge_writes: Dict[Tuple[int, int], Dict[str, Any]],
         preds_of: Dict[int, List[int]],
         edges_by_src: Dict[int, List[Tuple[int, Dict[str, Any]]]],
+        func_arities: Optional[Dict[str, int]] = None,
     ) -> Optional[str]:
         stack: List[Any] = []
         i = 0
@@ -722,7 +803,9 @@ class WATToSSALifter:
                         ):
                             tgt = int(br_lines[j].split()[1])
                             break
-                        err_s = cls._eval_wat_step(bl, br_stack, bb, branch_env, next_var)
+                        err_s = cls._eval_wat_step(
+                            bl, br_stack, bb, branch_env, next_var, func_arities=func_arities
+                        )
                         if err_s:
                             return None, {}, err_s
                         j += 1
@@ -746,7 +829,7 @@ class WATToSSALifter:
                     preds_of[f_idx].append(b_idx)
                 return None
 
-            err = cls._eval_wat_step(ln, stack, bb, env, next_var)
+            err = cls._eval_wat_step(ln, stack, bb, env, next_var, func_arities=func_arities)
             if err:
                 return err
             i += 1
@@ -764,11 +847,13 @@ class BackendTranslationValidator:
         enable_memory_theory: bool = True,
         max_loop_unroll: int = 4,
         enable_inductive_loops: bool = True,
+        enable_call_congruence: bool = True,
     ):
         self.validator = SSATranslationValidator(
             enable_memory_theory=enable_memory_theory,
             max_loop_unroll=max_loop_unroll,
             enable_inductive_loops=enable_inductive_loops,
+            enable_call_congruence=enable_call_congruence,
         )
 
     def verify_ssa_to_llvm_ir(

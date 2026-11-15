@@ -145,6 +145,12 @@ class RepoManifestIngestor:
                     imports.extend(imp)
                     all_bytes.extend(b)
 
+                elif f.endswith((".js", ".mjs", ".ts", ".go")):
+                    exp, imp, b = self._parse_polyglot_file(full_path, rel_path)
+                    exports.extend(exp)
+                    imports.extend(imp)
+                    all_bytes.extend(b)
+
         digest = blake3_digest(bytes(all_bytes)) if all_bytes else blake3_digest(name.encode("utf-8"))
         manifest = RepoManifest(
             repo_name=name,
@@ -271,6 +277,29 @@ class RepoManifestIngestor:
                     visibility="public",
                     language="rust",
                     source_file=rel_path
+                ))
+            return exports, imports, content
+        except Exception:
+            return exports, imports, b""
+
+    def _parse_polyglot_file(self, path: str, rel_path: str) -> Tuple[List[SymbolSignature], List[SymbolRequirement], bytes]:
+        exports: List[SymbolSignature] = []
+        imports: List[SymbolRequirement] = []
+        try:
+            with open(path, "rb") as f:
+                content = f.read()
+            text = content.decode("utf-8", errors="ignore")
+            from frontends.polyglot_ssa_lowering import parse_polyglot_file_to_ast
+
+            parsed = parse_polyglot_file_to_ast(path, source_text=text, strict=False)
+            for fn in parsed.functions:
+                exports.append(SymbolSignature(
+                    name=fn.name,
+                    params=[arg.arg for arg in fn.args.args],
+                    return_type="i64",
+                    visibility="public",
+                    language=parsed.language,
+                    source_file=rel_path,
                 ))
             return exports, imports, content
         except Exception:

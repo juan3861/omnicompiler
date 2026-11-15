@@ -18,6 +18,7 @@ test_modules = [
     "tests.test_alpha_c24_smt_translation_validation",
     "tests.test_alpha_c25_unified_smt_aot",
     "tests.test_alpha_c26_inductive_and_backend_tv",
+    "tests.test_alpha_c27_polyglot_aot_and_call_tv",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]
