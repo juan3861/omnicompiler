@@ -343,6 +343,9 @@ class OmniRepoCompiler:
         gvn_eliminated_exprs = 0
         sccp_folded_branches = 0
         specialized_functions = 0
+        licm_hoisted_insts = 0
+        dse_eliminated_stores = 0
+        forwarded_loads = 0
         all_line_entries: List[Tuple[int, int]] = []
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
@@ -462,6 +465,23 @@ class OmniRepoCompiler:
                     except Exception:
                         pass
 
+                    # 8. Loop-Invariant Code Motion (LICM)
+                    try:
+                        from compiler.licm_and_dse import LICMPass
+                        ssa_fn, licm_stats = LICMPass().run_on_function(ssa_fn)
+                        licm_hoisted_insts += licm_stats.get("licm_hoisted_insts", 0)
+                    except Exception:
+                        pass
+
+                    # 9. Alias-Guided Dead Store Elimination (DSE) & Store-to-Load Forwarding
+                    try:
+                        from compiler.licm_and_dse import DSEPass
+                        ssa_fn, dse_stats = DSEPass().run_on_function(ssa_fn)
+                        dse_eliminated_stores += dse_stats.get("dse_eliminated_stores", 0)
+                        forwarded_loads += dse_stats.get("forwarded_loads", 0)
+                    except Exception:
+                        pass
+
                     artifact = codegen.compile_ssa(ssa_fn)
                     irc_coalesced_moves += getattr(artifact, "coalesced_moves", 0)
 
@@ -507,6 +527,9 @@ class OmniRepoCompiler:
             "gvn_eliminated_exprs": gvn_eliminated_exprs,
             "sccp_folded_branches": sccp_folded_branches,
             "specialized_functions": specialized_functions,
+            "licm_hoisted_insts": licm_hoisted_insts,
+            "dse_eliminated_stores": dse_eliminated_stores,
+            "forwarded_loads": forwarded_loads,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }

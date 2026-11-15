@@ -12,6 +12,7 @@ test_modules = [
     "tests.test_alpha_c18_irc_regalloc",
     "tests.test_alpha_c19_vla_polyhedral",
     "tests.test_alpha_c20_ipsccp_gvn",
+    "tests.test_alpha_c21_licm_dse",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]
