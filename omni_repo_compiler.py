@@ -29,6 +29,8 @@ from validation.smt_refinement import SmtRefinementVerifier
 from validation.binary_structure_auditor import BinaryStructureAuditor
 from validation.silicon_safety_sandbox import SiliconSafetySandbox
 from validation.assembly_invariant_auditor import AssemblyInvariantAuditor
+from validation.biabduction_verifier import BiAbductionVerifier
+from validation.backend_translation_validator import BackendTranslationValidator
 from slicer.inter_repo_slicer import InterRepoSlicer
 from compiler.llvm_backend import LLVMBackend
 from compiler.wasm_backend import WasmBackend
@@ -144,6 +146,10 @@ class OmniRepoCompiler:
         self.llvm = LLVMBackend(opt_level=3)
         self.wasm = WasmBackend()
         self.smt_verifier = SmtRefinementVerifier(bit_width=64)
+        self.biabduction = BiAbductionVerifier()
+        self.backend_validator = BackendTranslationValidator(
+            enable_memory_theory=True, max_loop_unroll=4, enable_inductive_loops=True
+        )
         self.dwarf_emitter = DwarfV5Emitter()
 
     def _scan_repo_asts(
@@ -311,6 +317,39 @@ class OmniRepoCompiler:
         results["stages"]["cpg_security"] = {
             "taint_leak_detected": taint_leak is not None,
             "isolation_preserved": taint_leak is None,
+        }
+
+        # Stage 3b: Separation Logic / Bi-Abduction Heap Disjointness across Repos
+        repo_top_sources: Dict[str, str] = {}
+        for m in manifests:
+            global_stmts = []
+            for _fp, tree in repo_modules_map.get(m.repo_name, []):
+                for node in tree.body:
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        global_stmts.append(ast.unparse(node))
+            repo_top_sources[m.repo_name] = "\n".join(global_stmts)
+
+        separation_proofs: List[Dict[str, Any]] = []
+        heap_disjoint_all = True
+        repo_names_list = [m.repo_name for m in manifests]
+        for idx_a in range(len(repo_names_list)):
+            for idx_b in range(idx_a + 1, len(repo_names_list)):
+                ra, rb = repo_names_list[idx_a], repo_names_list[idx_b]
+                sp = self.biabduction.verify_heap_disjointness(
+                    repo_top_sources.get(ra, ""),
+                    repo_top_sources.get(rb, ""),
+                    tenant_a=ra,
+                    tenant_b=rb,
+                )
+                sp_dict = sp.to_dict()
+                separation_proofs.append(sp_dict)
+                if not sp_dict["heap_disjointness_proven"]:
+                    heap_disjoint_all = False
+
+        results["stages"]["separation_logic"] = {
+            "pairs_verified": len(separation_proofs),
+            "heap_disjointness_proven": heap_disjoint_all,
+            "proofs": separation_proofs,
         }
 
         # Stage 4: CEGIS Interface Synthesis & ABI Marshalling
@@ -499,9 +538,14 @@ class OmniRepoCompiler:
             except Exception:
                 pass
 
-        # Passes 6-11: SMT-Gated Optimization Passes (QF_ABV Memory + Bounded Loop Unrolling)
+        # Passes 6-11: SMT-Gated Optimization Passes (QF_ABV Memory + Bounded + Unbounded Inductive Loops)
         from validation.ssa_translation_validator import VerifiedPassRunner
-        smt_runner = VerifiedPassRunner(timeout_ms=300, enable_memory_theory=True, max_loop_unroll=4)
+        smt_runner = VerifiedPassRunner(
+            timeout_ms=300,
+            enable_memory_theory=True,
+            max_loop_unroll=4,
+            enable_inductive_loops=True,
+        )
 
         def _run_smt_gated_pass(fn_obj, pass_callable, counter_key=None):
             nonlocal smt_pass_proofs, smt_pass_rollbacks
@@ -609,6 +653,20 @@ class OmniRepoCompiler:
                 wasm_funcs.append(synth_fn)
 
             wat_source = self.wasm.ssa_module_to_wat(wasm_funcs)
+            wat_proofs_proven = 0
+            wat_refuted = 0
+            wat_verdicts: Dict[str, str] = {}
+            for wf_ssa in wasm_funcs:
+                bv = self.backend_validator.verify_ssa_to_wat(wf_ssa, wat_source, timeout_ms=400)
+                wat_verdicts[wf_ssa.name] = bv["status"]
+                if bv["proven"]:
+                    wat_proofs_proven += 1
+                if bv["status"] == "REFUTED_COUNTEREXAMPLE":
+                    wat_refuted += 1
+                    raise RuntimeError(
+                        f"WASM backend lowering translation validation REFUTED for '{wf_ssa.name}': {bv['counterexample']}"
+                    )
+
             wasm_bytes = self.wasm.wat_to_wasm(wat_source)
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             with open(output_path, "wb") as wf:
@@ -650,6 +708,12 @@ class OmniRepoCompiler:
                 "valid_wasm_magic": wasm_bytes[:4] == b"\x00asm",
                 "exported_symbols": exported_wasm_syms,
             }
+            results["stages"]["backend_validation"] = {
+                "backend": "wasm",
+                "proofs_proven": wat_proofs_proven,
+                "refuted": wat_refuted,
+                "verdicts": wat_verdicts,
+            }
             results["stages"]["linking"] = {
                 "success": True,
                 "total_text_size": len(wasm_bytes),
@@ -681,7 +745,7 @@ class OmniRepoCompiler:
             nonce = audit_nonce or "NONCE-C5-20261023-OMNI01"
             ledger_path = output_path + ".ledger.json"
             formal_proofs = {
-                "heap_biabduction": True,
+                "heap_biabduction": heap_disjoint_all,
                 "assembly_invariants": True,
                 "silicon_safety": True,
                 "structural_audit": wasm_bytes[:4] == b"\x00asm",
@@ -704,6 +768,9 @@ class OmniRepoCompiler:
             return results
 
         # Native / LLVM O3 Codegen + Object Ingestion per Repository
+        backend_proofs_proven = 0
+        backend_refuted = 0
+        backend_verdicts: Dict[str, str] = {}
         for m, obj_mod, stub_list in repo_order_objs:
             repo_ssas = [
                 ssa_program[fn_n]
@@ -724,6 +791,16 @@ class OmniRepoCompiler:
                 ]
                 if llvm_eligible:
                     llvm_ir = self.llvm.ssa_module_to_llvm_ir(llvm_eligible, module_name=f"omni_{m.repo_name}")
+                    for ls in llvm_eligible:
+                        bv = self.backend_validator.verify_ssa_to_llvm_ir(ls, llvm_ir, timeout_ms=400)
+                        backend_verdicts[ls.name] = bv["status"]
+                        if bv["proven"]:
+                            backend_proofs_proven += 1
+                        if bv["status"] == "REFUTED_COUNTEREXAMPLE":
+                            backend_refuted += 1
+                            raise RuntimeError(
+                                f"LLVM backend lowering translation validation REFUTED for '{ls.name}': {bv['counterexample']}"
+                            )
                     llvm_mod = self.llvm.compile_ir(llvm_ir, optimize=True)
                     obj_bytes = self.llvm.emit_object(llvm_mod)
                     llvm_obj_mod = (
@@ -789,6 +866,13 @@ class OmniRepoCompiler:
             synth_mod.add_symbol(entry_export, synth_code, is_exported=True)
             self.linker.add_module(synth_mod)
             defined_symbols_across_mods.add(entry_export)
+
+        results["stages"]["backend_validation"] = {
+            "backend": resolved_backend,
+            "proofs_proven": backend_proofs_proven,
+            "refuted": backend_refuted,
+            "verdicts": backend_verdicts,
+        }
 
         results["stages"]["codegen"] = {
             "backend": resolved_backend,
@@ -971,7 +1055,7 @@ class OmniRepoCompiler:
         nonce = audit_nonce or "NONCE-C5-20261023-OMNI01"
         ledger_path = artifact_path + ".ledger.json"
         formal_proofs = {
-            "heap_biabduction": True,
+            "heap_biabduction": heap_disjoint_all,
             "assembly_invariants": results["stages"]["preflight_safety"].get("assembly_invariants_valid", True),
             "silicon_safety": results["stages"]["preflight_safety"].get("is_safe_for_silicon", True),
             "structural_audit": audit_report.is_valid,

@@ -1161,7 +1161,7 @@ def _eval_const_binop(opcode: str, a: int, b: int) -> Optional[int]:
         if 0 <= sb < 64:
             return to_s64(sa << sb)
         return None
-    elif opcode == "shr":
+    elif opcode in ("shr", "sar"):
         if 0 <= sb < 64:
             return sa >> sb
         return None

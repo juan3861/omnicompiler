@@ -495,7 +495,19 @@ class X64CodeGenerator:
                     buf.emit(b"\x49\xf7\xfb")      # idiv r11
                     write_result_from_reg(inst.result, "rax" if op != "srem" else "rdx")
 
-                elif op in ("shl", "shr"):
+                elif op == "neg":
+                    resolve_operand_to_reg(inst.operands[0], "rax")
+                    buf.emit(b"\x48\xf7\xd8")  # neg rax
+                    write_result_from_reg(inst.result, "rax")
+
+                elif op == "not":
+                    resolve_operand_to_reg(inst.operands[0], "rax")
+                    buf.emit(_x64_test_rr("rax"))
+                    buf.emit(b"\x0f\x94\xc0")      # sete al
+                    buf.emit(b"\x48\x0f\xb6\xc0")  # movzx rax, al
+                    write_result_from_reg(inst.result, "rax")
+
+                elif op in ("shl", "shr", "sar"):
                     resolve_operand_to_reg(inst.operands[0], "rax")
                     resolve_operand_to_reg(inst.operands[1], "rcx")
                     if op == "shl":
@@ -939,7 +951,16 @@ class Arm64CodeGenerator:
                     load_op(inst.operands[1], 10)
                     code.extend(_a64_u32(0x9ACA2129))  # LSLV X9, X9, X10
                     store_res(inst.result, 9)
-                elif op == "shr":
+                elif op == "neg":
+                    load_op(inst.operands[0], 9)
+                    code.extend(_a64_u32(0xCB0903E9))  # SUB X9, XZR, X9
+                    store_res(inst.result, 9)
+                elif op == "not":
+                    load_op(inst.operands[0], 9)
+                    code.extend(_a64_u32(0xEB1F013F))  # CMP X9, XZR
+                    code.extend(_a64_u32(0x9A9F17E9))  # CSET X9, EQ (CSINC X9, XZR, XZR, NE)
+                    store_res(inst.result, 9)
+                elif op in ("shr", "sar"):
                     load_op(inst.operands[0], 9)
                     load_op(inst.operands[1], 10)
                     code.extend(_a64_u32(0x9ACA2929))  # ASRV X9, X9, X10
