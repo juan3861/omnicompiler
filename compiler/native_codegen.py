@@ -230,6 +230,41 @@ def _sequentialize_parallel_copies(
     return ordered
 
 
+FLOAT_OPCODES = frozenset({
+    "fconst", "fneg", "fadd", "fsub", "fmul", "fdiv",
+    "fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge",
+    "sitofp", "fptosi",
+})
+
+
+def _f64_bits(val: float) -> int:
+    return struct.unpack("<q", struct.pack("<d", float(val)))[0]
+
+
+def _x64_movq_xmm_r64(xmm_idx: int, reg: str) -> bytes:
+    r_hi, r_lo = X64_REGS[reg]
+    rex = 0x48 | ((1 if xmm_idx >= 8 else 0) << 2) | r_hi
+    modrm = 0xC0 | ((xmm_idx & 7) << 3) | r_lo
+    return bytes([0x66, rex, 0x0F, 0x6E, modrm])
+
+
+def _x64_movq_r64_xmm(reg: str, xmm_idx: int) -> bytes:
+    r_hi, r_lo = X64_REGS[reg]
+    rex = 0x48 | ((1 if xmm_idx >= 8 else 0) << 2) | r_hi
+    modrm = 0xC0 | ((xmm_idx & 7) << 3) | r_lo
+    return bytes([0x66, rex, 0x0F, 0x7E, modrm])
+
+
+def _x64_sse_sd(op_byte: int, dst_xmm: int = 0, src_xmm: int = 1) -> bytes:
+    modrm = 0xC0 | ((dst_xmm & 7) << 3) | (src_xmm & 7)
+    return bytes([0xF2, 0x0F, op_byte, modrm])
+
+
+def _x64_ucomisd(xmm_a: int = 0, xmm_b: int = 1) -> bytes:
+    modrm = 0xC0 | ((xmm_a & 7) << 3) | (xmm_b & 7)
+    return bytes([0x66, 0x0F, 0x2E, modrm])
+
+
 class X64CodeGenerator:
     """Compiles an Omni-SSA `SSAFunction` into native x86-64 machine code."""
 
@@ -282,11 +317,26 @@ class X64CodeGenerator:
         # Determine Leaf Register-Resident Mode vs General Stack-Frame Mode via George & Appel IRC
         alloca_insts = [inst for b in fn.blocks for inst in b.instructions if inst.opcode == "alloca"]
         has_alloca = len(alloca_insts) > 0
+        has_f64 = (
+            getattr(fn, "return_type", "i64") == "f64"
+            or any(t == "f64" for t in fn.param_types.values())
+            or any(
+                inst.opcode in FLOAT_OPCODES or (inst.result is not None and inst.result.var_type == "f64")
+                for b in fn.blocks
+                for inst in b.instructions
+            )
+        )
         alloc = IteratedRegisterCoalescingAllocator(
             LEAF_ALLOC_REGS,
             abi="win64" if self.is_windows else "sysv64",
         ).allocate(fn)
-        leaf_mode = (not has_calls) and (not has_alloca) and alloc["success"] and len(fn.params) <= len(self.param_regs)
+        leaf_mode = (
+            (not has_calls)
+            and (not has_alloca)
+            and (not has_f64)
+            and alloc["success"]
+            and len(fn.params) <= len(self.param_regs)
+        )
 
         reg_map: Dict[SSAVar, str] = {}
         slot_map: Dict[SSAVar, int] = {}
@@ -347,18 +397,53 @@ class X64CodeGenerator:
                     buf.emit(b"\x48\x81\xec" + struct.pack("<I", frame_size))
             prologue_size = len(buf.code)
             # Spill incoming ABI parameters into their stack frame home slots
+            sysv_int_idx = 0
+            sysv_fp_idx = 0
+            sysv_stack_idx = 0
             for idx, p_name in enumerate(fn.params):
                 p_var = SSAVar(p_name, 0)
-                if p_var in slot_map:
+                if p_var not in slot_map:
+                    continue
+                is_fp = fn.param_types.get(p_name) == "f64"
+                if self.is_windows:
                     if idx < len(self.param_regs):
-                        buf.emit(_x64_store_rbp(slot_map[p_var], self.param_regs[idx]))
+                        if is_fp:
+                            buf.emit(_x64_movq_r64_xmm("rax", idx))
+                            buf.emit(_x64_store_rbp(slot_map[p_var], "rax"))
+                        else:
+                            buf.emit(_x64_store_rbp(slot_map[p_var], self.param_regs[idx]))
                     else:
-                        # Stack parameter above [rbp + 16] (+32 shadow on Win64)
-                        caller_disp = 16 + (32 if self.is_windows else 0) + (idx - len(self.param_regs)) * 8
+                        caller_disp = 16 + 32 + (idx - len(self.param_regs)) * 8
                         buf.emit(_x64_load_rbp("rax", caller_disp))
                         buf.emit(_x64_store_rbp(slot_map[p_var], "rax"))
+                else:
+                    if is_fp:
+                        if sysv_fp_idx < 8:
+                            buf.emit(_x64_movq_r64_xmm("rax", sysv_fp_idx))
+                            buf.emit(_x64_store_rbp(slot_map[p_var], "rax"))
+                            sysv_fp_idx += 1
+                        else:
+                            caller_disp = 16 + sysv_stack_idx * 8
+                            sysv_stack_idx += 1
+                            buf.emit(_x64_load_rbp("rax", caller_disp))
+                            buf.emit(_x64_store_rbp(slot_map[p_var], "rax"))
+                    else:
+                        if sysv_int_idx < len(SYSV_PARAM_REGS):
+                            buf.emit(_x64_store_rbp(slot_map[p_var], SYSV_PARAM_REGS[sysv_int_idx]))
+                            sysv_int_idx += 1
+                        else:
+                            caller_disp = 16 + sysv_stack_idx * 8
+                            sysv_stack_idx += 1
+                            buf.emit(_x64_load_rbp("rax", caller_disp))
+                            buf.emit(_x64_store_rbp(slot_map[p_var], "rax"))
 
         def resolve_operand_to_reg(op: Any, target_reg: str) -> None:
+            if isinstance(op, float):
+                buf.emit(_x64_mov_ri(target_reg, _f64_bits(op)))
+                return
+            if isinstance(op, bool):
+                buf.emit(_x64_mov_ri(target_reg, int(op)))
+                return
             if isinstance(op, int):
                 buf.emit(_x64_mov_ri(target_reg, op))
                 return
@@ -412,6 +497,8 @@ class X64CodeGenerator:
                     dst_loc = reg_map[phi.result]
                     if isinstance(chosen_val, SSAVar):
                         src_loc: Any = reg_map[chosen_val]
+                    elif isinstance(chosen_val, float):
+                        src_loc = ("imm", _f64_bits(chosen_val))
                     elif isinstance(chosen_val, int):
                         src_loc = ("imm", chosen_val)
                     else:
@@ -421,6 +508,8 @@ class X64CodeGenerator:
                     dst_loc = ("slot", slot_map[phi.result])
                     if isinstance(chosen_val, SSAVar):
                         src_loc = ("slot", slot_map[chosen_val])
+                    elif isinstance(chosen_val, float):
+                        src_loc = ("imm", _f64_bits(chosen_val))
                     elif isinstance(chosen_val, int):
                         src_loc = ("imm", chosen_val)
                     else:
@@ -471,7 +560,7 @@ class X64CodeGenerator:
                 if op == "param":
                     continue
 
-                elif op in ("const", "mov"):
+                elif op in ("const", "fconst", "mov"):
                     resolve_operand_to_reg(inst.operands[0], "rax")
                     write_result_from_reg(inst.result, "rax")
 
@@ -524,6 +613,58 @@ class X64CodeGenerator:
                     buf.emit(b"\x48\x0f\xb6\xc0")              # movzx rax, al
                     write_result_from_reg(inst.result, "rax")
 
+                elif op in ("fadd", "fsub", "fmul", "fdiv"):
+                    resolve_operand_to_reg(inst.operands[0], "rax")
+                    resolve_operand_to_reg(inst.operands[1], "r11")
+                    buf.emit(_x64_movq_xmm_r64(0, "rax"))
+                    buf.emit(_x64_movq_xmm_r64(1, "r11"))
+                    sse_op = {"fadd": 0x58, "fsub": 0x5C, "fmul": 0x59, "fdiv": 0x5E}[op]
+                    buf.emit(_x64_sse_sd(sse_op, 0, 1))
+                    buf.emit(_x64_movq_r64_xmm("rax", 0))
+                    write_result_from_reg(inst.result, "rax")
+
+                elif op == "fneg":
+                    resolve_operand_to_reg(inst.operands[0], "rax")
+                    buf.emit(_x64_mov_ri("r11", -0x8000000000000000))
+                    buf.emit(_x64_alu_rr(0x31, "rax", "r11"))
+                    write_result_from_reg(inst.result, "rax")
+
+                elif op == "sitofp":
+                    resolve_operand_to_reg(inst.operands[0], "rax")
+                    buf.emit(b"\xf2\x48\x0f\x2a\xc0")  # cvtsi2sd xmm0, rax
+                    buf.emit(_x64_movq_r64_xmm("rax", 0))
+                    write_result_from_reg(inst.result, "rax")
+
+                elif op == "fptosi":
+                    resolve_operand_to_reg(inst.operands[0], "rax")
+                    buf.emit(_x64_movq_xmm_r64(0, "rax"))
+                    buf.emit(b"\xf2\x48\x0f\x2c\xc0")  # cvttsd2si rax, xmm0
+                    write_result_from_reg(inst.result, "rax")
+
+                elif op in ("fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge"):
+                    resolve_operand_to_reg(inst.operands[0], "rax")
+                    resolve_operand_to_reg(inst.operands[1], "r11")
+                    buf.emit(_x64_movq_xmm_r64(0, "rax"))
+                    buf.emit(_x64_movq_xmm_r64(1, "r11"))
+                    if op in ("fcmp_lt", "fcmp_le"):
+                        buf.emit(_x64_ucomisd(1, 0))
+                        buf.emit(bytes([0x0F, 0x97 if op == "fcmp_lt" else 0x93, 0xC0]))
+                    elif op in ("fcmp_gt", "fcmp_ge"):
+                        buf.emit(_x64_ucomisd(0, 1))
+                        buf.emit(bytes([0x0F, 0x97 if op == "fcmp_gt" else 0x93, 0xC0]))
+                    elif op == "fcmp_eq":
+                        buf.emit(_x64_ucomisd(0, 1))
+                        buf.emit(b"\x0f\x94\xc0")
+                        buf.emit(b"\x0f\x9b\xc1")
+                        buf.emit(b"\x20\xc8")
+                    else:
+                        buf.emit(_x64_ucomisd(0, 1))
+                        buf.emit(b"\x0f\x95\xc0")
+                        buf.emit(b"\x0f\x9b\xc1")
+                        buf.emit(b"\x20\xc8")
+                    buf.emit(b"\x48\x0f\xb6\xc0")
+                    write_result_from_reg(inst.result, "rax")
+
                 elif op == "select":
                     resolve_operand_to_reg(inst.operands[2], "rax")  # false_val
                     resolve_operand_to_reg(inst.operands[1], "r11")  # true_val
@@ -558,21 +699,54 @@ class X64CodeGenerator:
                 elif op == "call":
                     callee = str(inst.operands[0])
                     call_args = inst.operands[1:]
-                    # Place stack arguments (> len(param_regs)) first
                     shadow_off = 32 if self.is_windows else 0
-                    for a_idx in range(len(self.param_regs), len(call_args)):
-                        resolve_operand_to_reg(call_args[a_idx], "rax")
-                        sp_disp = shadow_off + (a_idx - len(self.param_regs)) * 8
-                        # mov [rsp + disp32], rax -> 48 89 84 24 <disp32>
-                        buf.emit(b"\x48\x89\x84\x24" + struct.pack("<i", sp_disp))
-                    # Place register arguments
-                    for a_idx in range(min(len(call_args), len(self.param_regs))):
-                        resolve_operand_to_reg(call_args[a_idx], self.param_regs[a_idx])
+                    if self.is_windows:
+                        for a_idx in range(len(self.param_regs), len(call_args)):
+                            resolve_operand_to_reg(call_args[a_idx], "rax")
+                            sp_disp = shadow_off + (a_idx - len(self.param_regs)) * 8
+                            buf.emit(b"\x48\x89\x84\x24" + struct.pack("<i", sp_disp))
+                        for a_idx in range(min(len(call_args), len(self.param_regs))):
+                            ca = call_args[a_idx]
+                            is_fp_arg = isinstance(ca, float) or (isinstance(ca, SSAVar) and ca.var_type == "f64")
+                            if is_fp_arg:
+                                resolve_operand_to_reg(ca, "rax")
+                                buf.emit(_x64_movq_xmm_r64(a_idx, "rax"))
+                            else:
+                                resolve_operand_to_reg(ca, self.param_regs[a_idx])
+                    else:
+                        c_int, c_fp, c_stk = 0, 0, 0
+                        reg_ops: List[Tuple[str, Any, bool, int]] = []
+                        for ca in call_args:
+                            is_fp_arg = isinstance(ca, float) or (isinstance(ca, SSAVar) and ca.var_type == "f64")
+                            if is_fp_arg:
+                                if c_fp < 8:
+                                    reg_ops.append(("fp", ca, True, c_fp))
+                                    c_fp += 1
+                                else:
+                                    resolve_operand_to_reg(ca, "rax")
+                                    buf.emit(b"\x48\x89\x84\x24" + struct.pack("<i", c_stk * 8))
+                                    c_stk += 1
+                            else:
+                                if c_int < len(SYSV_PARAM_REGS):
+                                    reg_ops.append(("int", ca, False, c_int))
+                                    c_int += 1
+                                else:
+                                    resolve_operand_to_reg(ca, "rax")
+                                    buf.emit(b"\x48\x89\x84\x24" + struct.pack("<i", c_stk * 8))
+                                    c_stk += 1
+                        for kind, ca, _, r_idx in reg_ops:
+                            if kind == "fp":
+                                resolve_operand_to_reg(ca, "rax")
+                                buf.emit(_x64_movq_xmm_r64(r_idx, "rax"))
+                            else:
+                                resolve_operand_to_reg(ca, SYSV_PARAM_REGS[r_idx])
 
                     if callee == fn.name:
                         buf.call_label(".L_func_entry")
                     else:
                         buf.call_external(callee)
+                    if inst.result is not None and inst.result.var_type == "f64":
+                        buf.emit(_x64_movq_r64_xmm("rax", 0))
                     write_result_from_reg(inst.result, "rax")
 
                 elif op == "br":
@@ -591,9 +765,15 @@ class X64CodeGenerator:
 
                 elif op == "ret":
                     if inst.operands:
-                        resolve_operand_to_reg(inst.operands[0], "rax")
+                        rv = inst.operands[0]
+                        resolve_operand_to_reg(rv, "rax")
+                        is_fp_ret = getattr(fn, "return_type", "i64") == "f64" or isinstance(rv, float) or (isinstance(rv, SSAVar) and rv.var_type == "f64")
+                        if is_fp_ret:
+                            buf.emit(_x64_movq_xmm_r64(0, "rax"))
                     else:
                         buf.emit(_x64_mov_ri("rax", 0))
+                        if getattr(fn, "return_type", "i64") == "f64":
+                            buf.emit(_x64_movq_xmm_r64(0, "rax"))
                     buf.jmp(".L_epilogue")
 
         # --- Emit Phi Edge Trampolines ---
@@ -872,13 +1052,31 @@ class Arm64CodeGenerator:
         code.extend(_a64_u32(0xA9007BFD))
         prologue_size = len(code)
 
-        # Store incoming parameters X0..X7 into slots
-        for idx, p_name in enumerate(fn.params[:8]):
+        # Store incoming parameters X0..X7 / D0..D7 into slots (AAPCS64)
+        a64_int_idx = 0
+        a64_fp_idx = 0
+        for p_name in fn.params:
             pv = SSAVar(p_name, 0)
-            if pv in slot_idx_map:
-                code.extend(_a64_str_fp_slot(idx, slot_idx_map[pv]))
+            if pv not in slot_idx_map:
+                continue
+            if fn.param_types.get(p_name) == "f64":
+                if a64_fp_idx < 8:
+                    # FMOV X9, D{a64_fp_idx} -> 0x9E660009 | (a64_fp_idx << 5)
+                    code.extend(_a64_u32(0x9E660009 | (a64_fp_idx << 5)))
+                    code.extend(_a64_str_fp_slot(9, slot_idx_map[pv]))
+                    a64_fp_idx += 1
+            else:
+                if a64_int_idx < 8:
+                    code.extend(_a64_str_fp_slot(a64_int_idx, slot_idx_map[pv]))
+                    a64_int_idx += 1
 
         def load_op(op: Any, target_x: int):
+            if isinstance(op, float):
+                code.extend(_a64_mov_imm64(target_x, _f64_bits(op)))
+                return
+            if isinstance(op, bool):
+                code.extend(_a64_mov_imm64(target_x, int(op)))
+                return
             if isinstance(op, int):
                 code.extend(_a64_mov_imm64(target_x, op))
                 return
@@ -916,7 +1114,7 @@ class Arm64CodeGenerator:
                 op = inst.opcode.lower()
                 if op == "param":
                     continue
-                elif op in ("const", "mov"):
+                elif op in ("const", "fconst", "mov"):
                     load_op(inst.operands[0], 9)
                     store_res(inst.result, 9)
                 elif op == "add":
@@ -988,6 +1186,45 @@ class Arm64CodeGenerator:
                     # CSINC X9, XZR, XZR, inv_c -> 0x9A9F07E9 | (inv_c << 12)
                     code.extend(_a64_u32(0x9A9F07E9 | (inv_c << 12)))
                     store_res(inst.result, 9)
+                elif op in ("fadd", "fsub", "fmul", "fdiv"):
+                    load_op(inst.operands[0], 9)
+                    load_op(inst.operands[1], 10)
+                    code.extend(_a64_u32(0x9E670120))  # FMOV D0, X9
+                    code.extend(_a64_u32(0x9E670141))  # FMOV D1, X10
+                    vfp_op = {"fadd": 0x1E612800, "fsub": 0x1E613800, "fmul": 0x1E610800, "fdiv": 0x1E611800}[op]
+                    code.extend(_a64_u32(vfp_op))
+                    code.extend(_a64_u32(0x9E660009))  # FMOV X9, D0
+                    store_res(inst.result, 9)
+                elif op == "fneg":
+                    load_op(inst.operands[0], 9)
+                    code.extend(_a64_u32(0x9E670120))  # FMOV D0, X9
+                    code.extend(_a64_u32(0x1E614000))  # FNEG D0, D0
+                    code.extend(_a64_u32(0x9E660009))  # FMOV X9, D0
+                    store_res(inst.result, 9)
+                elif op == "sitofp":
+                    load_op(inst.operands[0], 9)
+                    code.extend(_a64_u32(0x9E620120))  # SCVTF D0, X9
+                    code.extend(_a64_u32(0x9E660009))  # FMOV X9, D0
+                    store_res(inst.result, 9)
+                elif op == "fptosi":
+                    load_op(inst.operands[0], 9)
+                    code.extend(_a64_u32(0x9E670120))  # FMOV D0, X9
+                    code.extend(_a64_u32(0x9E780009))  # FCVTZS X9, D0
+                    store_res(inst.result, 9)
+                elif op in ("fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge"):
+                    load_op(inst.operands[0], 9)
+                    load_op(inst.operands[1], 10)
+                    code.extend(_a64_u32(0x9E670120))  # FMOV D0, X9
+                    code.extend(_a64_u32(0x9E670141))  # FMOV D1, X10
+                    code.extend(_a64_u32(0x1E612000))  # FCMP D0, D1
+                    if op == "fcmp_ne":
+                        code.extend(_a64_u32(0x9A9F07E9 | (0 << 12)))   # CSET X9, NE (inv=EQ)
+                        code.extend(_a64_u32(0x9A9F07EA | (6 << 12)))   # CSET X10, VC (inv=VS)
+                        code.extend(_a64_u32(0x8A0A0129))                # AND X9, X9, X10
+                    else:
+                        inv_fc = {"fcmp_eq": 1, "fcmp_lt": 5, "fcmp_le": 8, "fcmp_gt": 13, "fcmp_ge": 11}[op]
+                        code.extend(_a64_u32(0x9A9F07E9 | (inv_fc << 12)))
+                    store_res(inst.result, 9)
                 elif op == "select":
                     load_op(inst.operands[0], 9)
                     load_op(inst.operands[1], 10)
@@ -1015,14 +1252,24 @@ class Arm64CodeGenerator:
                     store_res(inst.result, 9)
                 elif op == "call":
                     callee = str(inst.operands[0])
-                    for a_i, a_op in enumerate(inst.operands[1:9]):
-                        load_op(a_op, a_i)
+                    c_int_a, c_fp_a = 0, 0
+                    for a_op in inst.operands[1:]:
+                        is_fp_a = isinstance(a_op, float) or (isinstance(a_op, SSAVar) and a_op.var_type == "f64")
+                        if is_fp_a and c_fp_a < 8:
+                            load_op(a_op, 9)
+                            code.extend(_a64_u32(0x9E670120 | c_fp_a))  # FMOV D{c_fp_a}, X9
+                            c_fp_a += 1
+                        elif not is_fp_a and c_int_a < 8:
+                            load_op(a_op, c_int_a)
+                            c_int_a += 1
                     off = len(code)
                     code.extend(_a64_u32(0x94000000))  # BL #0
                     if callee == fn.name:
                         b_fixups.append((off, "BL", ".L_func_entry"))
                     else:
                         relocs.append(CodegenRelocation(offset=off, symbol_name=callee, reloc_type="ARM64_CALL26"))
+                    if inst.result is not None and inst.result.var_type == "f64":
+                        code.extend(_a64_u32(0x9E660000))  # FMOV X0, D0
                     store_res(inst.result, 0)
                 elif op == "br":
                     emit_b(target_lbl(block.name, str(inst.operands[0])))
@@ -1034,9 +1281,14 @@ class Arm64CodeGenerator:
                     emit_b(fl)
                 elif op == "ret":
                     if inst.operands:
-                        load_op(inst.operands[0], 0)
+                        rv = inst.operands[0]
+                        load_op(rv, 0)
+                        if getattr(fn, "return_type", "i64") == "f64" or isinstance(rv, float) or (isinstance(rv, SSAVar) and rv.var_type == "f64"):
+                            code.extend(_a64_u32(0x9E670000))  # FMOV D0, X0
                     else:
                         code.extend(_a64_mov_imm64(0, 0))
+                        if getattr(fn, "return_type", "i64") == "f64":
+                            code.extend(_a64_u32(0x9E670000))
                     emit_b(".L_epilogue")
 
         for tl, pred_n, sb in trampolines:
@@ -1055,6 +1307,8 @@ class Arm64CodeGenerator:
                 dst_s = ("slot", slot_idx_map[phi.result])
                 if isinstance(c_val, SSAVar) and c_val in slot_idx_map:
                     src_s: Any = ("slot", slot_idx_map[c_val])
+                elif isinstance(c_val, float):
+                    src_s = ("imm", _f64_bits(c_val))
                 elif isinstance(c_val, int):
                     src_s = ("imm", c_val)
                 else:

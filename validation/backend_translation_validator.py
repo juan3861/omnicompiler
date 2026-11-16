@@ -15,6 +15,7 @@ multi-backend differential execution checks:
 import ctypes
 import platform
 import re
+import struct
 from typing import Dict, List, Tuple, Any, Optional, Sequence
 
 from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar
@@ -55,45 +56,65 @@ class LLVMIRToSSALifter:
         "sge": "cmp_ge",
     }
 
+    LLVM_FCMP_MAP = {
+        "oeq": "fcmp_eq",
+        "one": "fcmp_ne",
+        "olt": "fcmp_lt",
+        "ole": "fcmp_le",
+        "ogt": "fcmp_gt",
+        "oge": "fcmp_ge",
+    }
+
     @classmethod
     def lift_function(cls, llvm_ir: str, target_name: Optional[str] = None) -> Tuple[Optional[SSAFunction], Optional[str]]:
         func_match = None
-        for m in re.finditer(r"define\s+i64\s+@([A-Za-z0-9_.$]+)\s*\(([^)]*)\)\s*\{([\s\S]*?)^\}", llvm_ir, re.MULTILINE):
-            if target_name is None or m.group(1) == target_name:
+        for m in re.finditer(r"define\s+(i64|double)\s+@([A-Za-z0-9_.$]+)\s*\(([^)]*)\)\s*\{([\s\S]*?)^\}", llvm_ir, re.MULTILINE):
+            if target_name is None or m.group(2) == target_name:
                 func_match = m
                 break
         if func_match is None:
             return None, "LLVM_FUNC_NOT_FOUND"
 
-        fn_name = func_match.group(1)
-        raw_params = func_match.group(2).strip()
-        body_text = func_match.group(3)
+        ret_llvm_ty = func_match.group(1)
+        fn_name = func_match.group(2)
+        raw_params = func_match.group(3).strip()
+        body_text = func_match.group(4)
 
         params: List[str] = []
+        param_types: Dict[str, str] = {}
         arg_var_map: Dict[str, SSAVar] = {}
         if raw_params:
             for p_part in raw_params.split(","):
-                pm = re.search(r"i64\s+%([A-Za-z0-9_.$]+)", p_part.strip())
+                pm = re.search(r"(i64|double)\s+%([A-Za-z0-9_.$]+)", p_part.strip())
                 if not pm:
                     return None, f"UNSUPPORTED_LLVM_PARAM_{p_part.strip()}"
-                raw_pname = pm.group(1)
+                pty_str, raw_pname = pm.group(1), pm.group(2)
                 clean_name = raw_pname[4:] if raw_pname.startswith("arg_") else raw_pname
+                vty = "f64" if pty_str == "double" else "i64"
                 params.append(clean_name)
-                arg_var_map[raw_pname] = SSAVar(clean_name, 0)
+                param_types[clean_name] = vty
+                arg_var_map[raw_pname] = SSAVar(clean_name, 0, var_type=vty)
 
-        ssa_fn = SSAFunction(fn_name, params)
+        ssa_fn = SSAFunction(
+            fn_name,
+            params,
+            param_types=param_types,
+            return_type="f64" if ret_llvm_ty == "double" else "i64",
+        )
         ssa_vars: Dict[str, SSAVar] = dict(arg_var_map)
         var_counter = 0
 
-        def get_or_create_var(tok: str) -> SSAVar:
+        def get_or_create_var(tok: str, var_type: str = "i64") -> SSAVar:
             nonlocal var_counter
             name = tok[1:] if tok.startswith("%") else tok
             if name not in ssa_vars:
                 var_counter += 1
-                ssa_vars[name] = SSAVar(f"lv_{name}", var_counter)
+                ssa_vars[name] = SSAVar(f"lv_{name}", var_counter, var_type=var_type)
+            elif var_type == "f64" and ssa_vars[name].var_type != "f64":
+                ssa_vars[name].var_type = "f64"
             return ssa_vars[name]
 
-        def parse_val(tok: str) -> Any:
+        def parse_val(tok: str, as_float: bool = False) -> Any:
             t = tok.strip()
             if t.startswith("%"):
                 return get_or_create_var(t)
@@ -101,6 +122,17 @@ class LLVMIRToSSALifter:
                 return 1
             if t == "false":
                 return 0
+            if t.startswith("0x"):
+                try:
+                    raw_hex = t[2:].zfill(16)[-16:]
+                    return struct.unpack(">d", bytes.fromhex(raw_hex))[0]
+                except Exception:
+                    return t
+            if as_float or "." in t or "e" in t.lower():
+                try:
+                    return float(t)
+                except ValueError:
+                    pass
             try:
                 return int(t)
             except ValueError:
@@ -135,7 +167,9 @@ class LLVMIRToSSALifter:
         # Inject param materializations in entry block
         entry_bb = blocks[block_order[0]]
         for pname in params:
-            entry_bb.add_instruction(SSAInstruction(SSAVar(pname, 0), "param", [pname]))
+            entry_bb.add_instruction(
+                SSAInstruction(SSAVar(pname, 0, var_type=param_types[pname]), "param", [pname])
+            )
 
         for raw_ln in body_text.splitlines():
             ln = raw_ln.split(";", 1)[0].strip()
@@ -163,9 +197,10 @@ class LLVMIRToSSALifter:
                 cur_bb.add_instruction(SSAInstruction(None, "br_cond", [cond_op, t_bb, f_bb]))
                 continue
 
-            m_ret = re.match(r"^ret\s+i64\s+(.+)$", ln)
+            m_ret = re.match(r"^ret\s+(i64|double)\s+(.+)$", ln)
             if m_ret:
-                cur_bb.add_instruction(SSAInstruction(None, "ret", [parse_val(m_ret.group(1))]))
+                is_f = m_ret.group(1) == "double"
+                cur_bb.add_instruction(SSAInstruction(None, "ret", [parse_val(m_ret.group(2), as_float=is_f)]))
                 continue
 
             if ln.startswith("store i64 "):
@@ -187,13 +222,15 @@ class LLVMIRToSSALifter:
             lhs_name = lhs_tok[1:]
             rhs = m_asg.group(2).strip()
 
-            if rhs.startswith("phi i64 "):
+            m_phi = re.match(r"^phi\s+(i64|double)\s+(.+)$", rhs)
+            if m_phi:
+                is_f = m_phi.group(1) == "double"
                 incoming_pairs: List[Tuple[str, Any]] = []
                 for pm in re.finditer(r"\[\s*([^,\]]+),\s*%([A-Za-z0-9_.$]+)\s*\]", rhs):
-                    incoming_pairs.append((pm.group(2), parse_val(pm.group(1))))
+                    incoming_pairs.append((pm.group(2), parse_val(pm.group(1), as_float=is_f)))
                 if not incoming_pairs:
                     return None, f"INVALID_LLVM_PHI_{ln}"
-                res_v = get_or_create_var(lhs_tok)
+                res_v = get_or_create_var(lhs_tok, var_type="f64" if is_f else "i64")
                 cur_bb.phi_nodes.append(
                     SSAInstruction(
                         result=res_v,
@@ -252,6 +289,16 @@ class LLVMIRToSSALifter:
                 cur_bb.add_instruction(SSAInstruction(res_v, cls.LLVM_ICMP_MAP[pred], [op0, op1]))
                 continue
 
+            m_fcmp = re.match(r"^fcmp\s+(oeq|one|olt|ole|ogt|oge)\s+double\s+([^,]+),\s*(.+)$", rhs)
+            if m_fcmp:
+                pred = m_fcmp.group(1)
+                op0 = parse_val(m_fcmp.group(2), as_float=True)
+                op1 = parse_val(m_fcmp.group(3), as_float=True)
+                res_v = get_or_create_var(lhs_tok)
+                ext_zext_map[lhs_name] = res_v
+                cur_bb.add_instruction(SSAInstruction(res_v, cls.LLVM_FCMP_MAP[pred], [op0, op1]))
+                continue
+
             m_zext = re.match(r"^zext\s+i1\s+(%[A-Za-z0-9_.$]+)\s+to\s+i64$", rhs)
             if m_zext:
                 src_n = m_zext.group(1)[1:]
@@ -260,12 +307,37 @@ class LLVMIRToSSALifter:
                 cur_bb.add_instruction(SSAInstruction(res_v, "mov", [src_v]))
                 continue
 
-            m_sel = re.match(r"^select\s+i1\s+([^,]+),\s*i64\s+([^,]+),\s*i64\s+(.+)$", rhs)
+            m_sitofp = re.match(r"^sitofp\s+i64\s+(.+)\s+to\s+double$", rhs)
+            if m_sitofp:
+                res_v = get_or_create_var(lhs_tok, var_type="f64")
+                cur_bb.add_instruction(SSAInstruction(res_v, "sitofp", [parse_val(m_sitofp.group(1))]))
+                continue
+
+            m_fptosi = re.match(r"^fptosi\s+double\s+(.+)\s+to\s+i64$", rhs)
+            if m_fptosi:
+                res_v = get_or_create_var(lhs_tok, var_type="i64")
+                cur_bb.add_instruction(SSAInstruction(res_v, "fptosi", [parse_val(m_fptosi.group(1), as_float=True)]))
+                continue
+
+            m_fneg = re.match(r"^fneg\s+double\s+(.+)$", rhs)
+            if m_fneg:
+                res_v = get_or_create_var(lhs_tok, var_type="f64")
+                cur_bb.add_instruction(SSAInstruction(res_v, "fneg", [parse_val(m_fneg.group(1), as_float=True)]))
+                continue
+
+            m_sel = re.match(r"^select\s+i1\s+([^,]+),\s*(i64|double)\s+([^,]+),\s*(i64|double)\s+(.+)$", rhs)
             if m_sel:
                 c_tok = m_sel.group(1).strip()
                 c_op = ext_zext_map[c_tok[1:]] if (c_tok.startswith("%") and c_tok[1:] in ext_zext_map) else parse_val(c_tok)
-                res_v = get_or_create_var(lhs_tok)
-                cur_bb.add_instruction(SSAInstruction(res_v, "select", [c_op, parse_val(m_sel.group(2)), parse_val(m_sel.group(3))]))
+                is_f = m_sel.group(2) == "double"
+                res_v = get_or_create_var(lhs_tok, var_type="f64" if is_f else "i64")
+                cur_bb.add_instruction(
+                    SSAInstruction(
+                        res_v,
+                        "select",
+                        [c_op, parse_val(m_sel.group(3), as_float=is_f), parse_val(m_sel.group(5), as_float=is_f)],
+                    )
+                )
                 continue
 
             m_bin = re.match(r"^([a-z]+)\s+i64\s+([^,]+),\s*(.+)$", rhs)
@@ -275,18 +347,38 @@ class LLVMIRToSSALifter:
                 cur_bb.add_instruction(SSAInstruction(res_v, ssa_op, [parse_val(m_bin.group(2)), parse_val(m_bin.group(3))]))
                 continue
 
-            m_call = re.match(r"^call\s+i64\s+@([A-Za-z0-9_.$]+)\((.*)\)$", rhs)
+            m_fbin = re.match(r"^(fadd|fsub|fmul|fdiv)\s+double\s+([^,]+),\s*(.+)$", rhs)
+            if m_fbin:
+                fop = m_fbin.group(1)
+                lhs_arg = m_fbin.group(2).strip()
+                rhs_arg = m_fbin.group(3).strip()
+                res_v = get_or_create_var(lhs_tok, var_type="f64")
+                if fop == "fadd" and lhs_arg == "-0.0":
+                    val_r = parse_val(rhs_arg, as_float=True)
+                    if isinstance(val_r, float):
+                        cur_bb.add_instruction(SSAInstruction(res_v, "fconst", [val_r]))
+                    else:
+                        cur_bb.add_instruction(SSAInstruction(res_v, "mov", [val_r]))
+                else:
+                    cur_bb.add_instruction(
+                        SSAInstruction(res_v, fop, [parse_val(lhs_arg, as_float=True), parse_val(rhs_arg, as_float=True)])
+                    )
+                continue
+
+            m_call = re.match(r"^call\s+(i64|double)\s+@([A-Za-z0-9_.$]+)\((.*)\)$", rhs)
             if m_call:
-                callee = m_call.group(1)
-                raw_args = m_call.group(2).strip()
+                ret_is_f = m_call.group(1) == "double"
+                callee = m_call.group(2)
+                raw_args = m_call.group(3).strip()
                 call_args: List[Any] = []
                 if raw_args:
                     for part in raw_args.split(","):
                         toks = part.strip().split()
                         if not toks:
                             return None, f"INVALID_LLVM_CALL_ARG_{ln}"
-                        call_args.append(parse_val(toks[-1]))
-                res_v = get_or_create_var(lhs_tok)
+                        is_af = toks[0] == "double"
+                        call_args.append(parse_val(toks[-1], as_float=is_af))
+                res_v = get_or_create_var(lhs_tok, var_type="f64" if ret_is_f else "i64")
                 cur_bb.add_instruction(SSAInstruction(res_v, "call", [callee] + call_args))
                 continue
 
@@ -336,6 +428,20 @@ class WATToSSALifter:
         "i64.le_s": "cmp_le",
         "i64.gt_s": "cmp_gt",
         "i64.ge_s": "cmp_ge",
+    }
+    WAT_FLOAT_BINOP_MAP = {
+        "f64.add": "fadd",
+        "f64.sub": "fsub",
+        "f64.mul": "fmul",
+        "f64.div": "fdiv",
+    }
+    WAT_FLOAT_CMP_MAP = {
+        "f64.eq": "fcmp_eq",
+        "f64.ne": "fcmp_ne",
+        "f64.lt": "fcmp_lt",
+        "f64.le": "fcmp_le",
+        "f64.gt": "fcmp_gt",
+        "f64.ge": "fcmp_ge",
     }
 
     @classmethod
@@ -410,11 +516,62 @@ class WATToSSALifter:
         return arities
 
     @classmethod
+    def _extract_func_signatures(cls, wat: str) -> Tuple[Dict[str, int], Dict[str, str]]:
+        arities: Dict[str, int] = {}
+        ret_types: Dict[str, str] = {}
+        idx = 0
+        while True:
+            pos = wat.find("(func ", idx)
+            if pos < 0:
+                break
+            depth = 0
+            end = pos
+            while end < len(wat):
+                ch = wat[end]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end += 1
+                        break
+                end += 1
+            chunk = wat[pos:end]
+            chunk_lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+            if chunk_lines:
+                hdr = chunk_lines[0]
+                m_sym = re.search(r"\(func\s+\$([^\s()]+)", hdr)
+                m_exp = re.search(r'\(export\s+"([^"]+)"\)', hdr)
+                sig_text = [hdr]
+                for ln in chunk_lines[1:]:
+                    if ln.startswith("(param ") or ln.startswith("(result "):
+                        sig_text.append(ln)
+                    elif ln.startswith("(local "):
+                        break
+                    else:
+                        break
+                joined_sig = " ".join(sig_text)
+                param_cnt = 0
+                for p_inner in re.findall(r"\(param\b([^)]*)\)", joined_sig):
+                    toks = [tk for tk in p_inner.split() if tk in ("i64", "i32", "f64", "f32")]
+                    param_cnt += len(toks) if toks else 1
+                m_res_sig = re.search(r"\(result\s+(i64|i32|f64|f32)\)", joined_sig)
+                ret_ty = "f64" if (m_res_sig and m_res_sig.group(1) in ("f64", "f32")) else "i64"
+                if m_sym:
+                    arities[m_sym.group(1)] = param_cnt
+                    ret_types[m_sym.group(1)] = ret_ty
+                if m_exp:
+                    arities[m_exp.group(1)] = param_cnt
+                    ret_types[m_exp.group(1)] = ret_ty
+            idx = end
+        return arities, ret_types
+
+    @classmethod
     def lift_function(cls, wat: str, target_name: Optional[str] = None) -> Tuple[Optional[SSAFunction], Optional[str]]:
         chunk = cls._extract_func_block(wat, target_name=target_name)
         if chunk is None:
             return None, "WAT_FUNC_NOT_FOUND"
-        func_arities = cls._extract_func_arities(wat)
+        func_arities, func_ret_types = cls._extract_func_signatures(wat)
 
         lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
         header = lines[0]
@@ -424,34 +581,44 @@ class WATToSSALifter:
         fn_name = m_name.group(1) if m_name else (target_name or "wasm_fn")
 
         params: List[str] = []
-        for pm in re.finditer(r"\(param\s+\$([^\s)]+)\s+(?:i64|i32)\)", header):
+        param_types: Dict[str, str] = {}
+        for pm in re.finditer(r"\(param\s+\$([^\s)]+)\s+(i64|i32|f64|f32)\)", header):
             params.append(pm.group(1))
+            param_types[pm.group(1)] = "f64" if pm.group(2) in ("f64", "f32") else "i64"
+        m_res_hdr = re.search(r"\(result\s+(i64|i32|f64|f32)\)", header)
+        ret_type = "f64" if (m_res_hdr and m_res_hdr.group(1) in ("f64", "f32")) else "i64"
         local_names: set = set()
+        local_types: Dict[str, str] = {}
         body_start_idx = 1
         for i in range(1, len(lines)):
             ln = lines[i]
             if ln.startswith("(param "):
-                for pm in re.finditer(r"\(param\s+\$([^\s)]+)\s+(?:i64|i32)\)", ln):
+                for pm in re.finditer(r"\(param\s+\$([^\s)]+)\s+(i64|i32|f64|f32)\)", ln):
                     params.append(pm.group(1))
+                    param_types[pm.group(1)] = "f64" if pm.group(2) in ("f64", "f32") else "i64"
                 body_start_idx = i + 1
             elif ln.startswith("(result "):
+                m_res_ln = re.search(r"\(result\s+(i64|i32|f64|f32)\)", ln)
+                if m_res_ln and m_res_ln.group(1) in ("f64", "f32"):
+                    ret_type = "f64"
                 body_start_idx = i + 1
             elif ln.startswith("(local "):
-                for lm in re.finditer(r"\(local\s+\$([^\s)]+)\s+(?:i64|i32)\)", ln):
+                for lm in re.finditer(r"\(local\s+\$([^\s)]+)\s+(i64|i32|f64|f32)\)", ln):
                     local_names.add(lm.group(1))
+                    local_types[lm.group(1)] = "f64" if lm.group(2) in ("f64", "f32") else "i64"
                 body_start_idx = i + 1
             else:
                 body_start_idx = i
                 break
 
         body_lines = lines[body_start_idx:-1] if lines[-1] == ")" else lines[body_start_idx:]
-        ssa_fn = SSAFunction(fn_name, params)
+        ssa_fn = SSAFunction(fn_name, params, param_types=param_types, return_type=ret_type)
         tmp_counter = 0
 
-        def next_var(prefix: str = "wt") -> SSAVar:
+        def next_var(prefix: str = "wt", var_type: str = "i64") -> SSAVar:
             nonlocal tmp_counter
             tmp_counter += 1
-            return SSAVar(prefix, tmp_counter)
+            return SSAVar(prefix, tmp_counter, var_type=var_type)
 
         is_multiblock = any("(loop $cfg_dispatch" in ln for ln in body_lines)
 
@@ -461,14 +628,15 @@ class WATToSSALifter:
             ssa_fn.entry_block = entry
             env: Dict[str, Any] = {}
             for p in params:
-                pv = SSAVar(p, 0)
+                pv = SSAVar(p, 0, var_type=param_types.get(p, "i64"))
                 env[p] = pv
                 entry.add_instruction(SSAInstruction(pv, "param", [p]))
             for loc in local_names:
-                env.setdefault(loc, 0)
+                env.setdefault(loc, 0.0 if local_types.get(loc) == "f64" else 0)
 
             err = cls._lower_wat_block_lines(
-                body_lines, entry, env, next_var, has_return_ref=[False], func_arities=func_arities
+                body_lines, entry, env, next_var, has_return_ref=[False],
+                func_arities=func_arities, func_ret_types=func_ret_types,
             )
             if err:
                 return None, err
@@ -519,12 +687,12 @@ class WATToSSALifter:
         entry_bb = block_objs[0]
         local_ssa_vars: Dict[str, SSAVar] = {}
         for p in params:
-            pv = SSAVar(p, 0)
+            pv = SSAVar(p, 0, var_type=param_types.get(p, "i64"))
             local_ssa_vars[p] = pv
             entry_bb.add_instruction(SSAInstruction(pv, "param", [p]))
         for loc in sorted(local_names):
             if loc != "__bb" and loc not in local_ssa_vars:
-                lv = SSAVar(loc, 0)
+                lv = SSAVar(loc, 0, var_type=local_types.get(loc, "i64"))
                 local_ssa_vars[loc] = lv
 
         # Determine which `$loc` symbols are assigned on incoming edges (phi-nodes) vs intra-block
@@ -532,11 +700,12 @@ class WATToSSALifter:
         # Map `$loc` -> SSAVar cleanly across dispatch blocks via incoming phi resolution!
         edge_writes: Dict[Tuple[int, int], Dict[str, Any]] = {}
         block_env_end: Dict[int, Dict[str, Any]] = {}
-        # Initialize entry locals to 0 if not params
+        # Initialize entry locals to 0 / 0.0 if not params
         init_locals_bb0 = {k: v for k, v in local_ssa_vars.items()}
         for loc in sorted(local_names):
             if loc != "__bb" and loc not in params:
-                entry_bb.add_instruction(SSAInstruction(init_locals_bb0[loc], "const", [0]))
+                init_val = 0.0 if local_types.get(loc) == "f64" else 0
+                entry_bb.add_instruction(SSAInstruction(init_locals_bb0[loc], "const", [init_val]))
 
         # First pass: collect CFG edges + intra-block operations
         # Create per-block versioned local mapping so each SSA variable is single-assignment per block entry
@@ -551,7 +720,7 @@ class WATToSSALifter:
             else:
                 bmap: Dict[str, SSAVar] = {}
                 for k in sorted(local_ssa_vars.keys()):
-                    bmap[k] = next_var(f"b{b_idx}_{k}")
+                    bmap[k] = next_var(f"b{b_idx}_{k}", var_type=local_ssa_vars[k].var_type)
                 block_entry_vars[b_idx] = bmap
 
         for b_idx in sorted(dispatch_chunks.keys()):
@@ -561,6 +730,7 @@ class WATToSSALifter:
                 dispatch_chunks[b_idx], b_idx, bb, env, block_objs,
                 next_var, edge_writes, preds_of, edges_by_src,
                 func_arities=func_arities,
+                func_ret_types=func_ret_types,
             )
             if err:
                 return None, err
@@ -600,10 +770,11 @@ class WATToSSALifter:
             # Insert clean `__init__` preheader block so block 0 has valid preheader incoming phi edges
             init_bb = BasicBlock("__init__")
             for p in params:
-                init_bb.add_instruction(SSAInstruction(SSAVar(p, 0), "param", [p]))
+                init_bb.add_instruction(SSAInstruction(SSAVar(p, 0, var_type=param_types.get(p, "i64")), "param", [p]))
             for loc in sorted(local_names):
                 if loc != "__bb" and loc not in params:
-                    init_bb.add_instruction(SSAInstruction(local_ssa_vars[loc], "const", [0]))
+                    init_val = 0.0 if local_types.get(loc) == "f64" else 0
+                    init_bb.add_instruction(SSAInstruction(local_ssa_vars[loc], "const", [init_val]))
             init_bb.add_instruction(SSAInstruction(None, "br", ["bb_0"]))
             # Move entry instructions out of bb_0 since __init__ handles param/const initialization
             entry_bb.instructions = [
@@ -625,9 +796,13 @@ class WATToSSALifter:
         next_var,
         pending_edge_locs: Optional[Dict[str, Any]] = None,
         func_arities: Optional[Dict[str, int]] = None,
+        func_ret_types: Optional[Dict[str, str]] = None,
     ) -> Optional[str]:
         if ln.startswith("i64.const "):
             stack.append(int(ln.split()[1]))
+            return None
+        if ln.startswith("f64.const "):
+            stack.append(float(ln.split()[1]))
             return None
         if ln.startswith("local.get $"):
             vname = ln[len("local.get $"):].strip()
@@ -641,7 +816,17 @@ class WATToSSALifter:
             if pending_edge_locs is not None:
                 pending_edge_locs[vname] = val
             else:
-                rv = next_var(vname)
+                prev_val = env.get(vname)
+                val_vt = (
+                    "f64"
+                    if (
+                        isinstance(val, float)
+                        or (isinstance(val, SSAVar) and getattr(val, "var_type", "i64") == "f64")
+                        or (isinstance(prev_val, SSAVar) and getattr(prev_val, "var_type", "i64") == "f64")
+                    )
+                    else "i64"
+                )
+                rv = next_var(vname, var_type=val_vt)
                 bb.add_instruction(SSAInstruction(rv, "mov", [val]))
                 env[vname] = rv
             return None
@@ -654,6 +839,15 @@ class WATToSSALifter:
             bb.add_instruction(SSAInstruction(rv, cls.WAT_BINOP_MAP[ln], [lhs, rhs]))
             stack.append(rv)
             return None
+        if ln in cls.WAT_FLOAT_BINOP_MAP:
+            if len(stack) < 2:
+                return f"WAT_STACK_UNDERFLOW_{ln}"
+            rhs = stack.pop()
+            lhs = stack.pop()
+            rv = next_var("wfb", var_type="f64")
+            bb.add_instruction(SSAInstruction(rv, cls.WAT_FLOAT_BINOP_MAP[ln], [lhs, rhs]))
+            stack.append(rv)
+            return None
         if ln in cls.WAT_CMP_MAP:
             if len(stack) < 2:
                 return f"WAT_STACK_UNDERFLOW_{ln}"
@@ -661,6 +855,39 @@ class WATToSSALifter:
             lhs = stack.pop()
             rv = next_var("wc")
             bb.add_instruction(SSAInstruction(rv, cls.WAT_CMP_MAP[ln], [lhs, rhs]))
+            stack.append(rv)
+            return None
+        if ln in cls.WAT_FLOAT_CMP_MAP:
+            if len(stack) < 2:
+                return f"WAT_STACK_UNDERFLOW_{ln}"
+            rhs = stack.pop()
+            lhs = stack.pop()
+            rv = next_var("wfc")
+            bb.add_instruction(SSAInstruction(rv, cls.WAT_FLOAT_CMP_MAP[ln], [lhs, rhs]))
+            stack.append(rv)
+            return None
+        if ln == "f64.neg":
+            if not stack:
+                return "WAT_STACK_UNDERFLOW_fneg"
+            v = stack.pop()
+            rv = next_var("wfneg", var_type="f64")
+            bb.add_instruction(SSAInstruction(rv, "fneg", [v]))
+            stack.append(rv)
+            return None
+        if ln == "f64.convert_i64_s":
+            if not stack:
+                return "WAT_STACK_UNDERFLOW_convert"
+            v = stack.pop()
+            rv = next_var("wfp", var_type="f64")
+            bb.add_instruction(SSAInstruction(rv, "sitofp", [v]))
+            stack.append(rv)
+            return None
+        if ln == "i64.trunc_f64_s":
+            if not stack:
+                return "WAT_STACK_UNDERFLOW_trunc"
+            v = stack.pop()
+            rv = next_var("wtrunc")
+            bb.add_instruction(SSAInstruction(rv, "fptosi", [v]))
             stack.append(rv)
             return None
         if ln == "i64.eqz":
@@ -679,7 +906,17 @@ class WATToSSALifter:
             cond = stack.pop()
             f_val = stack.pop()
             t_val = stack.pop()
-            rv = next_var("ws")
+            sel_vt = (
+                "f64"
+                if (
+                    isinstance(t_val, float)
+                    or isinstance(f_val, float)
+                    or (isinstance(t_val, SSAVar) and getattr(t_val, "var_type", "i64") == "f64")
+                    or (isinstance(f_val, SSAVar) and getattr(f_val, "var_type", "i64") == "f64")
+                )
+                else "i64"
+            )
+            rv = next_var("ws", var_type=sel_vt)
             bb.add_instruction(SSAInstruction(rv, "select", [cond, t_val, f_val]))
             stack.append(rv)
             return None
@@ -734,7 +971,8 @@ class WATToSSALifter:
             if len(stack) < arity:
                 return f"WAT_STACK_UNDERFLOW_call_{callee}"
             call_args = [stack.pop() for _ in range(arity)][::-1]
-            rv = next_var("wcall")
+            call_vt = (func_ret_types or {}).get(callee, "i64")
+            rv = next_var("wcall", var_type=call_vt)
             bb.add_instruction(SSAInstruction(rv, "call", [callee] + call_args))
             stack.append(rv)
             return None
@@ -753,12 +991,17 @@ class WATToSSALifter:
         next_var,
         has_return_ref: List[bool],
         func_arities: Optional[Dict[str, int]] = None,
+        func_ret_types: Optional[Dict[str, str]] = None,
     ) -> Optional[str]:
         stack: List[Any] = []
         for ln in body_lines:
             if ln == "return":
                 has_return_ref[0] = True
-            err = cls._eval_wat_step(ln, stack, bb, env, next_var, func_arities=func_arities)
+            err = cls._eval_wat_step(
+                ln, stack, bb, env, next_var,
+                func_arities=func_arities,
+                func_ret_types=func_ret_types,
+            )
             if err:
                 return err
         if not has_return_ref[0]:
@@ -779,6 +1022,7 @@ class WATToSSALifter:
         preds_of: Dict[int, List[int]],
         edges_by_src: Dict[int, List[Tuple[int, Dict[str, Any]]]],
         func_arities: Optional[Dict[str, int]] = None,
+        func_ret_types: Optional[Dict[str, str]] = None,
     ) -> Optional[str]:
         stack: List[Any] = []
         i = 0
@@ -847,7 +1091,9 @@ class WATToSSALifter:
                             tgt = int(br_lines[j].split()[1])
                             break
                         err_s = cls._eval_wat_step(
-                            bl, br_stack, bb, branch_env, next_var, func_arities=func_arities
+                            bl, br_stack, bb, branch_env, next_var,
+                            func_arities=func_arities,
+                            func_ret_types=func_ret_types,
                         )
                         if err_s:
                             return None, {}, err_s
@@ -872,7 +1118,11 @@ class WATToSSALifter:
                     preds_of[f_idx].append(b_idx)
                 return None
 
-            err = cls._eval_wat_step(ln, stack, bb, env, next_var, func_arities=func_arities)
+            err = cls._eval_wat_step(
+                ln, stack, bb, env, next_var,
+                func_arities=func_arities,
+                func_ret_types=func_ret_types,
+            )
             if err:
                 return err
             i += 1
@@ -891,12 +1141,14 @@ class BackendTranslationValidator:
         max_loop_unroll: int = 4,
         enable_inductive_loops: bool = True,
         enable_call_congruence: bool = True,
+        enable_float_theory: bool = True,
     ):
         self.validator = SSATranslationValidator(
             enable_memory_theory=enable_memory_theory,
             max_loop_unroll=max_loop_unroll,
             enable_inductive_loops=enable_inductive_loops,
             enable_call_congruence=enable_call_congruence,
+            enable_float_theory=enable_float_theory,
         )
 
     def verify_ssa_to_llvm_ir(
@@ -938,20 +1190,36 @@ class BackendTranslationValidator:
     def verify_differential_execution(
         self,
         ssa_fn: SSAFunction,
-        test_vectors: Sequence[Sequence[int]],
+        test_vectors: Sequence[Sequence[Any]],
         backends: Tuple[str, ...] = ("native", "llvm", "wasm"),
     ) -> Dict[str, Any]:
         """
         Compiles and executes `ssa_fn` across the requested physical backends and
-        asserts bit-exact 64-bit signed return agreement for all input vectors.
+        asserts bit-exact 64-bit integer or IEEE-754 f64 return agreement for all vectors.
         """
-        arity = len(ssa_fn.params)
         target_os = "windows" if platform.system().lower().startswith("win") else "linux"
-        results_by_backend: Dict[str, List[int]] = {}
+        results_by_backend: Dict[str, List[Any]] = {}
         active_backends: List[str] = []
         jit_allocs: List[Any] = []
 
-        argtypes = [ctypes.c_int64] * arity
+        is_fp_ret = getattr(ssa_fn, "return_type", "i64") == "f64"
+        argtypes = [
+            ctypes.c_double if ssa_fn.param_types.get(p) == "f64" else ctypes.c_int64
+            for p in ssa_fn.params
+        ]
+        restype = ctypes.c_double if is_fp_ret else ctypes.c_int64
+
+        def fmt_out(v: Any) -> Any:
+            return float(v) if is_fp_ret else _to_s64(int(v))
+
+        def cmp_key(v: Any) -> int:
+            return struct.unpack("<Q", struct.pack("<d", float(v)))[0] if is_fp_ret else _to_s64(int(v))
+
+        def coerce_vec(vec: Sequence[Any]) -> Tuple[Any, ...]:
+            return tuple(
+                float(x) if ssa_fn.param_types.get(p) == "f64" else int(x)
+                for p, x in zip(ssa_fn.params, vec)
+            )
 
         if "native" in backends:
             codegen = NativeCodeGenerator(arch="x86_64", target_os=target_os)
@@ -960,8 +1228,8 @@ class BackendTranslationValidator:
                 jit_mem = NativeJitMemory(len(art.code_bytes))
                 jit_mem.write_code(art.code_bytes)
                 jit_allocs.append(jit_mem)
-                cfunc = ctypes.CFUNCTYPE(ctypes.c_int64, *argtypes)(jit_mem.ptr)
-                results_by_backend["native"] = [_to_s64(cfunc(*vec)) for vec in test_vectors]
+                cfunc = ctypes.CFUNCTYPE(restype, *argtypes)(jit_mem.ptr)
+                results_by_backend["native"] = [fmt_out(cfunc(*coerce_vec(vec))) for vec in test_vectors]
                 active_backends.append("native")
 
         if "llvm" in backends:
@@ -969,9 +1237,9 @@ class BackendTranslationValidator:
             if llvm_be.is_available:
                 ir = llvm_be.ssa_to_llvm_ir(ssa_fn)
                 mod = llvm_be.compile_ir(ir, optimize=True)
-                lfunc = llvm_be.create_jit_callable(mod, ssa_fn.name, restype=ctypes.c_int64, argtypes=argtypes)
+                lfunc = llvm_be.create_jit_callable(mod, ssa_fn.name, restype=restype, argtypes=argtypes)
                 jit_allocs.append(lfunc)
-                results_by_backend["llvm"] = [_to_s64(lfunc(*vec)) for vec in test_vectors]
+                results_by_backend["llvm"] = [fmt_out(lfunc(*coerce_vec(vec))) for vec in test_vectors]
                 active_backends.append("llvm")
 
         if "wasm" in backends:
@@ -984,16 +1252,15 @@ class BackendTranslationValidator:
                 mod = Module(wasm_be._engine, wasm_bytes)
                 inst = Instance(store, mod, [])
                 exp_fn = inst.exports(store)[ssa_fn.name]
-                results_by_backend["wasm"] = [_to_s64(exp_fn(store, *vec)) for vec in test_vectors]
+                results_by_backend["wasm"] = [fmt_out(exp_fn(store, *coerce_vec(vec))) for vec in test_vectors]
                 active_backends.append("wasm")
 
         mismatches: List[Dict[str, Any]] = []
         if len(active_backends) >= 2:
-            ref_name = active_backends[0]
-            ref_vals = results_by_backend[ref_name]
             for idx, vec in enumerate(test_vectors):
                 per_be = {be: results_by_backend[be][idx] for be in active_backends}
-                if len(set(per_be.values())) != 1:
+                keys = {cmp_key(v) for v in per_be.values()}
+                if len(keys) != 1:
                     mismatches.append({"input": list(vec), "outputs": per_be})
 
         return {

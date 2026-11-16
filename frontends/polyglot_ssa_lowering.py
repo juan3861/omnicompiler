@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 
@@ -81,9 +82,12 @@ _MULTI_CHAR_OPS = (
 
 _SINGLE_OPS = set("+-*/%&|^~!<>?=:.")
 _PUNCT = set("(){}[],;")
+_FLOAT_ANN_RE = re.compile(
+    r"(?::\s*(?:f64|float64|double)\b|->\s*(?:f64|float64|double)\b|\b(?:f64|float64)\b)"
+)
 
 
-def _tokenize(source: str) -> List[_Tok]:
+def _tokenize(source: str, allow_floats: bool = False) -> List[_Tok]:
     tokens: List[_Tok] = []
     n = len(source)
     i = 0
@@ -149,10 +153,11 @@ def _tokenize(source: str) -> List[_Tok]:
             tokens.append(_Tok("STR", "".join(buf), start_line, start_col))
             continue
 
-        # Numbers (hex, binary, decimal integer)
+        # Numbers (hex, binary, decimal integer, or IEEE-754 float when enabled)
         if ch.isdigit():
             start = i
             start_col = col
+            is_float = False
             if ch == "0" and i + 1 < n and source[i + 1] in ("x", "X", "b", "B", "o", "O"):
                 i += 2
                 col += 2
@@ -163,12 +168,44 @@ def _tokenize(source: str) -> List[_Tok]:
                 while i < n and (source[i].isdigit() or source[i] == "_"):
                     i += 1
                     col += 1
-                # Reject floats early if decimal point followed by digit (not `..`)
+                # Decimal point followed by digit (not `..`)
                 if i + 1 < n and source[i] == "." and source[i + 1].isdigit():
-                    raise PolyglotLoweringError(
-                        f"Line {line}:{col}: floating-point literals are outside integer AOT subset"
-                    )
+                    if not allow_floats:
+                        raise PolyglotLoweringError(
+                            f"Line {line}:{col}: floating-point literals are outside integer AOT subset"
+                        )
+                    is_float = True
+                    i += 1
+                    col += 1
+                    while i < n and (source[i].isdigit() or source[i] == "_"):
+                        i += 1
+                        col += 1
+                if allow_floats and i < n and source[i] in ("e", "E"):
+                    if i + 1 < n and (
+                        source[i + 1].isdigit()
+                        or (source[i + 1] in ("+", "-") and i + 2 < n and source[i + 2].isdigit())
+                    ):
+                        is_float = True
+                        i += 1
+                        col += 1
+                        if i < n and source[i] in ("+", "-"):
+                            i += 1
+                            col += 1
+                        while i < n and (source[i].isdigit() or source[i] == "_"):
+                            i += 1
+                            col += 1
+                if allow_floats and (source[i : i + 3] in ("f64", "f32")):
+                    is_float = True
+                    i += 3
+                    col += 3
             raw_num = source[start:i].replace("_", "")
+            if is_float:
+                for suffix in ("f64", "f32"):
+                    if raw_num.endswith(suffix) and len(raw_num) > len(suffix):
+                        raw_num = raw_num[: -len(suffix)]
+                        break
+                tokens.append(_Tok("FLOAT", raw_num, line, start_col))
+                continue
             # Strip Rust integer suffixes like 10i64, 1u32
             for suffix in ("i64", "i32", "u64", "u32", "usize", "isize", "i128", "u128"):
                 if raw_num.endswith(suffix) and len(raw_num) > len(suffix):
@@ -230,9 +267,10 @@ def _tokenize(source: str) -> List[_Tok]:
 
 
 class _PolyglotParser:
-    def __init__(self, source: str, language: str):
+    def __init__(self, source: str, language: str, allow_floats: bool = False):
         self.language = language
-        self.toks = _tokenize(source)
+        self.allow_floats = allow_floats
+        self.toks = _tokenize(source, allow_floats=allow_floats)
         self.pos = 0
 
     def _peek(self, offset: int = 0) -> _Tok:
@@ -430,16 +468,19 @@ class _PolyglotParser:
     # ------------------------------------------------------------------
     # Signatures
     # ------------------------------------------------------------------
-    def _parse_js_ts_param_list(self) -> List[str]:
+    def _parse_js_ts_param_list(self) -> Tuple[List[str], Dict[str, str]]:
         self._expect("PUNCT", "(")
         params: List[str] = []
+        param_types: Dict[str, str] = {}
         while not self._at("PUNCT", ")"):
             pname = self._expect("ID").val
             if self._at("OP", "?"):
                 self._advance()
             if self._at("OP", ":"):
                 self._advance()
-                self._skip_type_annotation(stop_tokens={",", ")"})
+                ann = self._skip_type_annotation(stop_tokens={",", ")", "="})
+                if ann is not None:
+                    param_types[pname] = ann
             if self._at("OP", "="):
                 self._advance()
                 self._parse_expr()
@@ -449,34 +490,39 @@ class _PolyglotParser:
             else:
                 break
         self._expect("PUNCT", ")")
-        return params
+        return params, param_types
 
     def _parse_js_ts_function(self) -> ast.FunctionDef:
         fn_tok = self._expect("ID", "function")
         name_tok = self._expect("ID")
         if self._at("OP", "<"):
             self._skip_type_args()
-        params = self._parse_js_ts_param_list()
+        params, param_types = self._parse_js_ts_param_list()
+        ret_type: Optional[str] = None
         if self._at("OP", ":"):
             self._advance()
-            self._skip_type_annotation(stop_tokens={"{"})
+            ret_type = self._skip_type_annotation(stop_tokens={"{"})
         body = self._parse_block()
-        return self._make_function_def(name_tok.val, params, body, fn_tok.line)
+        return self._make_function_def(
+            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type
+        )
 
     def _parse_arrow_rhs(self, fn_name: str, line: int) -> Optional[ast.FunctionDef]:
         if self._at("ID", "async"):
             self._advance()
         if self._at("OP", "<"):
             self._skip_type_args()
+        param_types: Dict[str, str] = {}
         if self._at("PUNCT", "("):
-            params = self._parse_js_ts_param_list()
+            params, param_types = self._parse_js_ts_param_list()
         elif self._at("ID"):
             params = [self._advance().val]
         else:
             return None
+        ret_type: Optional[str] = None
         if self._at("OP", ":"):
             self._advance()
-            self._skip_type_annotation(stop_tokens={"=>"})
+            ret_type = self._skip_type_annotation(stop_tokens={"=>"})
         if not self._at("OP", "=>"):
             return None
         self._advance()
@@ -486,7 +532,9 @@ class _PolyglotParser:
             expr = self._parse_expr()
             body = [ast.Return(value=expr, lineno=line)]
         self._consume_optional_semi()
-        return self._make_function_def(fn_name, params, body, line)
+        return self._make_function_def(
+            fn_name, params, body, line, param_types=param_types, return_type=ret_type
+        )
 
     def _try_parse_const_arrow_function(self) -> Optional[ast.FunctionDef]:
         save = self.pos
@@ -537,12 +585,15 @@ class _PolyglotParser:
             self._skip_type_args()
         self._expect("PUNCT", "(")
         params: List[str] = []
+        param_types: Dict[str, str] = {}
         while not self._at("PUNCT", ")"):
             if self._at("ID", "mut"):
                 self._advance()
             pname = self._expect("ID").val
             self._expect("OP", ":")
-            self._skip_type_annotation(stop_tokens={",", ")"})
+            ann = self._skip_type_annotation(stop_tokens={",", ")"})
+            if ann is not None:
+                param_types[pname] = ann
             params.append(pname)
             if self._at("PUNCT", ","):
                 self._advance()
@@ -551,15 +602,18 @@ class _PolyglotParser:
             else:
                 break
         self._expect("PUNCT", ")")
+        ret_type: Optional[str] = None
         if self._at("OP", "->"):
             self._advance()
-            self._skip_type_annotation(stop_tokens={"{"})
+            ret_type = self._skip_type_annotation(stop_tokens={"{"})
         if self._at("ID", "where"):
             self._advance()
             while not self._at("PUNCT", "{") and not self._at("EOF"):
                 self._advance()
         body = self._parse_block(allow_tail_return=True)
-        return self._make_function_def(name_tok.val, params, body, fn_tok.line)
+        return self._make_function_def(
+            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type
+        )
 
     def _parse_go_function(self) -> ast.FunctionDef:
         fn_tok = self._expect("ID", "func")
@@ -572,6 +626,7 @@ class _PolyglotParser:
             self._skip_balanced("[", "]")
         self._expect("PUNCT", "(")
         params: List[str] = []
+        param_types: Dict[str, str] = {}
         pending_group: List[str] = []
         while not self._at("PUNCT", ")"):
             # Expect identifier(s) optionally grouped before Go type (`a, b int64`)
@@ -582,8 +637,12 @@ class _PolyglotParser:
                     self._advance()
                     continue
                 # Next token starts the Go type (or `)` if untyped malformed; expect type)
+                ann: Optional[str] = None
                 if not self._at("PUNCT", ")"):
-                    self._skip_go_type(stop_tokens={",", ")"})
+                    ann = self._skip_go_type(stop_tokens={",", ")"})
+                if ann is not None:
+                    for p_g in pending_group:
+                        param_types[p_g] = ann
                 params.extend(pending_group)
                 pending_group.clear()
                 if self._at("PUNCT", ","):
@@ -596,12 +655,18 @@ class _PolyglotParser:
             params.extend(pending_group)
         self._expect("PUNCT", ")")
         # Optional Go return type(s) before `{`
+        ret_type: Optional[str] = None
         if self._at("PUNCT", "("):
             self._skip_balanced("(", ")")
+        ret_toks: List[str] = []
         while not self._at("PUNCT", "{") and not self._at("EOF"):
-            self._advance()
+            ret_toks.append(self._advance().val)
+        if ret_toks == ["float64"] or ret_toks == ["f64"] or ret_toks == ["double"]:
+            ret_type = "float"
         body = self._parse_block()
-        return self._make_function_def(name_tok.val, params, body, fn_tok.line)
+        return self._make_function_def(
+            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type
+        )
 
     def _skip_type_args(self) -> None:
         self._expect("OP", "<")
@@ -615,15 +680,17 @@ class _PolyglotParser:
             elif t.kind == "OP" and t.val == ">>":
                 depth -= 2
 
-    def _skip_type_annotation(self, stop_tokens: set) -> None:
+    def _skip_type_annotation(self, stop_tokens: set) -> Optional[str]:
         paren = 0
         bracket = 0
         angle = 0
+        captured: List[str] = []
         while not self._at("EOF"):
             t = self._peek()
             if paren == 0 and bracket == 0 and angle == 0 and t.val in stop_tokens:
-                return
+                break
             self._advance()
+            captured.append(t.val)
             if t.kind == "PUNCT" and t.val == "(":
                 paren += 1
             elif t.kind == "PUNCT" and t.val == ")":
@@ -636,15 +703,20 @@ class _PolyglotParser:
                 angle += 1
             elif t.kind == "OP" and t.val == ">":
                 angle = max(0, angle - 1)
+        if captured in (["f64"], ["float64"], ["double"]):
+            return "float"
+        return None
 
-    def _skip_go_type(self, stop_tokens: set) -> None:
+    def _skip_go_type(self, stop_tokens: set) -> Optional[str]:
         paren = 0
         bracket = 0
+        captured: List[str] = []
         while not self._at("EOF"):
             t = self._peek()
             if paren == 0 and bracket == 0 and t.val in stop_tokens:
-                return
+                break
             self._advance()
+            captured.append(t.val)
             if t.kind == "PUNCT" and t.val == "(":
                 paren += 1
             elif t.kind == "PUNCT" and t.val == ")":
@@ -653,17 +725,44 @@ class _PolyglotParser:
                 bracket += 1
             elif t.kind == "PUNCT" and t.val == "]":
                 bracket = max(0, bracket - 1)
+        if captured in (["float64"], ["f64"], ["double"]):
+            return "float"
+        return None
 
     def _make_function_def(
-        self, name: str, params: List[str], body: List[ast.stmt], line: int
+        self,
+        name: str,
+        params: List[str],
+        body: List[ast.stmt],
+        line: int,
+        param_types: Optional[Dict[str, str]] = None,
+        return_type: Optional[str] = None,
     ) -> ast.FunctionDef:
         if not body:
-            body = [ast.Return(value=ast.Constant(value=0), lineno=line)]
+            init_ret = 0.0 if return_type == "float" else 0
+            body = [ast.Return(value=ast.Constant(value=init_ret), lineno=line)]
+        pt_map = param_types or {}
+        arg_nodes = [
+            ast.arg(
+                arg=p,
+                annotation=(
+                    ast.Name(id="float", ctx=ast.Load(), lineno=line)
+                    if pt_map.get(p) == "float"
+                    else None
+                ),
+            )
+            for p in params
+        ]
+        ret_node = (
+            ast.Name(id="float", ctx=ast.Load(), lineno=line)
+            if return_type == "float"
+            else None
+        )
         fn = ast.FunctionDef(
             name=name,
             args=ast.arguments(
                 posonlyargs=[],
-                args=[ast.arg(arg=p, annotation=None) for p in params],
+                args=arg_nodes,
                 vararg=None,
                 kwonlyargs=[],
                 kw_defaults=[],
@@ -672,7 +771,7 @@ class _PolyglotParser:
             ),
             body=body,
             decorator_list=[],
-            returns=None,
+            returns=ret_node,
             lineno=line,
         )
         ast.fix_missing_locations(fn)
@@ -796,17 +895,25 @@ class _PolyglotParser:
         if self._at("ID", "mut"):
             self._advance()
         name_tok = self._expect("ID")
+        var_ann: Optional[str] = None
         if self._at("OP", ":"):
             self._advance()
-            self._skip_type_annotation(stop_tokens={"=", ";", "}", ","})
+            var_ann = self._skip_type_annotation(stop_tokens={"=", ";", "}", ","})
         elif self.language == "go" and self._at("ID"):
-            # Go `var x int64 = 0` or `var x int64`
-            self._skip_go_type(stop_tokens={"=", ";", "}", ","})
+            # Go `var x int64 = 0` or `var x float64`
+            var_ann = self._skip_go_type(stop_tokens={"=", ";", "}", ","})
         if self._at("OP", "="):
             self._advance()
             val = self._parse_expr()
+            if (
+                var_ann == "float"
+                and isinstance(val, ast.Constant)
+                and isinstance(val.value, int)
+                and not isinstance(val.value, bool)
+            ):
+                val = ast.Constant(value=float(val.value), lineno=val.lineno)
         else:
-            val = ast.Constant(value=0, lineno=kw_line)
+            val = ast.Constant(value=(0.0 if var_ann == "float" else 0), lineno=kw_line)
         return ast.Assign(
             targets=[ast.Name(id=name_tok.val, ctx=ast.Store(), lineno=name_tok.line)],
             value=val,
@@ -1553,6 +1660,9 @@ class _PolyglotParser:
         if t.kind == "NUM":
             self._advance()
             return ast.Constant(value=int(t.val, 0), lineno=t.line)
+        if t.kind == "FLOAT":
+            self._advance()
+            return ast.Constant(value=float(t.val), lineno=t.line)
         if t.kind == "ID":
             self._advance()
             if t.val == "true":
@@ -1575,6 +1685,7 @@ def lower_polyglot_source_to_ast(
     language: str,
     file_path: str = "<polyglot>",
     strict: bool = False,
+    allow_floats: bool = False,
 ) -> PolyglotParseResult:
     """
     Lower a JS, TS, Rust, or Go source string into a Python `ast.Module` of
@@ -1584,7 +1695,8 @@ def lower_polyglot_source_to_ast(
     if lang not in ("javascript", "typescript", "rust", "go"):
         raise PolyglotLoweringError(f"Unsupported polyglot language: {language!r}")
 
-    parser = _PolyglotParser(source, lang)
+    effective_floats = bool(allow_floats or _FLOAT_ANN_RE.search(source))
+    parser = _PolyglotParser(source, lang, allow_floats=effective_floats)
     mod, funcs, errors = parser.parse_module()
     if strict and errors:
         raise PolyglotLoweringError("; ".join(errors))
@@ -1601,6 +1713,7 @@ def parse_polyglot_file_to_ast(
     file_path: str,
     source_text: Optional[str] = None,
     strict: bool = False,
+    allow_floats: bool = False,
 ) -> PolyglotParseResult:
     """Detect language from file extension and lower it to Python AST."""
     ext = os.path.splitext(file_path)[1].lower()
@@ -1615,4 +1728,5 @@ def parse_polyglot_file_to_ast(
         language=lang,
         file_path=file_path,
         strict=strict,
+        allow_floats=allow_floats,
     )

@@ -8,6 +8,7 @@ loop unrolling, GVN, instcombine), and compiles to MCJIT silicon or COFF/ELF obj
 
 from typing import Optional, List, Dict, Any, Union
 import ctypes
+import struct
 
 from compiler.ssa_ir import SSAVar, SSAFunction, TERMINATOR_OPCODES
 
@@ -33,6 +34,19 @@ class LLVMBackend:
         "cmp_gt": "sgt",
         "cmp_ge": "sge",
     }
+
+    FCMP_PRED_MAP = {
+        "fcmp_eq": "oeq",
+        "fcmp_ne": "one",
+        "fcmp_lt": "olt",
+        "fcmp_le": "ole",
+        "fcmp_gt": "ogt",
+        "fcmp_ge": "oge",
+    }
+
+    @staticmethod
+    def _llvm_type(var_type: str) -> str:
+        return "double" if var_type == "f64" else "i64"
 
     def __init__(self, opt_level: int = 3):
         self.opt_level = opt_level
@@ -124,6 +138,11 @@ class LLVMBackend:
             if op.version == 0 and op.name in param_set:
                 return f"%arg_{op.name}"
             return f"%ssa_{op.name}_{op.version}"
+        if isinstance(op, float):
+            bits = struct.unpack(">Q", struct.pack(">d", op))[0]
+            return f"0x{bits:016x}"
+        if isinstance(op, bool):
+            return str(int(op))
         if isinstance(op, int):
             return str(op)
         s = str(op).strip()
@@ -137,10 +156,14 @@ class LLVMBackend:
     def _format_ssa_def(self, var: SSAVar) -> str:
         return f"%ssa_{var.name}_{var.version}"
 
-    def ssa_function_to_llvm_body(self, ssa_func: SSAFunction, declared_externals: Optional[Dict[str, int]] = None) -> str:
+    def ssa_function_to_llvm_body(self, ssa_func: SSAFunction, declared_externals: Optional[Dict[str, Any]] = None) -> str:
         param_set = set(ssa_func.params)
-        params_str = ", ".join(f"i64 %arg_{p}" for p in ssa_func.params)
-        lines = [f"define i64 @{ssa_func.name}({params_str}) {{"]
+        fn_ret_ty = self._llvm_type(getattr(ssa_func, "return_type", "i64"))
+        params_str = ", ".join(
+            f"{self._llvm_type(ssa_func.param_types.get(p, 'i64'))} %arg_{p}"
+            for p in ssa_func.params
+        )
+        lines = [f"define {fn_ret_ty} @{ssa_func.name}({params_str}) {{"]
         aux_counter = 0
 
         def next_aux(prefix: str = "aux") -> str:
@@ -156,6 +179,7 @@ class LLVMBackend:
                 if phi.result is None:
                     continue
                 lhs = self._format_ssa_def(phi.result)
+                phi_ty = self._llvm_type(phi.result.var_type)
                 pairs = []
                 if phi.phi_incoming:
                     for pred_blk, val in phi.phi_incoming:
@@ -164,11 +188,11 @@ class LLVMBackend:
                     for pred_b, val in zip(block.predecessors, phi.operands):
                         pairs.append(f"[ {self._format_ssa_operand(val, param_set)}, %{pred_b.name} ]")
                 if pairs:
-                    lines.append(f"    {lhs} = phi i64 {', '.join(pairs)}")
+                    lines.append(f"    {lhs} = phi {phi_ty} {', '.join(pairs)}")
 
             # 2. Emit instructions up to first terminator
             emitted_terminator = False
-            last_val = "0"
+            last_val = "0.0" if fn_ret_ty == "double" else "0"
 
             for inst in block.instructions:
                 if emitted_terminator:
@@ -179,20 +203,53 @@ class LLVMBackend:
                     if inst.result is not None and not (inst.result.version == 0 and inst.result.name in param_set):
                         lhs = self._format_ssa_def(inst.result)
                         p_name = str(inst.operands[0])
-                        lines.append(f"    {lhs} = add i64 0, %arg_{p_name}")
+                        p_ty = self._llvm_type(inst.result.var_type)
+                        if p_ty == "double":
+                            lines.append(f"    {lhs} = fadd double -0.0, %arg_{p_name}")
+                        else:
+                            lines.append(f"    {lhs} = add i64 0, %arg_{p_name}")
                     continue
 
                 lhs = self._format_ssa_def(inst.result) if inst.result is not None else next_aux("unused")
                 ops = [self._format_ssa_operand(o, param_set) for o in inst.operands]
+                res_ty = self._llvm_type(inst.result.var_type) if inst.result is not None else "i64"
 
-                if opcode in ("const", "mov"):
+                if opcode == "const":
                     v1 = ops[0] if ops else "0"
                     lines.append(f"    {lhs} = add i64 0, {v1}")
+                    last_val = lhs
+
+                elif opcode == "fconst":
+                    v1 = ops[0] if ops else "0.0"
+                    lines.append(f"    {lhs} = fadd double -0.0, {v1}")
+                    last_val = lhs
+
+                elif opcode == "mov":
+                    v1 = ops[0] if ops else ("0.0" if res_ty == "double" else "0")
+                    if res_ty == "double":
+                        lines.append(f"    {lhs} = fadd double -0.0, {v1}")
+                    else:
+                        lines.append(f"    {lhs} = add i64 0, {v1}")
                     last_val = lhs
 
                 elif opcode == "neg":
                     v1 = ops[0] if ops else "0"
                     lines.append(f"    {lhs} = sub i64 0, {v1}")
+                    last_val = lhs
+
+                elif opcode == "fneg":
+                    v1 = ops[0] if ops else "0.0"
+                    lines.append(f"    {lhs} = fneg double {v1}")
+                    last_val = lhs
+
+                elif opcode == "sitofp":
+                    v1 = ops[0] if ops else "0"
+                    lines.append(f"    {lhs} = sitofp i64 {v1} to double")
+                    last_val = lhs
+
+                elif opcode == "fptosi":
+                    v1 = ops[0] if ops else "0.0"
+                    lines.append(f"    {lhs} = fptosi double {v1} to i64")
                     last_val = lhs
 
                 elif opcode == "not":
@@ -221,6 +278,12 @@ class LLVMBackend:
                     lines.append(f"    {lhs} = {llvm_op} i64 {v1}, {v2}")
                     last_val = lhs
 
+                elif opcode in ("fadd", "fsub", "fmul", "fdiv"):
+                    v1 = ops[0] if len(ops) > 0 else "0.0"
+                    v2 = ops[1] if len(ops) > 1 else "0.0"
+                    lines.append(f"    {lhs} = {opcode} double {v1}, {v2}")
+                    last_val = lhs
+
                 elif opcode in self.CMP_PRED_MAP:
                     pred = self.CMP_PRED_MAP[opcode]
                     v1 = ops[0] if len(ops) > 0 else "0"
@@ -230,13 +293,22 @@ class LLVMBackend:
                     lines.append(f"    {lhs} = zext i1 {cmp_i1} to i64")
                     last_val = lhs
 
+                elif opcode in self.FCMP_PRED_MAP:
+                    pred = self.FCMP_PRED_MAP[opcode]
+                    v1 = ops[0] if len(ops) > 0 else "0.0"
+                    v2 = ops[1] if len(ops) > 1 else "0.0"
+                    cmp_i1 = next_aux("fcmp_i1")
+                    lines.append(f"    {cmp_i1} = fcmp {pred} double {v1}, {v2}")
+                    lines.append(f"    {lhs} = zext i1 {cmp_i1} to i64")
+                    last_val = lhs
+
                 elif opcode == "select":
                     c_op = ops[0] if len(ops) > 0 else "0"
-                    t_op = ops[1] if len(ops) > 1 else "0"
-                    f_op = ops[2] if len(ops) > 2 else "0"
+                    t_op = ops[1] if len(ops) > 1 else ("0.0" if res_ty == "double" else "0")
+                    f_op = ops[2] if len(ops) > 2 else ("0.0" if res_ty == "double" else "0")
                     sel_i1 = next_aux("sel_i1")
                     lines.append(f"    {sel_i1} = icmp ne i64 {c_op}, 0")
-                    lines.append(f"    {lhs} = select i1 {sel_i1}, i64 {t_op}, i64 {f_op}")
+                    lines.append(f"    {lhs} = select i1 {sel_i1}, {res_ty} {t_op}, {res_ty} {f_op}")
                     last_val = lhs
 
                 elif opcode == "load":
@@ -261,11 +333,16 @@ class LLVMBackend:
 
                 elif opcode == "call":
                     callee = str(inst.operands[0])
-                    call_args = [self._format_ssa_operand(a, param_set) for a in inst.operands[1:]]
+                    arg_pairs = []
+                    arg_tys = []
+                    for orig_a, fmt_a in zip(inst.operands[1:], ops[1:]):
+                        aty = "double" if (isinstance(orig_a, float) or (isinstance(orig_a, SSAVar) and orig_a.var_type == "f64")) else "i64"
+                        arg_pairs.append(f"{aty} {fmt_a}")
+                        arg_tys.append(aty)
                     if declared_externals is not None and callee != ssa_func.name:
-                        declared_externals.setdefault(callee, len(call_args))
-                    args_sig = ", ".join(f"i64 {a}" for a in call_args)
-                    lines.append(f"    {lhs} = call i64 @{callee}({args_sig})")
+                        declared_externals.setdefault(callee, (res_ty, arg_tys))
+                    args_sig = ", ".join(arg_pairs)
+                    lines.append(f"    {lhs} = call {res_ty} @{callee}({args_sig})")
                     last_val = lhs
 
                 elif opcode == "br":
@@ -283,42 +360,48 @@ class LLVMBackend:
                     emitted_terminator = True
 
                 elif opcode == "ret":
-                    v = ops[0] if ops else "0"
-                    lines.append(f"    ret i64 {v}")
+                    v = ops[0] if ops else ("0.0" if fn_ret_ty == "double" else "0")
+                    lines.append(f"    ret {fn_ret_ty} {v}")
                     emitted_terminator = True
 
             if not emitted_terminator:
-                lines.append(f"    ret i64 {last_val}")
+                lines.append(f"    ret {fn_ret_ty} {last_val}")
 
         lines.append("}")
         return "\n".join(lines)
 
     def ssa_to_llvm_ir(self, ssa_func: SSAFunction) -> str:
         """Lowers a single OmniCompiler `SSAFunction` (including multi-block CFGs & external decls) to LLVM IR."""
-        externals: Dict[str, int] = {}
+        externals: Dict[str, Any] = {}
         body = self.ssa_function_to_llvm_body(ssa_func, declared_externals=externals)
         header = [
             f'; ModuleID = "omni_{ssa_func.name}"',
             f'target triple = "{self.target_triple}"',
         ]
-        for ext_name, arity in sorted(externals.items()):
-            sig = ", ".join(["i64"] * arity)
-            header.append(f"declare i64 @{ext_name}({sig})")
+        for ext_name, spec in sorted(externals.items()):
+            if isinstance(spec, int):
+                ret_ty, arg_tys = "i64", ["i64"] * spec
+            else:
+                ret_ty, arg_tys = spec
+            header.append(f"declare {ret_ty} @{ext_name}({', '.join(arg_tys)})")
         header.append(body)
         return "\n".join(header)
 
     def ssa_module_to_llvm_ir(self, ssa_funcs: List[SSAFunction], module_name: str = "omni_module") -> str:
         """Lowers a multi-function repository module into a single LLVM IR compilation unit for LTO/O3."""
         defined = {f.name for f in ssa_funcs}
-        externals: Dict[str, int] = {}
+        externals: Dict[str, Any] = {}
         bodies = [self.ssa_function_to_llvm_body(f, declared_externals=externals) for f in ssa_funcs]
         lines = [
             f'; ModuleID = "{module_name}"',
             f'target triple = "{self.target_triple}"',
         ]
-        for ext_name, arity in sorted(externals.items()):
+        for ext_name, spec in sorted(externals.items()):
             if ext_name not in defined:
-                sig = ", ".join(["i64"] * arity)
-                lines.append(f"declare i64 @{ext_name}({sig})")
+                if isinstance(spec, int):
+                    ret_ty, arg_tys = "i64", ["i64"] * spec
+                else:
+                    ret_ty, arg_tys = spec
+                lines.append(f"declare {ret_ty} @{ext_name}({', '.join(arg_tys)})")
         lines.extend(bodies)
         return "\n".join(lines)

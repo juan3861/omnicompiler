@@ -99,6 +99,22 @@ class WasmBackend:
         "cmp_ge": "i64.ge_s",
     }
 
+    WASM_FLOAT_BINOP_MAP = {
+        "fadd": "f64.add",
+        "fsub": "f64.sub",
+        "fmul": "f64.mul",
+        "fdiv": "f64.div",
+    }
+
+    WASM_FLOAT_CMP_MAP = {
+        "fcmp_eq": "f64.eq",
+        "fcmp_ne": "f64.ne",
+        "fcmp_lt": "f64.lt",
+        "fcmp_le": "f64.le",
+        "fcmp_gt": "f64.gt",
+        "fcmp_ge": "f64.ge",
+    }
+
     def __init__(self):
         self._engine = None
         self._fuel_engine = None
@@ -190,35 +206,53 @@ class WasmBackend:
     # ------------------------------------------------------------------
     def _ssa_function_to_wat_func(self, ssa_func: SSAFunction) -> str:
         """Lowers a single `SSAFunction` into a `(func ...)` WAT definition."""
+        def _wty(vtype: str) -> str:
+            return "f64" if vtype == "f64" else "i64"
+
         param_set = set(ssa_func.params)
-        params_str = " ".join(f"(param ${p} i64)" for p in ssa_func.params)
+        fn_ret_wty = _wty(getattr(ssa_func, "return_type", "i64"))
+        params_str = " ".join(
+            f"(param ${p} {_wty(ssa_func.param_types.get(p, 'i64'))})"
+            for p in ssa_func.params
+        )
         wat_lines = [
-            f'  (func ${ssa_func.name} (export "{ssa_func.name}") {params_str} (result i64)',
+            f'  (func ${ssa_func.name} (export "{ssa_func.name}") {params_str} (result {fn_ret_wty})',
         ]
 
+        local_types: Dict[str, str] = {}
         var_locals: set = set()
         phi_tmps: set = set()
         for block in ssa_func.blocks:
             for phi in block.phi_nodes:
                 if phi.result:
+                    wty = _wty(phi.result.var_type)
                     v_n = f"var_{phi.result.name}_{phi.result.version}"
+                    p_n = f"ptmp_{phi.result.name}_{phi.result.version}"
                     var_locals.add(v_n)
-                    phi_tmps.add(f"ptmp_{phi.result.name}_{phi.result.version}")
+                    phi_tmps.add(p_n)
+                    local_types[v_n] = wty
+                    local_types[p_n] = wty
             for inst in block.instructions:
                 if inst.result and not (inst.result.version == 0 and inst.result.name in param_set and inst.opcode == "param"):
-                    var_locals.add(f"var_{inst.result.name}_{inst.result.version}")
+                    v_n = f"var_{inst.result.name}_{inst.result.version}"
+                    var_locals.add(v_n)
+                    local_types[v_n] = _wty(inst.result.var_type)
 
         is_multiblock = len(ssa_func.blocks) > 1
         if is_multiblock:
             wat_lines.append("    (local $__bb i32)")
         for l_name in sorted(var_locals | phi_tmps):
-            wat_lines.append(f"    (local ${l_name} i64)")
+            wat_lines.append(f"    (local ${l_name} {local_types.get(l_name, 'i64')})")
 
         def emit_operand(op: Any) -> str:
             if isinstance(op, SSAVar):
                 if op.version == 0 and op.name in param_set:
                     return f"local.get ${op.name}"
                 return f"local.get $var_{op.name}_{op.version}"
+            if isinstance(op, float):
+                return f"f64.const {repr(op)}"
+            if isinstance(op, bool):
+                return f"i64.const {int(op)}"
             if isinstance(op, int):
                 return f"i64.const {op}"
             s = str(op).strip()
@@ -255,7 +289,7 @@ class WasmBackend:
                 if chosen is None and phi.operands:
                     chosen = phi.operands[0]
                 if chosen is None:
-                    chosen = 0
+                    chosen = 0.0 if phi.result.var_type == "f64" else 0
                 tmp_l = f"ptmp_{phi.result.name}_{phi.result.version}"
                 dst_l = f"var_{phi.result.name}_{phi.result.version}"
                 wat_lines.append(f"{indent}{emit_operand(chosen)}")
@@ -272,13 +306,25 @@ class WasmBackend:
                     if inst.result and not (inst.result.version == 0 and inst.result.name in param_set):
                         wat_lines.append(f"{indent}local.get ${inst.operands[0]}")
                         set_result(inst.result, indent)
-                elif opcode in ("const", "mov"):
+                elif opcode in ("const", "fconst", "mov"):
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
                     set_result(inst.result, indent)
                 elif opcode == "neg":
                     wat_lines.append(f"{indent}i64.const 0")
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
                     wat_lines.append(f"{indent}i64.sub")
+                    set_result(inst.result, indent)
+                elif opcode == "fneg":
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    wat_lines.append(f"{indent}f64.neg")
+                    set_result(inst.result, indent)
+                elif opcode == "sitofp":
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    wat_lines.append(f"{indent}f64.convert_i64_s")
+                    set_result(inst.result, indent)
+                elif opcode == "fptosi":
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    wat_lines.append(f"{indent}i64.trunc_f64_s")
                     set_result(inst.result, indent)
                 elif opcode == "not":
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
@@ -290,10 +336,21 @@ class WasmBackend:
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[1])}")
                     wat_lines.append(f"{indent}{self.WASM_BINOP_MAP[opcode]}")
                     set_result(inst.result, indent)
+                elif opcode in self.WASM_FLOAT_BINOP_MAP:
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[1])}")
+                    wat_lines.append(f"{indent}{self.WASM_FLOAT_BINOP_MAP[opcode]}")
+                    set_result(inst.result, indent)
                 elif opcode in self.WASM_CMP_MAP:
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[1])}")
                     wat_lines.append(f"{indent}{self.WASM_CMP_MAP[opcode]}")
+                    wat_lines.append(f"{indent}i64.extend_i32_u")
+                    set_result(inst.result, indent)
+                elif opcode in self.WASM_FLOAT_CMP_MAP:
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
+                    wat_lines.append(f"{indent}{emit_operand(inst.operands[1])}")
+                    wat_lines.append(f"{indent}{self.WASM_FLOAT_CMP_MAP[opcode]}")
                     wat_lines.append(f"{indent}i64.extend_i32_u")
                     set_result(inst.result, indent)
                 elif opcode == "select":
@@ -362,7 +419,7 @@ class WasmBackend:
                     if inst.operands:
                         wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
                     else:
-                        wat_lines.append(f"{indent}i64.const 0")
+                        wat_lines.append(f"{indent}{'f64.const 0.0' if fn_ret_wty == 'f64' else 'i64.const 0'}")
                     wat_lines.append(f"{indent}return")
 
         if not is_multiblock:
@@ -372,7 +429,7 @@ class WasmBackend:
                 if var_locals:
                     wat_lines.append(f"    local.get ${sorted(var_locals)[-1]}")
                 else:
-                    wat_lines.append("    i64.const 0")
+                    wat_lines.append(f"    {'f64.const 0.0' if fn_ret_wty == 'f64' else 'i64.const 0'}")
         else:
             wat_lines.append("    i32.const 0")
             wat_lines.append("    local.set $__bb")
@@ -387,7 +444,7 @@ class WasmBackend:
                 wat_lines.append(f"        )")
                 wat_lines.append(f"      )")
             wat_lines.append("    )")
-            wat_lines.append("    i64.const 0")
+            wat_lines.append(f"    {'f64.const 0.0' if fn_ret_wty == 'f64' else 'i64.const 0'}")
 
         wat_lines.append("  )")
         return "\n".join(wat_lines)

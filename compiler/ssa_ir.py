@@ -98,10 +98,17 @@ class BasicBlock:
 
 
 class SSAFunction:
-    def __init__(self, name: str, params: List[str], param_types: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        name: str,
+        params: List[str],
+        param_types: Optional[Dict[str, str]] = None,
+        return_type: str = "i64",
+    ):
         self.name = name
         self.params = params
         self.param_types: Dict[str, str] = param_types or {p: "i64" for p in params}
+        self.return_type: str = return_type
         self.entry_block: Optional[BasicBlock] = None
         self.blocks: List[BasicBlock] = []
         self.source_file: str = "<module>"
@@ -231,6 +238,23 @@ class AstToSsaLowering:
         ast.GtE: "cmp_ge",
         ast.Is: "cmp_eq",
         ast.IsNot: "cmp_ne",
+    }
+
+    FLOAT_BINOP_MAP = {
+        ast.Add: "fadd",
+        ast.Sub: "fsub",
+        ast.Mult: "fmul",
+        ast.Div: "fdiv",
+        ast.FloorDiv: "fdiv",
+    }
+
+    FLOAT_CMP_MAP = {
+        ast.Eq: "fcmp_eq",
+        ast.NotEq: "fcmp_ne",
+        ast.Lt: "fcmp_lt",
+        ast.LtE: "fcmp_le",
+        ast.Gt: "fcmp_gt",
+        ast.GtE: "fcmp_ge",
     }
 
     def __init__(self):
@@ -427,6 +451,10 @@ class AstToSsaLowering:
             operands.append(pred_val)
         phi_inst.phi_incoming = incoming
         phi_inst.operands = operands
+        if phi_inst.result is not None and any(
+            isinstance(op, SSAVar) and op.var_type == "f64" for op in operands
+        ):
+            phi_inst.result.var_type = "f64"
         return self._try_remove_trivial_phi(block, phi_inst)
 
     def _try_remove_trivial_phi(self, block: BasicBlock, phi_inst: SSAInstruction) -> SSAVar:
@@ -501,18 +529,130 @@ class AstToSsaLowering:
         self._emit(v, "const", [int(val)], line=line)
         return v
 
+    def _emit_fconst(self, val: float, line: int = 0) -> SSAVar:
+        v = self._next_var("fc", var_type="f64")
+        self._emit(v, "fconst", [float(val)], line=line)
+        return v
+
+    def _promote_to_f64(self, v: SSAVar, line: int = 0) -> SSAVar:
+        if v.var_type == "f64":
+            return v
+        fv = self._next_var("fp", var_type="f64")
+        self._emit(fv, "sitofp", [v], line=line)
+        return fv
+
+    @staticmethod
+    def _is_float_annotation(ann: Optional[ast.AST]) -> bool:
+        return isinstance(ann, ast.Name) and ann.id in ("float", "f64", "float64", "double")
+
+    def _finalize_ssa_types(self, fn: SSAFunction) -> None:
+        blk_map = {b.name: b for b in fn.blocks}
+        # Propagate f64 type through Phi chains iteratively
+        changed = True
+        while changed:
+            changed = False
+            for b in fn.blocks:
+                for phi in b.phi_nodes:
+                    if phi.result and phi.result.var_type != "f64":
+                        if any(isinstance(op, SSAVar) and op.var_type == "f64" for op in phi.operands):
+                            phi.result.var_type = "f64"
+                            changed = True
+
+        # Eliminate any sitofp whose source was promoted to f64 via phi/param resolution
+        redundant_casts: Dict[SSAVar, SSAVar] = {}
+        for b in fn.blocks:
+            kept: List[SSAInstruction] = []
+            for inst in b.instructions:
+                if (
+                    inst.opcode == "sitofp"
+                    and inst.result is not None
+                    and len(inst.operands) == 1
+                    and isinstance(inst.operands[0], SSAVar)
+                    and inst.operands[0].var_type == "f64"
+                ):
+                    src = inst.operands[0]
+                    while src in redundant_casts:
+                        src = redundant_casts[src]
+                    redundant_casts[inst.result] = src
+                    continue
+                kept.append(inst)
+            b.instructions = kept
+        if redundant_casts:
+            def _resolve_alias(v: Any) -> Any:
+                while isinstance(v, SSAVar) and v in redundant_casts:
+                    v = redundant_casts[v]
+                return v
+            for b in fn.blocks:
+                for phi in b.phi_nodes:
+                    phi.operands = [_resolve_alias(op) for op in phi.operands]
+                    phi.phi_incoming = [(pn, _resolve_alias(pv)) for pn, pv in phi.phi_incoming]
+                for inst in b.instructions:
+                    inst.operands = [_resolve_alias(op) for op in inst.operands]
+
+        # Ensure every incoming value to an f64 Phi is also f64
+        for b in fn.blocks:
+            for phi in b.phi_nodes:
+                if phi.result and phi.result.var_type == "f64":
+                    new_inc = []
+                    new_ops = []
+                    for pred_n, val in phi.phi_incoming:
+                        if isinstance(val, SSAVar) and val.var_type != "f64" and pred_n in blk_map:
+                            pblk = blk_map[pred_n]
+                            pv = self._next_var("fp_phi", var_type="f64")
+                            inst = SSAInstruction(pv, "sitofp", [val])
+                            ins_pos = max(0, len(pblk.instructions) - 1) if pblk.is_terminated else len(pblk.instructions)
+                            pblk.instructions.insert(ins_pos, inst)
+                            val = pv
+                        new_inc.append((pred_n, val))
+                        new_ops.append(val)
+                    phi.phi_incoming = new_inc
+                    phi.operands = new_ops
+
+        # Promote return type if any ret yields f64, and coerce mismatched rets
+        if fn.return_type != "f64":
+            for b in fn.blocks:
+                for inst in b.instructions:
+                    if inst.opcode == "ret" and inst.operands and isinstance(inst.operands[0], SSAVar) and inst.operands[0].var_type == "f64":
+                        fn.return_type = "f64"
+                        break
+        if fn.return_type == "f64":
+            for b in fn.blocks:
+                new_insts: List[SSAInstruction] = []
+                for inst in b.instructions:
+                    if inst.opcode == "ret" and inst.operands:
+                        rv = inst.operands[0]
+                        if isinstance(rv, SSAVar) and rv.var_type != "f64":
+                            fv = self._next_var("fp_ret", var_type="f64")
+                            new_insts.append(SSAInstruction(fv, "sitofp", [rv], source_line=inst.source_line))
+                            inst.operands[0] = fv
+                        elif isinstance(rv, int) and not isinstance(rv, bool):
+                            fv = self._next_var("fc_ret", var_type="f64")
+                            new_insts.append(SSAInstruction(fv, "fconst", [float(rv)], source_line=inst.source_line))
+                            inst.operands[0] = fv
+                    new_insts.append(inst)
+                b.instructions = new_insts
+
     # ------------------------------------------------------------------
     # Full Function & Statement/Expression Lowering
     # ------------------------------------------------------------------
     def lower_function_def(self, func_def: ast.FunctionDef) -> SSAFunction:
-        # Fast path for pure single-statement `return <expr>` without control-flow
+        # Fast path for pure single-statement `return <expr>` without control-flow (integer-only)
         body_stmts = [
             s for s in func_def.body
             if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str))
         ]
         params = [arg.arg for arg in func_def.args.args]
+        has_float_ann = self._is_float_annotation(func_def.returns) or any(
+            self._is_float_annotation(arg.annotation) for arg in func_def.args.args
+        )
+        has_float_const = any(
+            isinstance(n, ast.Constant) and isinstance(n.value, float)
+            for n in ast.walk(func_def)
+        )
         if (
-            len(body_stmts) == 1
+            not has_float_ann
+            and not has_float_const
+            and len(body_stmts) == 1
             and isinstance(body_stmts[0], ast.Return)
             and body_stmts[0].value is not None
             and not any(isinstance(n, (ast.BoolOp,)) for n in ast.walk(body_stmts[0].value))
@@ -524,10 +664,13 @@ class AstToSsaLowering:
             ann = arg.annotation
             if isinstance(ann, ast.Name) and ann.id in ("ptr", "pointer", "bytes", "list"):
                 param_types[arg.arg] = "ptr"
+            elif self._is_float_annotation(ann):
+                param_types[arg.arg] = "f64"
             else:
                 param_types[arg.arg] = "i64"
 
-        fn = SSAFunction(func_def.name, params, param_types=param_types)
+        ret_type = "f64" if self._is_float_annotation(func_def.returns) else "i64"
+        fn = SSAFunction(func_def.name, params, param_types=param_types, return_type=ret_type)
         self._fn = fn
         self._block_counter = 0
         self._current_def.clear()
@@ -549,13 +692,14 @@ class AstToSsaLowering:
 
         # Ensure fallthrough block ends with `ret 0`
         if self._cur_block is not None and not self._cur_block.is_terminated:
-            z = self._emit_const(0, line=getattr(func_def, "lineno", 0))
+            z = self._emit_fconst(0.0, line=getattr(func_def, "lineno", 0)) if ret_type == "f64" else self._emit_const(0, line=getattr(func_def, "lineno", 0))
             self._emit(None, "ret", [z], line=getattr(func_def, "lineno", 0))
 
         # Seal any remaining unsealed blocks defensively and prune unreachable empty blocks
         for b in list(fn.blocks):
             self._seal_block(b)
 
+        self._finalize_ssa_types(fn)
         self._prune_unreachable_blocks(fn)
         return fn
 
@@ -618,9 +762,16 @@ class AstToSsaLowering:
             if isinstance(stmt.target, ast.Name):
                 cur_val = self._read_variable(stmt.target.id, self._cur_block)
                 rhs_val = self._lower_expr(stmt.value)
-                opcode = self.BINOP_MAP.get(type(stmt.op), "add")
-                res = self._next_var(stmt.target.id)
-                self._emit(res, opcode, [cur_val, rhs_val], line=line)
+                if cur_val.var_type == "f64" or rhs_val.var_type == "f64":
+                    cur_f = self._promote_to_f64(cur_val, line=line)
+                    rhs_f = self._promote_to_f64(rhs_val, line=line)
+                    fop = self.FLOAT_BINOP_MAP.get(type(stmt.op), "fadd")
+                    res = self._next_var(stmt.target.id, var_type="f64")
+                    self._emit(res, fop, [cur_f, rhs_f], line=line)
+                else:
+                    opcode = self.BINOP_MAP.get(type(stmt.op), "add")
+                    res = self._next_var(stmt.target.id)
+                    self._emit(res, opcode, [cur_val, rhs_val], line=line)
                 self._write_variable(stmt.target.id, self._cur_block, res)
             elif isinstance(stmt.target, ast.Subscript):
                 base_var = self._lower_expr(stmt.target.value)
@@ -920,6 +1071,8 @@ class AstToSsaLowering:
                 return self._emit_const(1 if node.value else 0, line=line)
             elif isinstance(node.value, int):
                 return self._emit_const(node.value, line=line)
+            elif isinstance(node.value, float):
+                return self._emit_fconst(node.value, line=line)
             elif isinstance(node.value, str):
                 from runtime.native_strings import omni_str_new_from_bytes
                 raw = node.value.encode("utf-8")
@@ -932,6 +1085,10 @@ class AstToSsaLowering:
             if isinstance(node.op, ast.UAdd):
                 return op_var
             elif isinstance(node.op, ast.USub):
+                if op_var.var_type == "f64":
+                    res = self._next_var("fneg", var_type="f64")
+                    self._emit(res, "fneg", [op_var], line=line)
+                    return res
                 zero = self._emit_const(0, line=line)
                 res = self._next_var("neg")
                 self._emit(res, "sub", [zero, op_var], line=line)
@@ -942,6 +1099,11 @@ class AstToSsaLowering:
                 self._emit(res, "xor", [op_var, neg1], line=line)
                 return res
             elif isinstance(node.op, ast.Not):
+                if op_var.var_type == "f64":
+                    fz = self._emit_fconst(0.0, line=line)
+                    res = self._next_var("fnot")
+                    self._emit(res, "fcmp_eq", [op_var, fz], line=line)
+                    return res
                 zero = self._emit_const(0, line=line)
                 res = self._next_var("not")
                 self._emit(res, "cmp_eq", [op_var, zero], line=line)
@@ -950,6 +1112,13 @@ class AstToSsaLowering:
         elif isinstance(node, ast.BinOp):
             left_var = self._lower_expr(node.left)
             right_var = self._lower_expr(node.right)
+            if left_var.var_type == "f64" or right_var.var_type == "f64":
+                lf = self._promote_to_f64(left_var, line=line)
+                rf = self._promote_to_f64(right_var, line=line)
+                opcode = self.FLOAT_BINOP_MAP.get(type(node.op), "fadd")
+                res = self._next_var("ft", var_type="f64")
+                self._emit(res, opcode, [lf, rf], line=line)
+                return res
             opcode = self.BINOP_MAP.get(type(node.op), "add")
             res = self._next_var("t")
             self._emit(res, opcode, [left_var, right_var], line=line)
@@ -960,9 +1129,16 @@ class AstToSsaLowering:
             acc: Optional[SSAVar] = None
             for op, comp in zip(node.ops, node.comparators):
                 right_var = self._lower_expr(comp)
-                cmp_opcode = self.CMP_MAP.get(type(op), "cmp_eq")
-                cmp_res = self._next_var("cmp")
-                self._emit(cmp_res, cmp_opcode, [left_var, right_var], line=line)
+                if left_var.var_type == "f64" or right_var.var_type == "f64":
+                    lf = self._promote_to_f64(left_var, line=line)
+                    rf = self._promote_to_f64(right_var, line=line)
+                    cmp_opcode = self.FLOAT_CMP_MAP.get(type(op), "fcmp_eq")
+                    cmp_res = self._next_var("fcmp")
+                    self._emit(cmp_res, cmp_opcode, [lf, rf], line=line)
+                else:
+                    cmp_opcode = self.CMP_MAP.get(type(op), "cmp_eq")
+                    cmp_res = self._next_var("cmp")
+                    self._emit(cmp_res, cmp_opcode, [left_var, right_var], line=line)
                 if acc is None:
                     acc = cmp_res
                 else:
@@ -992,6 +1168,12 @@ class AstToSsaLowering:
             cond_var = self._lower_expr(node.test)
             true_var = self._lower_expr(node.body)
             false_var = self._lower_expr(node.orelse)
+            if true_var.var_type == "f64" or false_var.var_type == "f64":
+                tv = self._promote_to_f64(true_var, line=line)
+                fv = self._promote_to_f64(false_var, line=line)
+                res = self._next_var("fsel", var_type="f64")
+                self._emit(res, "select", [cond_var, tv, fv], line=line)
+                return res
             res = self._next_var("sel")
             self._emit(res, "select", [cond_var, true_var, false_var], line=line)
             return res
@@ -1053,6 +1235,15 @@ class AstToSsaLowering:
                     return res
                 elif fname == "abs" and len(node.args) == 1:
                     x = self._lower_expr(node.args[0])
+                    if x.var_type == "f64":
+                        fz = self._emit_fconst(0.0, line=line)
+                        is_neg = self._next_var("is_neg")
+                        self._emit(is_neg, "fcmp_lt", [x, fz], line=line)
+                        neg_x = self._next_var("neg_x", var_type="f64")
+                        self._emit(neg_x, "fneg", [x], line=line)
+                        res = self._next_var("fabs", var_type="f64")
+                        self._emit(res, "select", [is_neg, neg_x, x], line=line)
+                        return res
                     z = self._emit_const(0, line=line)
                     is_neg = self._next_var("is_neg")
                     self._emit(is_neg, "cmp_lt", [x, z], line=line)
@@ -1064,6 +1255,14 @@ class AstToSsaLowering:
                 elif fname == "min" and len(node.args) == 2:
                     a = self._lower_expr(node.args[0])
                     b = self._lower_expr(node.args[1])
+                    if a.var_type == "f64" or b.var_type == "f64":
+                        af = self._promote_to_f64(a, line=line)
+                        bf = self._promote_to_f64(b, line=line)
+                        cond = self._next_var("flt")
+                        self._emit(cond, "fcmp_lt", [af, bf], line=line)
+                        res = self._next_var("fmin", var_type="f64")
+                        self._emit(res, "select", [cond, af, bf], line=line)
+                        return res
                     cond = self._next_var("lt")
                     self._emit(cond, "cmp_lt", [a, b], line=line)
                     res = self._next_var("min")
@@ -1072,13 +1271,29 @@ class AstToSsaLowering:
                 elif fname == "max" and len(node.args) == 2:
                     a = self._lower_expr(node.args[0])
                     b = self._lower_expr(node.args[1])
+                    if a.var_type == "f64" or b.var_type == "f64":
+                        af = self._promote_to_f64(a, line=line)
+                        bf = self._promote_to_f64(b, line=line)
+                        cond = self._next_var("fgt")
+                        self._emit(cond, "fcmp_gt", [af, bf], line=line)
+                        res = self._next_var("fmax", var_type="f64")
+                        self._emit(res, "select", [cond, af, bf], line=line)
+                        return res
                     cond = self._next_var("gt")
                     self._emit(cond, "cmp_gt", [a, b], line=line)
                     res = self._next_var("max")
                     self._emit(res, "select", [cond, a, b], line=line)
                     return res
                 elif fname == "int" and len(node.args) == 1:
-                    return self._lower_expr(node.args[0])
+                    av = self._lower_expr(node.args[0])
+                    if av.var_type == "f64":
+                        iv = self._next_var("f2i", var_type="i64")
+                        self._emit(iv, "fptosi", [av], line=line)
+                        return iv
+                    return av
+                elif fname == "float" and len(node.args) == 1:
+                    av = self._lower_expr(node.args[0])
+                    return self._promote_to_f64(av, line=line)
                 elif fname == "sum" and len(node.args) == 1:
                     arg_v = self._lower_expr(node.args[0])
                     res = self._next_var("sum")

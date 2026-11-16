@@ -23,6 +23,7 @@ Alive2-style symbolic equivalence verifier for Omni-SSA IR optimization passes:
      semantic equivalence.
 """
 
+import struct
 from typing import Dict, List, Set, Tuple, Any, Optional, Callable
 import z3
 
@@ -42,6 +43,11 @@ SUPPORTED_Z3_OPCODES = frozenset({
 
 SUPPORTED_Z3_MEMORY_OPCODES = frozenset({"alloca", "load", "store"})
 SUPPORTED_Z3_METADATA_OPCODES = frozenset({"unroll_meta", "unroll_factor"})
+SUPPORTED_Z3_FLOAT_OPCODES = frozenset({
+    "fconst", "fneg", "fadd", "fsub", "fmul", "fdiv",
+    "fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge",
+    "sitofp", "fptosi",
+})
 
 
 class SSATranslationValidator:
@@ -56,11 +62,13 @@ class SSATranslationValidator:
         max_loop_unroll: int = 0,
         enable_inductive_loops: bool = False,
         enable_call_congruence: bool = False,
+        enable_float_theory: bool = False,
     ):
         self.enable_memory_theory = enable_memory_theory
         self.max_loop_unroll = max(0, int(max_loop_unroll))
         self.enable_inductive_loops = bool(enable_inductive_loops)
         self.enable_call_congruence = bool(enable_call_congruence)
+        self.enable_float_theory = bool(enable_float_theory)
 
     def _topological_blocks(self, fn: SSAFunction) -> Optional[List[BasicBlock]]:
         """
@@ -129,7 +137,48 @@ class SSATranslationValidator:
             ops |= SUPPORTED_Z3_METADATA_OPCODES
         if self.enable_call_congruence:
             ops.add("call")
+        if self.enable_float_theory:
+            ops |= SUPPORTED_Z3_FLOAT_OPCODES
         return frozenset(ops)
+
+    @staticmethod
+    def _float_to_bv(val: float) -> z3.BitVecRef:
+        bits = struct.unpack("<Q", struct.pack("<d", float(val)))[0]
+        return z3.BitVecVal(bits, 64)
+
+    @staticmethod
+    def _eval_float_inst(op: str, args: List[z3.BitVecRef]) -> z3.BitVecRef:
+        fp64 = z3.Float64()
+        rm = z3.RNE()
+        if op == "fneg":
+            return args[0] ^ z3.BitVecVal(0x8000000000000000, 64)
+        if op == "sitofp":
+            return z3.fpToIEEEBV(z3.fpSignedToFP(rm, args[0], fp64))
+        if op == "fptosi":
+            return z3.fpToSBV(z3.RTZ(), z3.fpBVToFP(args[0], fp64), z3.BitVecSort(64))
+        f0 = z3.fpBVToFP(args[0], fp64)
+        f1 = z3.fpBVToFP(args[1], fp64)
+        if op == "fadd":
+            return z3.fpToIEEEBV(z3.fpAdd(rm, f0, f1))
+        if op == "fsub":
+            return z3.fpToIEEEBV(z3.fpSub(rm, f0, f1))
+        if op == "fmul":
+            return z3.fpToIEEEBV(z3.fpMul(rm, f0, f1))
+        if op == "fdiv":
+            return z3.fpToIEEEBV(z3.fpDiv(rm, f0, f1))
+        if op == "fcmp_eq":
+            cond = z3.fpEQ(f0, f1)
+        elif op == "fcmp_ne":
+            cond = z3.And(z3.Not(z3.fpIsNaN(f0)), z3.Not(z3.fpIsNaN(f1)), z3.Not(z3.fpEQ(f0, f1)))
+        elif op == "fcmp_lt":
+            cond = z3.fpLT(f0, f1)
+        elif op == "fcmp_le":
+            cond = z3.fpLEQ(f0, f1)
+        elif op == "fcmp_gt":
+            cond = z3.fpGT(f0, f1)
+        else:  # fcmp_ge
+            cond = z3.fpGEQ(f0, f1)
+        return z3.If(cond, z3.BitVecVal(1, 64), z3.BitVecVal(0, 64))
 
     def _eval_call_uf(self, callee: str, arg_exprs: List[z3.BitVecRef]) -> z3.BitVecRef:
         bv64 = z3.BitVecSort(64)
@@ -234,6 +283,8 @@ class SSATranslationValidator:
                             cur_loc_mem = z3.If(ec, node_loc_mem_out[pn], cur_loc_mem)
 
                 def eval_op(op: Any, lookup_lvl: int = lvl) -> Optional[z3.BitVecRef]:
+                    if isinstance(op, float):
+                        return self._float_to_bv(op)
                     if isinstance(op, bool):
                         return z3.BitVecVal(int(op), 64)
                     if isinstance(op, int):
@@ -307,9 +358,12 @@ class SSATranslationValidator:
                         if not inst.operands or inst.result is None:
                             return {"error": "INVALID_CONST"}
                         val = inst.operands[0]
-                        if not isinstance(val, (int, bool)):
+                        if isinstance(val, float) and self.enable_float_theory:
+                            env_levels[lvl][inst.result] = self._float_to_bv(val)
+                        elif not isinstance(val, (int, bool)):
                             return {"error": "NON_INT_CONST"}
-                        env_levels[lvl][inst.result] = z3.BitVecVal(int(val), 64)
+                        else:
+                            env_levels[lvl][inst.result] = z3.BitVecVal(int(val), 64)
 
                     elif op == "mov":
                         if not inst.operands or inst.result is None:
@@ -437,6 +491,22 @@ class SSATranslationValidator:
                         else:  # cmp_ge
                             res_bv = z3.If(v0 >= v1, z3.BitVecVal(1, 64), z3.BitVecVal(0, 64))
                         env_levels[lvl][inst.result] = res_bv
+
+                    elif op == "fconst":
+                        if not inst.operands or inst.result is None:
+                            return {"error": "INVALID_FCONST"}
+                        env_levels[lvl][inst.result] = self._float_to_bv(float(inst.operands[0]))
+
+                    elif op in SUPPORTED_Z3_FLOAT_OPCODES:
+                        if inst.result is None:
+                            return {"error": f"INVALID_{op}"}
+                        fargs: List[z3.BitVecRef] = []
+                        for a in inst.operands:
+                            av = eval_op(a)
+                            if av is None:
+                                return {"error": f"UNRESOLVED_{op}"}
+                            fargs.append(av)
+                        env_levels[lvl][inst.result] = self._eval_float_inst(op, fargs)
 
                     elif op == "select":
                         if len(inst.operands) != 3 or inst.result is None:
@@ -629,6 +699,8 @@ class SSATranslationValidator:
                     cur_loc_mem = z3.If(ec, node_loc_mem_out[pn], cur_loc_mem)
 
             def eval_op(op: Any, specific_block: Optional[str] = None) -> Optional[z3.BitVecRef]:
+                if isinstance(op, float):
+                    return self._float_to_bv(op)
                 if isinstance(op, bool):
                     return z3.BitVecVal(int(op), 64)
                 if isinstance(op, int):
@@ -693,9 +765,12 @@ class SSATranslationValidator:
                     if not inst.operands or inst.result is None:
                         return {"error": "INVALID_CONST"}
                     val = inst.operands[0]
-                    if not isinstance(val, (int, bool)):
+                    if isinstance(val, float) and self.enable_float_theory:
+                        local_env[inst.result] = self._float_to_bv(val)
+                    elif not isinstance(val, (int, bool)):
                         return {"error": "NON_INT_CONST"}
-                    local_env[inst.result] = z3.BitVecVal(int(val), 64)
+                    else:
+                        local_env[inst.result] = z3.BitVecVal(int(val), 64)
 
                 elif op == "mov":
                     if not inst.operands or inst.result is None:
@@ -824,6 +899,22 @@ class SSATranslationValidator:
                     else:
                         res_bv = z3.If(v0 >= v1, z3.BitVecVal(1, 64), z3.BitVecVal(0, 64))
                     local_env[inst.result] = res_bv
+
+                elif op == "fconst":
+                    if not inst.operands or inst.result is None:
+                        return {"error": "INVALID_FCONST"}
+                    local_env[inst.result] = self._float_to_bv(float(inst.operands[0]))
+
+                elif op in SUPPORTED_Z3_FLOAT_OPCODES:
+                    if inst.result is None:
+                        return {"error": f"INVALID_{op}"}
+                    fargs: List[z3.BitVecRef] = []
+                    for a in inst.operands:
+                        av = eval_op(a)
+                        if av is None:
+                            return {"error": f"UNRESOLVED_{op}"}
+                        fargs.append(av)
+                    local_env[inst.result] = self._eval_float_inst(op, fargs)
 
                 elif op == "select":
                     if len(inst.operands) != 3 or inst.result is None:
@@ -1360,6 +1451,7 @@ class SSATranslationValidator:
             max_loop_unroll=max(self.max_loop_unroll, 12),
             enable_inductive_loops=False,
             enable_call_congruence=self.enable_call_congruence,
+            enable_float_theory=self.enable_float_theory,
         )
         probe_res = bounded_probe.verify_equivalence(ssa_before, ssa_after, timeout_ms=timeout_ms)
         if probe_res["status"] == "REFUTED_COUNTEREXAMPLE":
@@ -2259,8 +2351,20 @@ class SSATranslationValidator:
                     "bounded": True,
                 }
 
-        # Exact Z3 AST reflexivity fast-path: identical encoded terms cannot diverge
+        # Exact Z3 AST reflexivity + algebraic simplification fast-path
         if ret_b.eq(ret_a) and mem_b.eq(mem_a) and (not is_bounded or term_b.eq(term_a)):
+            return {
+                "proven": True,
+                "status": "PROVEN_BOUNDED_EQUIVALENT" if is_bounded else "PROVEN_EQUIVALENT",
+                "counterexample": None,
+                "bounded": is_bounded,
+            }
+
+        if self.enable_float_theory and (
+            z3.simplify(ret_b).eq(z3.simplify(ret_a))
+            and z3.simplify(mem_b).eq(z3.simplify(mem_a))
+            and (not is_bounded or z3.simplify(term_b).eq(term_a))
+        ):
             return {
                 "proven": True,
                 "status": "PROVEN_BOUNDED_EQUIVALENT" if is_bounded else "PROVEN_EQUIVALENT",
@@ -2275,6 +2379,40 @@ class SSATranslationValidator:
             )
         else:
             mismatch_cond = z3.Or(ret_b != ret_a, mem_b != mem_a)
+
+        # Fast sound Z3 QF_FP / QF_BV witness substitution before full 53-bit FP bit-blasting
+        if self.enable_float_theory and sym_params:
+            pt_before = getattr(ssa_before, "param_types", {}) or {}
+            pt_after = getattr(ssa_after, "param_types", {}) or {}
+            witness_tuples = [
+                (0.1, 0.2, 0.3, 1.0, 2.0, -1.0),
+                (1e16, -1e16, 1.0, 2.0, 3.0, 4.0),
+                (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+                (2.5, -1.25, 0.5, -3.0, 1.5, -0.5),
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                (-2.0, 4.0, -0.25, 0.75, 1.25, -1.5),
+            ]
+            for wt in witness_tuples:
+                subst_pairs = []
+                ce_cand = {}
+                for idx_p, p_sym in enumerate(sym_params):
+                    pname = ssa_before.params[idx_p]
+                    raw_v = wt[idx_p % len(wt)]
+                    if pt_before.get(pname) == "f64" or pt_after.get(pname) == "f64":
+                        bv_val = self._float_to_bv(float(raw_v))
+                        ce_cand[pname] = float(raw_v)
+                    else:
+                        iv = int(raw_v)
+                        bv_val = z3.BitVecVal(iv, 64)
+                        ce_cand[pname] = iv
+                    subst_pairs.append((p_sym, bv_val))
+                if z3.is_true(z3.simplify(z3.substitute(mismatch_cond, *subst_pairs))):
+                    return {
+                        "proven": False,
+                        "status": "REFUTED_COUNTEREXAMPLE",
+                        "counterexample": ce_cand,
+                        "bounded": is_bounded,
+                    }
 
         solver = z3.Solver()
         solver.set("timeout", timeout_ms)
