@@ -203,13 +203,14 @@ class LLVMIRToSSALifter:
                 cur_bb.add_instruction(SSAInstruction(None, "ret", [parse_val(m_ret.group(2), as_float=is_f)]))
                 continue
 
-            if ln.startswith("store i64 "):
-                m_st = re.match(r"^store\s+i64\s+([^,]+),\s*ptr\s+(%[A-Za-z0-9_.$]+)", ln)
+            if ln.startswith("store i64 ") or ln.startswith("store double "):
+                m_st = re.match(r"^store\s+(i64|double)\s+([^,]+),\s*ptr\s+(%[A-Za-z0-9_.$]+)", ln)
                 if not m_st:
                     return None, f"UNSUPPORTED_LLVM_STORE_{ln}"
-                val_op = parse_val(m_st.group(1))
-                p_name = m_st.group(2)[1:]
-                base_op, idx_op = alias_ptr.get(p_name, (get_or_create_var(m_st.group(2)), 0))
+                is_f_st = m_st.group(1) == "double"
+                val_op = parse_val(m_st.group(2), as_float=is_f_st)
+                p_name = m_st.group(3)[1:]
+                base_op, idx_op = alias_ptr.get(p_name, (get_or_create_var(m_st.group(3)), 0))
                 cur_bb.add_instruction(SSAInstruction(None, "store", [base_op, idx_op, val_op]))
                 continue
 
@@ -263,7 +264,7 @@ class LLVMIRToSSALifter:
                 alias_ptr[lhs_name] = (parse_val(m_itop.group(1)), 0)
                 continue
 
-            m_gep = re.match(r"^getelementptr\s+i64,\s*ptr\s+(%[A-Za-z0-9_.$]+),\s*i64\s+(.+)$", rhs)
+            m_gep = re.match(r"^getelementptr\s+(?:i64|double),\s*ptr\s+(%[A-Za-z0-9_.$]+),\s*i64\s+(.+)$", rhs)
             if m_gep:
                 src_p = m_gep.group(1)[1:]
                 idx_op = parse_val(m_gep.group(2))
@@ -271,11 +272,12 @@ class LLVMIRToSSALifter:
                 alias_ptr[lhs_name] = (base_op, idx_op)
                 continue
 
-            m_load = re.match(r"^load\s+i64,\s*ptr\s+(%[A-Za-z0-9_.$]+)", rhs)
+            m_load = re.match(r"^load\s+(i64|double),\s*ptr\s+(%[A-Za-z0-9_.$]+)", rhs)
             if m_load:
-                p_name = m_load.group(1)[1:]
-                base_op, idx_op = alias_ptr.get(p_name, (get_or_create_var(m_load.group(1)), 0))
-                res_v = get_or_create_var(lhs_tok)
+                is_f_ld = m_load.group(1) == "double"
+                p_name = m_load.group(2)[1:]
+                base_op, idx_op = alias_ptr.get(p_name, (get_or_create_var(m_load.group(2)), 0))
+                res_v = get_or_create_var(lhs_tok, var_type="f64" if is_f_ld else "i64")
                 cur_bb.add_instruction(SSAInstruction(res_v, "load", [base_op, idx_op]))
                 continue
 
@@ -940,7 +942,7 @@ class WATToSSALifter:
             else:
                 stack.append(("__wat_ptr__", addr_val, 0))
             return None
-        if ln == "i64.load":
+        if ln in ("i64.load", "f64.load"):
             if not stack:
                 return "WAT_STACK_UNDERFLOW_load"
             addr_tok = stack.pop()
@@ -948,11 +950,11 @@ class WATToSSALifter:
                 base_op, idx_op = addr_tok[1], addr_tok[2]
             else:
                 base_op, idx_op = addr_tok, 0
-            rv = next_var("wld")
+            rv = next_var("wld", var_type="f64" if ln == "f64.load" else "i64")
             bb.add_instruction(SSAInstruction(rv, "load", [base_op, idx_op]))
             stack.append(rv)
             return None
-        if ln == "i64.store":
+        if ln in ("i64.store", "f64.store"):
             if len(stack) < 2:
                 return "WAT_STACK_UNDERFLOW_store"
             val_op = stack.pop()
@@ -1199,6 +1201,7 @@ class BackendTranslationValidator:
         """
         target_os = "windows" if platform.system().lower().startswith("win") else "linux"
         results_by_backend: Dict[str, List[Any]] = {}
+        memory_by_backend: Dict[str, List[Dict[str, List[Any]]]] = {}
         active_backends: List[str] = []
         jit_allocs: List[Any] = []
 
@@ -1212,14 +1215,49 @@ class BackendTranslationValidator:
         def fmt_out(v: Any) -> Any:
             return float(v) if is_fp_ret else _to_s64(int(v))
 
-        def cmp_key(v: Any) -> int:
-            return struct.unpack("<Q", struct.pack("<d", float(v)))[0] if is_fp_ret else _to_s64(int(v))
+        def elem_bits(v: Any, is_f: bool) -> int:
+            return struct.unpack("<Q", struct.pack("<d", float(v)))[0] if is_f else _to_s64(int(v))
 
-        def coerce_vec(vec: Sequence[Any]) -> Tuple[Any, ...]:
-            return tuple(
-                float(x) if ssa_fn.param_types.get(p) == "f64" else int(x)
-                for p, x in zip(ssa_fn.params, vec)
+        def cmp_key(ret_v: Any, mem_snap: Dict[str, List[Any]]) -> Tuple[Any, ...]:
+            r_bits = elem_bits(ret_v, is_fp_ret)
+            m_bits = tuple(
+                (
+                    k,
+                    tuple(
+                        elem_bits(
+                            el,
+                            ssa_fn.param_types.get(k) == "ptr_f64" or isinstance(el, float),
+                        )
+                        for el in vals
+                    ),
+                )
+                for k, vals in sorted(mem_snap.items())
             )
+            return (r_bits, m_bits)
+
+        def run_ctypes_callable(cfunc, vec: Sequence[Any]) -> Tuple[Any, Dict[str, List[Any]]]:
+            call_args: List[Any] = []
+            live_bufs: List[Tuple[str, Any, bool, int]] = []
+            for p, x in zip(ssa_fn.params, vec):
+                pty = ssa_fn.param_types.get(p, "i64")
+                if isinstance(x, list):
+                    is_f_buf = pty == "ptr_f64" or any(isinstance(el, float) for el in x)
+                    n_el = len(x)
+                    if is_f_buf:
+                        cbuf = (ctypes.c_double * max(1, n_el))(*[float(el) for el in x])
+                    else:
+                        cbuf = (ctypes.c_int64 * max(1, n_el))(*[int(el) for el in x])
+                    live_bufs.append((p, cbuf, is_f_buf, n_el))
+                    call_args.append(ctypes.addressof(cbuf))
+                elif pty == "f64":
+                    call_args.append(float(x))
+                else:
+                    call_args.append(int(x))
+            rv = fmt_out(cfunc(*call_args))
+            mem_out: Dict[str, List[Any]] = {}
+            for p, cbuf, is_f_buf, n_el in live_bufs:
+                mem_out[p] = [float(cbuf[i]) if is_f_buf else _to_s64(int(cbuf[i])) for i in range(n_el)]
+            return rv, mem_out
 
         if "native" in backends:
             codegen = NativeCodeGenerator(arch="x86_64", target_os=target_os)
@@ -1229,7 +1267,13 @@ class BackendTranslationValidator:
                 jit_mem.write_code(art.code_bytes)
                 jit_allocs.append(jit_mem)
                 cfunc = ctypes.CFUNCTYPE(restype, *argtypes)(jit_mem.ptr)
-                results_by_backend["native"] = [fmt_out(cfunc(*coerce_vec(vec))) for vec in test_vectors]
+                nat_outs, nat_mems = [], []
+                for vec in test_vectors:
+                    ro, mo = run_ctypes_callable(cfunc, vec)
+                    nat_outs.append(ro)
+                    nat_mems.append(mo)
+                results_by_backend["native"] = nat_outs
+                memory_by_backend["native"] = nat_mems
                 active_backends.append("native")
 
         if "llvm" in backends:
@@ -1239,7 +1283,13 @@ class BackendTranslationValidator:
                 mod = llvm_be.compile_ir(ir, optimize=True)
                 lfunc = llvm_be.create_jit_callable(mod, ssa_fn.name, restype=restype, argtypes=argtypes)
                 jit_allocs.append(lfunc)
-                results_by_backend["llvm"] = [fmt_out(lfunc(*coerce_vec(vec))) for vec in test_vectors]
+                ll_outs, ll_mems = [], []
+                for vec in test_vectors:
+                    ro, mo = run_ctypes_callable(lfunc, vec)
+                    ll_outs.append(ro)
+                    ll_mems.append(mo)
+                results_by_backend["llvm"] = ll_outs
+                memory_by_backend["llvm"] = ll_mems
                 active_backends.append("llvm")
 
         if "wasm" in backends:
@@ -1251,21 +1301,63 @@ class BackendTranslationValidator:
                 store = Store(wasm_be._engine)
                 mod = Module(wasm_be._engine, wasm_bytes)
                 inst = Instance(store, mod, [])
-                exp_fn = inst.exports(store)[ssa_fn.name]
-                results_by_backend["wasm"] = [fmt_out(exp_fn(store, *coerce_vec(vec))) for vec in test_vectors]
+                exports_map = inst.exports(store)
+                exp_fn = exports_map[ssa_fn.name]
+                wasm_mem = exports_map.get("memory")
+                w_outs, w_mems = [], []
+                for vec in test_vectors:
+                    w_args: List[Any] = []
+                    w_bufs: List[Tuple[str, int, int, bool]] = []
+                    cur_off = 1024
+                    for p, x in zip(ssa_fn.params, vec):
+                        pty = ssa_fn.param_types.get(p, "i64")
+                        if isinstance(x, list) and wasm_mem is not None:
+                            is_f_buf = pty == "ptr_f64" or any(isinstance(el, float) for el in x)
+                            n_el = len(x)
+                            if is_f_buf:
+                                raw_b = struct.pack(f"<{n_el}d", *[float(el) for el in x]) if n_el > 0 else b""
+                            else:
+                                raw_b = struct.pack(f"<{n_el}q", *[_to_s64(int(el)) for el in x]) if n_el > 0 else b""
+                            if raw_b:
+                                wasm_mem.write(store, raw_b, cur_off)
+                            w_bufs.append((p, cur_off, n_el, is_f_buf))
+                            w_args.append(cur_off)
+                            cur_off += max(64, ((len(raw_b) + 63) // 64) * 64)
+                        elif pty == "f64":
+                            w_args.append(float(x))
+                        else:
+                            w_args.append(int(x))
+                    rv = fmt_out(exp_fn(store, *w_args))
+                    mo: Dict[str, List[Any]] = {}
+                    if wasm_mem is not None:
+                        for p, off, n_el, is_f_buf in w_bufs:
+                            if n_el == 0:
+                                mo[p] = []
+                            else:
+                                raw_out = bytes(wasm_mem.read(store, off, off + n_el * 8))
+                                if is_f_buf:
+                                    mo[p] = list(struct.unpack(f"<{n_el}d", raw_out))
+                                else:
+                                    mo[p] = [_to_s64(v) for v in struct.unpack(f"<{n_el}q", raw_out)]
+                    w_outs.append(rv)
+                    w_mems.append(mo)
+                results_by_backend["wasm"] = w_outs
+                memory_by_backend["wasm"] = w_mems
                 active_backends.append("wasm")
 
         mismatches: List[Dict[str, Any]] = []
         if len(active_backends) >= 2:
             for idx, vec in enumerate(test_vectors):
                 per_be = {be: results_by_backend[be][idx] for be in active_backends}
-                keys = {cmp_key(v) for v in per_be.values()}
+                per_mem = {be: memory_by_backend[be][idx] for be in active_backends}
+                keys = {cmp_key(per_be[be], per_mem[be]) for be in active_backends}
                 if len(keys) != 1:
-                    mismatches.append({"input": list(vec), "outputs": per_be})
+                    mismatches.append({"input": list(vec), "outputs": per_be, "memory": per_mem})
 
         return {
             "equivalent": len(mismatches) == 0 and len(active_backends) >= 2,
             "active_backends": active_backends,
             "outputs_by_backend": results_by_backend,
+            "memory_by_backend": memory_by_backend,
             "mismatches": mismatches,
         }

@@ -872,6 +872,61 @@ class X64CodeGenerator:
         buf.emit(b"\xc3")
         return buf.finalize()
 
+    def emit_avx2_vector_add_f64(self) -> bytes:
+        """
+        Emits a VEX-encoded 256-bit AVX2 IEEE-754 double-precision SIMD kernel:
+          int64_t avx2_add_f64(const double* a, const double* b, double* out, int64_t count)
+        Processes 4 x 64-bit IEEE-754 doubles (32 bytes) per cycle using YMM0/YMM1 (`vaddpd`),
+        with SSE2 scalar `addsd` tail cleanup and `vzeroupper` epilogue.
+        """
+        buf = X64LabelBuffer()
+        if self.is_windows:
+            buf.emit(_x64_mov_rr("r10", "rcx"))
+            buf.emit(_x64_mov_rr("r11", "rdx"))
+            buf.emit(_x64_mov_rr("rax", "r8"))
+            buf.emit(_x64_mov_rr("rcx", "r9"))
+        else:
+            buf.emit(_x64_mov_rr("r10", "rdi"))
+            buf.emit(_x64_mov_rr("r11", "rsi"))
+            buf.emit(_x64_mov_rr("rax", "rdx"))
+
+        buf.mark(".L_vec_loop_f64")
+        buf.emit(b"\x48\x83\xf9\x04")              # cmp rcx, 4
+        buf.emit(b"\x0f\x8c\x00\x00\x00\x00")      # jl .L_scalar_tail_f64
+        buf.fixups.append((len(buf.code) - 4, ".L_scalar_tail_f64"))
+
+        buf.emit(b"\xc4\xc1\x7d\x10\x02")          # vmovupd ymm0, [r10]
+        buf.emit(b"\xc4\xc1\x7d\x10\x0b")          # vmovupd ymm1, [r11]
+        buf.emit(b"\xc5\xfd\x58\xc1")              # vaddpd ymm0, ymm0, ymm1
+        buf.emit(b"\xc5\xfd\x11\x00")              # vmovupd [rax], ymm0
+
+        buf.emit(b"\x49\x83\xc2\x20")              # add r10, 32
+        buf.emit(b"\x49\x83\xc3\x20")              # add r11, 32
+        buf.emit(b"\x48\x83\xc0\x20")              # add rax, 32
+        buf.emit(b"\x48\x83\xe9\x04")              # sub rcx, 4
+        buf.jmp(".L_vec_loop_f64")
+
+        buf.mark(".L_scalar_tail_f64")
+        buf.emit(b"\xc5\xf8\x77")                  # vzeroupper
+        buf.mark(".L_tail_loop_f64")
+        buf.emit(_x64_test_rr("rcx"))              # test rcx, rcx
+        buf.emit(b"\x0f\x8e\x00\x00\x00\x00")      # jle .L_done_f64
+        buf.fixups.append((len(buf.code) - 4, ".L_done_f64"))
+
+        buf.emit(b"\xf2\x41\x0f\x10\x02")          # movsd xmm0, [r10]
+        buf.emit(b"\xf2\x41\x0f\x58\x03")          # addsd xmm0, [r11]
+        buf.emit(b"\xf2\x0f\x11\x00")              # movsd [rax], xmm0
+        buf.emit(b"\x49\x83\xc2\x08")              # add r10, 8
+        buf.emit(b"\x49\x83\xc3\x08")              # add r11, 8
+        buf.emit(b"\x48\x83\xc0\x08")              # add rax, 8
+        buf.emit(b"\x48\xff\xc9")                  # dec rcx
+        buf.jmp(".L_tail_loop_f64")
+
+        buf.mark(".L_done_f64")
+        buf.emit(_x64_mov_ri("rax", 1))
+        buf.emit(b"\xc3")
+        return buf.finalize()
+
     def emit_avx2_fma_dot_i64(self) -> bytes:
         """
         Emits a VEX-encoded 256-bit AVX2 tiled reduction / dot-scale kernel:
@@ -1363,6 +1418,38 @@ class Arm64CodeGenerator:
             prologue_size=prologue_size,
             leaf_register_mode=False,
         )
+
+    def emit_neon_vector_add_f64(self) -> bytes:
+        """
+        Emits a 128-bit ARMv8-A NEON ASIMD IEEE-754 double-precision vector kernel:
+          int64_t neon_add_f64(const double* a, const double* b, double* out, int64_t count)
+        Processes 2 x 64-bit IEEE-754 doubles (16 bytes) per cycle using V0.2D/V1.2D (`FADD V0.2D, V0.2D, V1.2D`),
+        with scalar VFP `FADD D0, D0, D1` tail cleanup.
+        """
+        words = [
+            # .L_vec_loop (word 0):
+            0xF100087F,  # 0: CMP X3, #2
+            0x540000EB,  # 1: B.LT .L_tail (+7 words -> word 8)
+            0x3CC10400,  # 2: LDR Q0, [X0], #16
+            0x3CC10421,  # 3: LDR Q1, [X1], #16
+            0x4E61D400,  # 4: FADD V0.2D, V0.2D, V1.2D
+            0x3C810440,  # 5: STR Q0, [X2], #16
+            0xD1000863,  # 6: SUB X3, X3, #2
+            0x17FFFFF9,  # 7: B .L_vec_loop (-7 words -> word 0)
+            # .L_tail (word 8):
+            0xF100007F,  # 8: CMP X3, #0
+            0x540000ED,  # 9: B.LE .L_done (+7 words -> word 16)
+            0xFC408400,  # 10: LDR D0, [X0], #8
+            0xFC408421,  # 11: LDR D1, [X1], #8
+            0x1E612800,  # 12: FADD D0, D0, D1
+            0xFC008440,  # 13: STR D0, [X2], #8
+            0xD1000463,  # 14: SUB X3, X3, #1
+            0x17FFFFF9,  # 15: B .L_tail (-7 words -> word 8)
+            # .L_done (word 16):
+            0xD2800020,  # 16: MOVZ X0, #1
+            0xD65F03C0,  # 17: RET
+        ]
+        return b"".join(_a64_u32(w) for w in words)
 
 
 class NativeCodeGenerator:

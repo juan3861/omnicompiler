@@ -83,7 +83,7 @@ _MULTI_CHAR_OPS = (
 _SINGLE_OPS = set("+-*/%&|^~!<>?=:.")
 _PUNCT = set("(){}[],;")
 _FLOAT_ANN_RE = re.compile(
-    r"(?::\s*(?:f64|float64|double)\b|->\s*(?:f64|float64|double)\b|\b(?:f64|float64)\b)"
+    r"(?::\s*(?:f64|float64|double|Float64Array)\b|->\s*(?:f64|float64|double)\b|\b(?:f64|float64|Float64Array)\b)"
 )
 
 
@@ -705,6 +705,14 @@ class _PolyglotParser:
                 angle = max(0, angle - 1)
         if captured in (["f64"], ["float64"], ["double"]):
             return "float"
+        if (
+            captured == ["Float64Array"]
+            or (
+                any(t in ("f64", "float64", "double") for t in captured)
+                and any(t in ("[", "&", "*", "Array", "Slice") for t in captured)
+            )
+        ):
+            return "ptr_f64"
         return None
 
     def _skip_go_type(self, stop_tokens: set) -> Optional[str]:
@@ -727,6 +735,10 @@ class _PolyglotParser:
                 bracket = max(0, bracket - 1)
         if captured in (["float64"], ["f64"], ["double"]):
             return "float"
+        if any(t in ("float64", "f64", "double") for t in captured) and (
+            "[" in captured or "*" in captured
+        ):
+            return "ptr_f64"
         return None
 
     def _make_function_def(
@@ -746,8 +758,8 @@ class _PolyglotParser:
             ast.arg(
                 arg=p,
                 annotation=(
-                    ast.Name(id="float", ctx=ast.Load(), lineno=line)
-                    if pt_map.get(p) == "float"
+                    ast.Name(id=pt_map[p], ctx=ast.Load(), lineno=line)
+                    if pt_map.get(p) in ("float", "ptr_f64")
                     else None
                 ),
             )

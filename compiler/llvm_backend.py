@@ -314,22 +314,32 @@ class LLVMBackend:
                 elif opcode == "load":
                     base_op = ops[0] if len(ops) > 0 else "0"
                     idx_op = ops[1] if len(ops) > 1 else "0"
+                    elem_ty = "double" if res_ty == "double" else "i64"
                     ptr_v = next_aux("ptr")
                     gep_v = next_aux("gep")
                     lines.append(f"    {ptr_v} = inttoptr i64 {base_op} to ptr")
-                    lines.append(f"    {gep_v} = getelementptr i64, ptr {ptr_v}, i64 {idx_op}")
-                    lines.append(f"    {lhs} = load i64, ptr {gep_v}, align 8")
+                    lines.append(f"    {gep_v} = getelementptr {elem_ty}, ptr {ptr_v}, i64 {idx_op}")
+                    lines.append(f"    {lhs} = load {elem_ty}, ptr {gep_v}, align 8")
                     last_val = lhs
 
                 elif opcode == "store":
                     base_op = ops[0] if len(ops) > 0 else "0"
                     idx_op = ops[1] if len(ops) > 1 else "0"
                     val_op = ops[2] if len(ops) > 2 else "0"
+                    raw_val_op = inst.operands[2] if len(inst.operands) > 2 else 0
+                    elem_ty = (
+                        "double"
+                        if (
+                            isinstance(raw_val_op, float)
+                            or (isinstance(raw_val_op, SSAVar) and raw_val_op.var_type == "f64")
+                        )
+                        else "i64"
+                    )
                     ptr_v = next_aux("ptr")
                     gep_v = next_aux("gep")
                     lines.append(f"    {ptr_v} = inttoptr i64 {base_op} to ptr")
-                    lines.append(f"    {gep_v} = getelementptr i64, ptr {ptr_v}, i64 {idx_op}")
-                    lines.append(f"    store i64 {val_op}, ptr {gep_v}, align 8")
+                    lines.append(f"    {gep_v} = getelementptr {elem_ty}, ptr {ptr_v}, i64 {idx_op}")
+                    lines.append(f"    store {elem_ty} {val_op}, ptr {gep_v}, align 8")
 
                 elif opcode == "call":
                     callee = str(inst.operands[0])

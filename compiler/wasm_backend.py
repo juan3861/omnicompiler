@@ -364,18 +364,24 @@ class WasmBackend:
                 elif opcode == "load":
                     base_op = inst.operands[0] if len(inst.operands) > 0 else 0
                     idx_op = inst.operands[1] if len(inst.operands) > 1 else 0
+                    ld_op = "f64.load" if (inst.result is not None and inst.result.var_type == "f64") else "i64.load"
                     wat_lines.append(f"{indent}{emit_operand(base_op)}")
                     wat_lines.append(f"{indent}{emit_operand(idx_op)}")
                     wat_lines.append(f"{indent}i64.const 3")
                     wat_lines.append(f"{indent}i64.shl")
                     wat_lines.append(f"{indent}i64.add")
                     wat_lines.append(f"{indent}i32.wrap_i64")
-                    wat_lines.append(f"{indent}i64.load")
+                    wat_lines.append(f"{indent}{ld_op}")
                     set_result(inst.result, indent)
                 elif opcode == "store":
                     base_op = inst.operands[0] if len(inst.operands) > 0 else 0
                     idx_op = inst.operands[1] if len(inst.operands) > 1 else 0
                     val_op = inst.operands[2] if len(inst.operands) > 2 else 0
+                    st_op = (
+                        "f64.store"
+                        if (isinstance(val_op, float) or (isinstance(val_op, SSAVar) and val_op.var_type == "f64"))
+                        else "i64.store"
+                    )
                     wat_lines.append(f"{indent}{emit_operand(base_op)}")
                     wat_lines.append(f"{indent}{emit_operand(idx_op)}")
                     wat_lines.append(f"{indent}i64.const 3")
@@ -383,7 +389,7 @@ class WasmBackend:
                     wat_lines.append(f"{indent}i64.add")
                     wat_lines.append(f"{indent}i32.wrap_i64")
                     wat_lines.append(f"{indent}{emit_operand(val_op)}")
-                    wat_lines.append(f"{indent}i64.store")
+                    wat_lines.append(f"{indent}{st_op}")
                 elif opcode == "call":
                     callee = str(inst.operands[0])
                     for a in inst.operands[1:]:

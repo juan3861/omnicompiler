@@ -545,6 +545,29 @@ class AstToSsaLowering:
     def _is_float_annotation(ann: Optional[ast.AST]) -> bool:
         return isinstance(ann, ast.Name) and ann.id in ("float", "f64", "float64", "double")
 
+    @classmethod
+    def _is_float_ptr_annotation(cls, ann: Optional[ast.AST]) -> bool:
+        if isinstance(ann, ast.Name) and ann.id in ("ptr_f64", "f64_ptr", "float_ptr", "Float64Array", "double_ptr"):
+            return True
+        if (
+            isinstance(ann, ast.Subscript)
+            and isinstance(ann.value, ast.Name)
+            and ann.value.id in ("ptr", "list", "List", "Sequence")
+            and cls._is_float_annotation(ann.slice)
+        ):
+            return True
+        return False
+
+    def _is_f64_pointer_target(self, expr_node: ast.AST, base_var: SSAVar) -> bool:
+        if base_var.var_type == "ptr_f64":
+            return True
+        if isinstance(expr_node, ast.Name):
+            if self._fn is not None and self._fn.param_types.get(expr_node.id) == "ptr_f64":
+                return True
+            if expr_node.id.endswith(("_f64_ptr", "_f64_buf", "_float_ptr")):
+                return True
+        return False
+
     def _finalize_ssa_types(self, fn: SSAFunction) -> None:
         blk_map = {b.name: b for b in fn.blocks}
         # Propagate f64 type through Phi chains iteratively
@@ -643,7 +666,8 @@ class AstToSsaLowering:
         ]
         params = [arg.arg for arg in func_def.args.args]
         has_float_ann = self._is_float_annotation(func_def.returns) or any(
-            self._is_float_annotation(arg.annotation) for arg in func_def.args.args
+            self._is_float_annotation(arg.annotation) or self._is_float_ptr_annotation(arg.annotation)
+            for arg in func_def.args.args
         )
         has_float_const = any(
             isinstance(n, ast.Constant) and isinstance(n.value, float)
@@ -662,7 +686,9 @@ class AstToSsaLowering:
         param_types: Dict[str, str] = {}
         for arg in func_def.args.args:
             ann = arg.annotation
-            if isinstance(ann, ast.Name) and ann.id in ("ptr", "pointer", "bytes", "list"):
+            if self._is_float_ptr_annotation(ann):
+                param_types[arg.arg] = "ptr_f64"
+            elif isinstance(ann, ast.Name) and ann.id in ("ptr", "pointer", "bytes", "list"):
                 param_types[arg.arg] = "ptr"
             elif self._is_float_annotation(ann):
                 param_types[arg.arg] = "f64"
@@ -776,13 +802,40 @@ class AstToSsaLowering:
             elif isinstance(stmt.target, ast.Subscript):
                 base_var = self._lower_expr(stmt.target.value)
                 idx_var = self._lower_expr(stmt.target.slice)
-                loaded = self._next_var("ld")
-                self._emit(loaded, "call", ["omni_item_get", base_var, idx_var], line=line)
-                rhs_val = self._lower_expr(stmt.value)
-                opcode = self.BINOP_MAP.get(type(stmt.op), "add")
-                res = self._next_var("st_val")
-                self._emit(res, opcode, [loaded, rhs_val], line=line)
-                self._emit(None, "call", ["omni_item_set", base_var, idx_var, res], line=line)
+                is_raw_pointer = (
+                    isinstance(stmt.target.value, ast.Name)
+                    and (
+                        (self._fn is not None and stmt.target.value.id in self._fn.params)
+                        or stmt.target.value.id.endswith("_ptr")
+                        or stmt.target.value.id.endswith("_buf")
+                        or stmt.target.value.id.startswith("buf")
+                        or stmt.target.value.id.startswith("sim_")
+                    )
+                )
+                if is_raw_pointer:
+                    is_f64_ptr = self._is_f64_pointer_target(stmt.target.value, base_var)
+                    loaded = self._next_var("ld", var_type="f64" if is_f64_ptr else "i64")
+                    self._emit(loaded, "load", [base_var, idx_var], line=line)
+                    rhs_val = self._lower_expr(stmt.value)
+                    if loaded.var_type == "f64" or rhs_val.var_type == "f64":
+                        lf = self._promote_to_f64(loaded, line=line)
+                        rf = self._promote_to_f64(rhs_val, line=line)
+                        fop = self.FLOAT_BINOP_MAP.get(type(stmt.op), "fadd")
+                        res = self._next_var("st_val", var_type="f64")
+                        self._emit(res, fop, [lf, rf], line=line)
+                    else:
+                        opcode = self.BINOP_MAP.get(type(stmt.op), "add")
+                        res = self._next_var("st_val")
+                        self._emit(res, opcode, [loaded, rhs_val], line=line)
+                    self._emit(None, "store", [base_var, idx_var, res], line=line)
+                else:
+                    loaded = self._next_var("ld")
+                    self._emit(loaded, "call", ["omni_item_get", base_var, idx_var], line=line)
+                    rhs_val = self._lower_expr(stmt.value)
+                    opcode = self.BINOP_MAP.get(type(stmt.op), "add")
+                    res = self._next_var("st_val")
+                    self._emit(res, opcode, [loaded, rhs_val], line=line)
+                    self._emit(None, "call", ["omni_item_set", base_var, idx_var, res], line=line)
 
         elif isinstance(stmt, ast.If):
             cond_var = self._lower_expr(stmt.test)
@@ -1055,6 +1108,8 @@ class AstToSsaLowering:
                 )
             )
             if is_raw_pointer:
+                if self._is_f64_pointer_target(target.value, base_var) and val.var_type != "f64":
+                    val = self._promote_to_f64(val, line=line)
                 self._emit(None, "store", [base_var, idx_var, val], line=line)
             else:
                 self._emit(None, "call", ["omni_item_set", base_var, idx_var, val], line=line)
@@ -1218,7 +1273,8 @@ class AstToSsaLowering:
                     or node.value.id.startswith("sim_")
                 )
             )
-            res = self._next_var("ld")
+            is_f64_ptr = is_raw_pointer and self._is_f64_pointer_target(node.value, base_var)
+            res = self._next_var("ld", var_type="f64" if is_f64_ptr else "i64")
             if is_raw_pointer:
                 self._emit(res, "load", [base_var, idx_var], line=line)
             else:

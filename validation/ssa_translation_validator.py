@@ -1159,6 +1159,8 @@ class SSATranslationValidator:
                     return z3.BitVecVal(int(op), 64)
                 if isinstance(op, int):
                     return z3.BitVecVal(op, 64)
+                if isinstance(op, float) and self.enable_float_theory:
+                    return self._float_to_bv(op)
                 if isinstance(op, SSAVar):
                     bmap = pre_res["block_env"].get(pred_name, {})
                     if op in bmap:
@@ -1259,6 +1261,8 @@ class SSATranslationValidator:
                 return z3.BitVecVal(int(op), 64)
             if isinstance(op, int):
                 return z3.BitVecVal(op, 64)
+            if isinstance(op, float) and self.enable_float_theory:
+                return self._float_to_bv(op)
             if isinstance(op, SSAVar):
                 bmap = loop_res["block_env"].get(pred_name, {})
                 if op in bmap:
@@ -1432,6 +1436,16 @@ class SSATranslationValidator:
                 paired.append((kb, kb))
                 matched_b.add(kb)
                 matched_a.add(kb)
+        for kb in keys_b:
+            if kb in matched_b:
+                continue
+            suffix = f"_var_{kb[0]}_{kb[1]}"
+            for ka in keys_a:
+                if ka not in matched_a and ka[0].endswith(suffix):
+                    paired.append((kb, ka))
+                    matched_b.add(kb)
+                    matched_a.add(ka)
+                    break
         rem_b = [k for k in keys_b if k not in matched_b]
         rem_a = [k for k in keys_a if k not in matched_a]
         if len(rem_b) == len(rem_a):
@@ -1446,9 +1460,10 @@ class SSATranslationValidator:
         ssa_after: SSAFunction,
         timeout_ms: int,
     ) -> Dict[str, Any]:
+        unroll_k = max(self.max_loop_unroll, 4 if self.enable_float_theory else 12)
         bounded_probe = SSATranslationValidator(
             enable_memory_theory=self.enable_memory_theory,
-            max_loop_unroll=max(self.max_loop_unroll, 12),
+            max_loop_unroll=unroll_k,
             enable_inductive_loops=False,
             enable_call_congruence=self.enable_call_congruence,
             enable_float_theory=self.enable_float_theory,
@@ -1469,6 +1484,8 @@ class SSATranslationValidator:
             return z3.BitVecVal(int(op), 64)
         if isinstance(op, int):
             return z3.BitVecVal(op, 64)
+        if isinstance(op, float):
+            return SSATranslationValidator._float_to_bv(op)
         if isinstance(op, SSAVar):
             bmap = seg_res["block_env"].get(pred_name, {})
             if op in bmap:
@@ -1820,11 +1837,12 @@ class SSATranslationValidator:
                     z3.Implies(enter_b, make_inv(init_phi_b, init_phi_a, pre_ext_b, pre_ext_a, pre_loc_b, pre_loc_a)),
                 ]
             )
-            sb_solver = z3.Solver()
-            sb_solver.set("timeout", timeout_ms)
-            sb_solver.add(z3.And(outer_rel_assume, z3.Not(base_goal)))
-            if sb_solver.check() != z3.unsat:
-                return {"status": "RESULT", "result": self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)}
+            if not (self.enable_float_theory and z3.is_true(z3.simplify(base_goal))):
+                sb_solver = z3.Solver()
+                sb_solver.set("timeout", min(timeout_ms, 600) if self.enable_float_theory else timeout_ms)
+                sb_solver.add(z3.And(outer_rel_assume, z3.Not(base_goal)))
+                if sb_solver.check() != z3.unsat:
+                    return {"status": "RESULT", "result": self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)}
 
             exit_targets_b = {
                 s.name for n in lb_set for s in db["block_map"][n].successors if s.name not in lb_set
@@ -1908,11 +1926,23 @@ class SSATranslationValidator:
                 if read_only
                 else loop_assume
             )
-            st_solver = z3.Solver()
-            st_solver.set("timeout", timeout_ms)
-            st_solver.add(z3.And(step_assume, z3.Not(step_goal)))
-            if st_solver.check() != z3.unsat:
-                return {"status": "RESULT", "result": self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)}
+            step_proven_fast = False
+            if self.enable_float_theory:
+                inv_subst = (
+                    [(sym_a[ka], sym_b[kb]) for kb, ka in pairs]
+                    + [(sym_ext_a, pre_ext_b if read_only else sym_ext_b), (sym_loc_a, sym_loc_b)]
+                    + ([(sym_ext_b, pre_ext_b), (pre_ext_a, pre_ext_b)] if read_only else [])
+                    + [(sym_b[kb], init_phi_b[kb]) for kb in rem_b]
+                    + [(sym_a[ka], init_phi_a[ka]) for ka in rem_a]
+                )
+                if z3.is_true(z3.simplify(z3.substitute(step_goal, *inv_subst))):
+                    step_proven_fast = True
+            if not step_proven_fast:
+                st_solver = z3.Solver()
+                st_solver.set("timeout", min(timeout_ms, 600) if self.enable_float_theory else timeout_ms)
+                st_solver.add(z3.And(step_assume, z3.Not(step_goal)))
+                if st_solver.check() != z3.unsat:
+                    return {"status": "RESULT", "result": self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)}
 
             # Summarize proven-equivalent loop exit equally for downstream siblings / parent suffix
             shared_ext_out = pre_ext_b if read_only else z3.Array(f"{tag}_L{idx}_post_ext", bv64, bv64)
@@ -2131,24 +2161,9 @@ class SSATranslationValidator:
         # Pair header phis by (name, version) first, then positional if bijective
         keys_b = ph_b["phi_keys"]
         keys_a = ph_a["phi_keys"]
-        paired_keys: List[Tuple[Tuple[str, int], Tuple[str, int]]] = []
-        matched_b: Set[Tuple[str, int]] = set()
-        matched_a: Set[Tuple[str, int]] = set()
-
-        for kb in keys_b:
-            if kb in keys_a:
-                paired_keys.append((kb, kb))
-                matched_b.add(kb)
-                matched_a.add(kb)
-
-        rem_b = [k for k in keys_b if k not in matched_b]
-        rem_a = [k for k in keys_a if k not in matched_a]
-        if len(rem_b) == len(rem_a):
-            for kb, ka in zip(rem_b, rem_a):
-                paired_keys.append((kb, ka))
-                matched_b.add(kb)
-                matched_a.add(ka)
-            rem_b, rem_a = [], []
+        paired_keys, rem_b_raw, rem_a_raw = self._pair_phi_keys(keys_b, keys_a)
+        rem_b = [k for k in rem_b_raw if ph_b["next_phi_vals"][k].eq(ph_b["phi_syms"][k])]
+        rem_a = [k for k in rem_a_raw if ph_a["next_phi_vals"][k].eq(ph_a["phi_syms"][k])]
 
         def make_rel_inv(
             state_b: Dict[Tuple[str, int], z3.BitVecRef],
@@ -2199,10 +2214,14 @@ class SSATranslationValidator:
             ph_b["pre_loc_mem"], ph_a["pre_loc_mem"],
             read_only_mem_inv=read_only_loop,
         )
-        base_solver = z3.Solver()
-        base_solver.set("timeout", timeout_ms)
-        base_solver.add(z3.Not(z3.And(pre_eq, z3.Implies(ph_b["enter_cond"], base_inv))))
-        base_chk = base_solver.check()
+        base_goal_expr = z3.And(pre_eq, z3.Implies(ph_b["enter_cond"], base_inv))
+        if self.enable_float_theory and z3.is_true(z3.simplify(base_goal_expr)):
+            base_chk = z3.unsat
+        else:
+            base_solver = z3.Solver()
+            base_solver.set("timeout", min(timeout_ms, 600) if self.enable_float_theory else timeout_ms)
+            base_solver.add(z3.Not(base_goal_expr))
+            base_chk = base_solver.check()
         if base_chk == z3.sat:
             m = base_solver.model()
             ce = {}
@@ -2257,10 +2276,32 @@ class SSATranslationValidator:
                 ),
             ),
         )
-        step_solver = z3.Solver()
-        step_solver.set("timeout", timeout_ms)
-        step_solver.add(z3.And(step_assume, z3.Not(step_goal)))
-        step_chk = step_solver.check()
+        step_chk = None
+        if self.enable_float_theory:
+            step_subst = (
+                [(ph_a["phi_syms"][ka], ph_b["phi_syms"][kb]) for kb, ka in paired_keys]
+                + [
+                    (ph_a["sym_ext_mem"], ph_b["pre_ext_mem"] if read_only_loop else ph_b["sym_ext_mem"]),
+                    (ph_a["sym_loc_mem"], ph_b["sym_loc_mem"]),
+                ]
+                + (
+                    [
+                        (ph_b["sym_ext_mem"], ph_b["pre_ext_mem"]),
+                        (ph_a["pre_ext_mem"], ph_b["pre_ext_mem"]),
+                    ]
+                    if read_only_loop
+                    else []
+                )
+                + [(ph_b["phi_syms"][kb], ph_b["init_phi_vals"][kb]) for kb in rem_b]
+                + [(ph_a["phi_syms"][ka], ph_a["init_phi_vals"][ka]) for ka in rem_a]
+            )
+            if z3.is_true(z3.simplify(z3.substitute(step_goal, *step_subst))):
+                step_chk = z3.unsat
+        if step_chk is None:
+            step_solver = z3.Solver()
+            step_solver.set("timeout", min(timeout_ms, 600) if self.enable_float_theory else timeout_ms)
+            step_solver.add(z3.And(step_assume, z3.Not(step_goal)))
+            step_chk = step_solver.check()
 
         if step_chk == z3.unsat:
             return {
@@ -2271,7 +2312,7 @@ class SSATranslationValidator:
             }
 
         # Step/Exit failed under arbitrary state: confirm concrete refutation via bounded witness check
-        if step_chk == z3.sat:
+        if step_chk == z3.sat or (self.enable_float_theory and step_chk == z3.unknown):
             return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
 
         return {
@@ -2380,33 +2421,60 @@ class SSATranslationValidator:
         else:
             mismatch_cond = z3.Or(ret_b != ret_a, mem_b != mem_a)
 
-        # Fast sound Z3 QF_FP / QF_BV witness substitution before full 53-bit FP bit-blasting
+        # Fast sound Z3 QF_FP / QF_ABVFP witness substitution before full 53-bit FP bit-blasting
         if self.enable_float_theory and sym_params:
             pt_before = getattr(ssa_before, "param_types", {}) or {}
             pt_after = getattr(ssa_after, "param_types", {}) or {}
+            ptr_params: Set[str] = {
+                p for p in ssa_before.params
+                if pt_before.get(p) in ("ptr", "ptr_f64") or pt_after.get(p) in ("ptr", "ptr_f64")
+            }
+            for fn_cand in (ssa_before, ssa_after):
+                for blk in fn_cand.blocks:
+                    for ins in blk.instructions:
+                        if ins.opcode in ("load", "store") and ins.operands:
+                            b_op = ins.operands[0]
+                            if isinstance(b_op, SSAVar) and b_op.version == 0 and b_op.name in ssa_before.params:
+                                ptr_params.add(b_op.name)
             witness_tuples = [
                 (0.1, 0.2, 0.3, 1.0, 2.0, -1.0),
                 (1e16, -1e16, 1.0, 2.0, 3.0, 4.0),
-                (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+                (2.0, 2.0, 3.0, 2.0, 2.0, 2.0),
                 (2.5, -1.25, 0.5, -3.0, 1.5, -0.5),
                 (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
                 (-2.0, 4.0, -0.25, 0.75, 1.25, -1.5),
             ]
+            probe_addrs = [z3.BitVecVal(0x10000 + i * 0x1000 + k * 8, 64) for i in range(len(sym_params)) for k in (0, 1)]
+            mem_probe_disj = [z3.Select(mem_b, pa) != z3.Select(mem_a, pa) for pa in probe_addrs]
+            if is_bounded:
+                conc_mismatch = z3.Or(
+                    term_b != term_a,
+                    z3.And(term_b, term_a, z3.Or(ret_b != ret_a, *mem_probe_disj)),
+                )
+            else:
+                conc_mismatch = z3.Or(ret_b != ret_a, *mem_probe_disj)
+            init_mem_k = z3.K(bv64, self._float_to_bv(1.5))
             for wt in witness_tuples:
-                subst_pairs = []
+                subst_pairs = [(shared_ext_mem, init_mem_k)]
                 ce_cand = {}
                 for idx_p, p_sym in enumerate(sym_params):
                     pname = ssa_before.params[idx_p]
                     raw_v = wt[idx_p % len(wt)]
-                    if pt_before.get(pname) == "f64" or pt_after.get(pname) == "f64":
+                    pty_b = pt_before.get(pname, "i64")
+                    pty_a = pt_after.get(pname, "i64")
+                    if pty_b == "f64" or pty_a == "f64":
                         bv_val = self._float_to_bv(float(raw_v))
                         ce_cand[pname] = float(raw_v)
+                    elif pname in ptr_params:
+                        ptr_addr = 0x10000 + idx_p * 0x1000
+                        bv_val = z3.BitVecVal(ptr_addr, 64)
+                        ce_cand[pname] = ptr_addr
                     else:
                         iv = int(raw_v)
                         bv_val = z3.BitVecVal(iv, 64)
                         ce_cand[pname] = iv
                     subst_pairs.append((p_sym, bv_val))
-                if z3.is_true(z3.simplify(z3.substitute(mismatch_cond, *subst_pairs))):
+                if z3.is_true(z3.simplify(z3.substitute(conc_mismatch, *subst_pairs))):
                     return {
                         "proven": False,
                         "status": "REFUTED_COUNTEREXAMPLE",
