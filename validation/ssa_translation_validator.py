@@ -1442,615 +1442,303 @@ class SSATranslationValidator:
             loc_m = z3.If(ec, seg_res["loc_mem_out"][src], loc_m)
         return ext_m, loc_m
 
-    def _verify_nested_two_level_loops(
+    @staticmethod
+    def _top_level_headers_in_scope(
+        d: Dict[str, Any], scope: Set[str], exclude_headers: Set[str]
+    ) -> List[str]:
+        cand = [h for h in d["headers"] if h in scope and h not in exclude_headers]
+        return [
+            h for h in cand
+            if not any(h != other and h in d["loop_names"][other] for other in cand)
+        ]
+
+    @staticmethod
+    def _group_stop_cond(
+        edges: List[Tuple[str, str, z3.BoolRef]], targets: Set[str]
+    ) -> z3.BoolRef:
+        cs = [ec for (_, dst, ec) in edges if dst in targets]
+        if not cs:
+            return z3.BoolVal(False)
+        return cs[0] if len(cs) == 1 else z3.Or(cs)
+
+    def _verify_loop_sequence_in_region(
         self,
         ssa_before: SSAFunction,
         ssa_after: SSAFunction,
         db: Dict[str, Any],
         da: Dict[str, Any],
         sym_params: List[z3.BitVecRef],
-        shared_ext_mem: z3.ArrayRef,
+        scope_b: Set[str],
+        scope_a: Set[str],
+        exclude_b: Set[str],
+        exclude_a: Set[str],
+        start_pos_b: int,
+        start_pos_a: int,
+        init_reach_b: Dict[str, z3.BoolRef],
+        init_reach_a: Dict[str, z3.BoolRef],
+        init_edges_b: Dict[Tuple[str, str], z3.BoolRef],
+        init_edges_a: Dict[Tuple[str, str], z3.BoolRef],
+        init_edge_ext_b: Dict[str, z3.ArrayRef],
+        init_edge_ext_a: Dict[str, z3.ArrayRef],
+        init_edge_loc_b: Dict[str, z3.ArrayRef],
+        init_edge_loc_a: Dict[str, z3.ArrayRef],
+        default_ext_b: z3.ArrayRef,
+        default_ext_a: z3.ArrayRef,
+        default_loc_b: z3.ArrayRef,
+        default_loc_a: z3.ArrayRef,
+        init_env_b: Dict[SSAVar, z3.BitVecRef],
+        init_env_a: Dict[SSAVar, z3.BitVecRef],
+        init_alloc_b: Dict[SSAVar, z3.BitVecRef],
+        init_alloc_a: Dict[SSAVar, z3.BitVecRef],
+        skip_b: Set[str],
+        skip_a: Set[str],
+        stop_targets_b: Set[str],
+        stop_targets_a: Set[str],
+        allow_allocas: bool,
+        outer_rel_assume: z3.BoolRef,
+        parent_exit_targets_b: Set[str],
+        parent_exit_targets_a: Set[str],
         timeout_ms: int,
-    ) -> Optional[Dict[str, Any]]:
-        hb_out, hb_in = db["headers"][0], db["headers"][1]
-        ha_out, ha_in = da["headers"][0], da["headers"][1]
-        if not (db["loop_names"][hb_in] < db["loop_names"][hb_out]):
-            return None
-        if not (da["loop_names"][ha_in] < da["loop_names"][ha_out]):
-            return None
-
+        tag: str,
+    ) -> Dict[str, Any]:
         bv64 = z3.BitVecSort(64)
         allowed_ops = frozenset(set(self._allowed_opcodes()) | SUPPORTED_Z3_METADATA_OPCODES)
-        init_loc_b = z3.Array(f"loc_nest_init_B_{ssa_before.name}", bv64, bv64)
-        init_loc_a = z3.Array(f"loc_nest_init_A_{ssa_after.name}", bv64, bv64)
+        top_b = self._top_level_headers_in_scope(db, scope_b, exclude_b)
+        top_a = self._top_level_headers_in_scope(da, scope_a, exclude_a)
+        if len(top_b) != len(top_a):
+            return {"status": "FALLBACK"}
 
-        def split_nested(d: Dict[str, Any], h_out: str, h_in: str) -> Optional[Dict[str, Any]]:
-            rpo = d["rpo_blocks"]
-            ridx = d["rpo_idx"]
-            outer_set = d["loop_names"][h_out]
-            inner_set = d["loop_names"][h_in]
-            pre_blocks = [b for b in rpo if ridx[b.name] < ridx[h_out] and b.name not in outer_set]
-            exit_blocks = [b for b in rpo if ridx[b.name] > ridx[h_out] and b.name not in outer_set]
-            out_prefix = [b for b in rpo if b.name in outer_set and b.name not in inner_set and ridx[b.name] < ridx[h_in]]
-            in_blocks = [b for b in rpo if b.name in inner_set]
-            out_suffix = [b for b in rpo if b.name in outer_set and b.name not in inner_set and ridx[b.name] > ridx[h_in]]
-            exit_names = {b.name for b in exit_blocks}
-            # Ensure no backedges jump elsewhere
-            for src_n, dst_n in d["back_edges"]:
-                if dst_n not in (h_out, h_in):
-                    return None
-                if dst_n == h_out and src_n not in outer_set:
-                    return None
-                if dst_n == h_in and src_n not in inner_set:
-                    return None
-            return {
-                "entry": d["entry"],
-                "h_out": d["block_map"][h_out],
-                "h_in": d["block_map"][h_in],
-                "pre_blocks": pre_blocks,
-                "out_prefix": out_prefix,
-                "in_blocks": in_blocks,
-                "out_suffix": out_suffix,
-                "exit_blocks": exit_blocks,
-                "outer_set": outer_set,
-                "inner_set": inner_set,
-                "exit_names": exit_names,
-                "suffix_and_exit_names": {b.name for b in out_suffix} | exit_names,
-            }
-
-        sb = split_nested(db, hb_out, hb_in)
-        sa = split_nested(da, ha_out, ha_in)
-        if sb is None or sa is None:
-            return None
-
-        # 1. Preheader segment -> Outer Header
-        def run_pre(fn: SSAFunction, s: Dict[str, Any], init_loc: z3.ArrayRef):
-            if not s["pre_blocks"]:
-                if s["h_out"].phi_nodes:
-                    return None
-                return {
-                    "enter_cond": z3.BoolVal(True),
-                    "bypass_term": z3.BoolVal(False),
-                    "bypass_ret": z3.BitVecVal(0, 64),
-                    "bypass_mem": shared_ext_mem,
-                    "pre_ext_mem": shared_ext_mem,
-                    "pre_loc_mem": init_loc,
-                    "init_phis": {},
-                    "env": {},
-                    "allocas": {},
+        if not top_b:
+            blocks_b = [
+                b for b in db["rpo_blocks"]
+                if b.name in scope_b and db["rpo_idx"][b.name] >= start_pos_b
+            ]
+            blocks_a = [
+                b for b in da["rpo_blocks"]
+                if b.name in scope_a and da["rpo_idx"][b.name] >= start_pos_a
+            ]
+            if blocks_b:
+                res_b = self._run_dag_segment(
+                    fn=ssa_before, blocks=blocks_b, sym_params=sym_params,
+                    init_env=init_env_b, init_alloca_bases=init_alloc_b,
+                    entry_reach=init_reach_b, entry_edge_conds=init_edges_b,
+                    entry_ext_mem=init_edge_ext_b, entry_loc_mem=init_edge_loc_b,
+                    default_ext_mem=default_ext_b, default_loc_mem=default_loc_b,
+                    stop_targets=stop_targets_b, skip_phi_blocks=skip_b,
+                    allow_allocas=allow_allocas, allowed_ops=allowed_ops,
+                )
+            else:
+                res_b = {
+                    "stopped_edges": [(s, d, ec) for (s, d), ec in init_edges_b.items()],
+                    "ret_cases": [],
+                    "env": dict(init_env_b),
+                    "alloca_bases": dict(init_alloc_b),
+                    "ext_mem_out": dict(init_edge_ext_b),
+                    "loc_mem_out": dict(init_edge_loc_b),
+                    "block_env": {},
+                    "wrote_ext_mem": False,
                 }
-            res = self._run_dag_segment(
-                fn=fn, blocks=s["pre_blocks"], sym_params=sym_params,
-                init_env={}, init_alloca_bases={},
-                entry_reach={s["entry"].name: z3.BoolVal(True)},
-                entry_edge_conds={}, entry_ext_mem={}, entry_loc_mem={},
-                default_ext_mem=shared_ext_mem, default_loc_mem=init_loc,
-                stop_targets={s["h_out"].name}, skip_phi_blocks=set(),
-                allow_allocas=True, allowed_ops=allowed_ops,
-            )
-            if res.get("error"):
-                return None
-            enter_c, edge_map = self._extract_edge_group(res["stopped_edges"], {s["h_out"].name})
-            if enter_c is None:
-                return None
-            init_phis = self._collect_header_phi_values(s["h_out"], edge_map, res)
-            if init_phis is None:
-                return None
-            pre_ext, pre_loc = self._merge_pred_mem(res, edge_map)
-            b_term, b_ret, b_mem = self._combine_ret_cases(res["ret_cases"], shared_ext_mem)
-            return {
-                "enter_cond": enter_c,
-                "bypass_term": b_term,
-                "bypass_ret": b_ret,
-                "bypass_mem": b_mem,
-                "pre_ext_mem": pre_ext,
-                "pre_loc_mem": pre_loc,
-                "init_phis": init_phis,
-                "env": res["env"],
-                "allocas": res["alloca_bases"],
-            }
-
-        pre_b = run_pre(ssa_before, sb, init_loc_b)
-        pre_a = run_pre(ssa_after, sa, init_loc_a)
-        if pre_b is None or pre_a is None:
-            return None
-
-        out_pairs, out_rem_b, out_rem_a = self._pair_phi_keys(
-            list(pre_b["init_phis"].keys()), list(pre_a["init_phis"].keys())
-        )
-
-        # Symbolic outer header phis & memory
-        sym_out_b = {k: z3.BitVec(f"nest_out_B_{k[0]}_{k[1]}", 64) for k in pre_b["init_phis"]}
-        sym_out_a = {k: z3.BitVec(f"nest_out_A_{k[0]}_{k[1]}", 64) for k in pre_a["init_phis"]}
-        sym_out_ext_b = z3.Array("nest_out_ext_B", bv64, bv64)
-        sym_out_ext_a = z3.Array("nest_out_ext_A", bv64, bv64)
-        sym_out_loc_b = z3.Array("nest_out_loc_B", bv64, bv64)
-        sym_out_loc_a = z3.Array("nest_out_loc_A", bv64, bv64)
-
-        def make_out_inv(sb_map, sa_map, mb, ma, lb, la) -> z3.BoolRef:
-            cl = [mb == ma]
-            if len(pre_b["allocas"]) == len(pre_a["allocas"]) and len(pre_b["allocas"]) > 0:
-                cl.append(lb == la)
-            for kb, ka in out_pairs:
-                cl.append(sb_map[kb] == sa_map[ka])
-            for kb in out_rem_b:
-                cl.append(sb_map[kb] == pre_b["init_phis"][kb])
-            for ka in out_rem_a:
-                cl.append(sa_map[ka] == pre_a["init_phis"][ka])
-            return z3.And(cl)
-
-        # 2. Run Outer Prefix up to Inner Header (and Outer Exit)
-        def run_out_prefix(fn: SSAFunction, s: Dict[str, Any], pre: Dict[str, Any], sym_phi: Dict[Tuple[str, int], z3.BitVecRef], sym_ext: z3.ArrayRef, sym_loc: z3.ArrayRef):
-            init_env = dict(pre["env"])
-            for phi in s["h_out"].phi_nodes:
-                init_env[phi.result] = sym_phi[(phi.result.name, phi.result.version)]
-            res = self._run_dag_segment(
-                fn=fn, blocks=s["out_prefix"], sym_params=sym_params,
-                init_env=init_env, init_alloca_bases=pre["allocas"],
-                entry_reach={s["h_out"].name: z3.BoolVal(True)},
-                entry_edge_conds={}, entry_ext_mem={}, entry_loc_mem={},
-                default_ext_mem=sym_ext, default_loc_mem=sym_loc,
-                stop_targets={s["h_in"].name} | s["exit_names"],
-                skip_phi_blocks={s["h_out"].name},
-                allow_allocas=False, allowed_ops=allowed_ops,
-            )
-            if res.get("error"):
-                return None
-            return res
-
-        pref_b = run_out_prefix(ssa_before, sb, pre_b, sym_out_b, sym_out_ext_b, sym_out_loc_b)
-        pref_a = run_out_prefix(ssa_after, sa, pre_a, sym_out_a, sym_out_ext_a, sym_out_loc_a)
-        if pref_b is None or pref_a is None:
-            return None
-
-        in_enter_b, in_pre_edges_b = self._extract_edge_group(pref_b["stopped_edges"], {sb["h_in"].name})
-        in_enter_a, in_pre_edges_a = self._extract_edge_group(pref_a["stopped_edges"], {sa["h_in"].name})
-        if in_enter_b is None or in_enter_a is None:
-            return None
-
-        init_in_b = self._collect_header_phi_values(sb["h_in"], in_pre_edges_b, pref_b)
-        init_in_a = self._collect_header_phi_values(sa["h_in"], in_pre_edges_a, pref_a)
-        if init_in_b is None or init_in_a is None:
-            return None
-
-        pre_in_ext_b, pre_in_loc_b = self._merge_pred_mem(pref_b, in_pre_edges_b)
-        pre_in_ext_a, pre_in_loc_a = self._merge_pred_mem(pref_a, in_pre_edges_a)
-
-        in_pairs, in_rem_b, in_rem_a = self._pair_phi_keys(list(init_in_b.keys()), list(init_in_a.keys()))
-
-        # 3. Inner Loop Symbolic Step Execution
-        sym_in_b = {k: z3.BitVec(f"nest_in_B_{k[0]}_{k[1]}", 64) for k in init_in_b}
-        sym_in_a = {k: z3.BitVec(f"nest_in_A_{k[0]}_{k[1]}", 64) for k in init_in_a}
-        sym_in_ext_b = z3.Array("nest_in_ext_B", bv64, bv64)
-        sym_in_ext_a = z3.Array("nest_in_ext_A", bv64, bv64)
-        sym_in_loc_b = z3.Array("nest_in_loc_B", bv64, bv64)
-        sym_in_loc_a = z3.Array("nest_in_loc_A", bv64, bv64)
-
-        def run_in_body(fn: SSAFunction, s: Dict[str, Any], pref: Dict[str, Any], pre: Dict[str, Any], sym_in: Dict[Tuple[str, int], z3.BitVecRef], sym_ext: z3.ArrayRef, sym_loc: z3.ArrayRef):
-            init_env = dict(pref["env"])
-            for phi in s["h_in"].phi_nodes:
-                init_env[phi.result] = sym_in[(phi.result.name, phi.result.version)]
-            res = self._run_dag_segment(
-                fn=fn, blocks=s["in_blocks"], sym_params=sym_params,
-                init_env=init_env, init_alloca_bases=pre["allocas"],
-                entry_reach={s["h_in"].name: z3.BoolVal(True)},
-                entry_edge_conds={}, entry_ext_mem={}, entry_loc_mem={},
-                default_ext_mem=sym_ext, default_loc_mem=sym_loc,
-                stop_targets={s["h_in"].name} | s["suffix_and_exit_names"],
-                skip_phi_blocks={s["h_in"].name},
-                allow_allocas=False, allowed_ops=allowed_ops,
-            )
-            if res.get("error"):
-                return None
-            return res
-
-        in_body_b = run_in_body(ssa_before, sb, pref_b, pre_b, sym_in_b, sym_in_ext_b, sym_in_loc_b)
-        in_body_a = run_in_body(ssa_after, sa, pref_a, pre_a, sym_in_a, sym_in_ext_a, sym_in_loc_a)
-        if in_body_b is None or in_body_a is None:
-            return None
-
-        in_cont_b, in_back_edges_b = self._extract_edge_group(in_body_b["stopped_edges"], {sb["h_in"].name})
-        in_cont_a, in_back_edges_a = self._extract_edge_group(in_body_a["stopped_edges"], {sa["h_in"].name})
-        if in_cont_b is None or in_cont_a is None:
-            return None
-
-        next_in_b = self._collect_header_phi_values(sb["h_in"], in_back_edges_b, in_body_b)
-        next_in_a = self._collect_header_phi_values(sa["h_in"], in_back_edges_a, in_body_a)
-        if next_in_b is None or next_in_a is None:
-            return None
-
-        next_in_ext_b, next_in_loc_b = self._merge_pred_mem(in_body_b, in_back_edges_b)
-        next_in_ext_a, next_in_loc_a = self._merge_pred_mem(in_body_a, in_back_edges_a)
-        in_early_tb, in_early_rb, in_early_mb = self._combine_ret_cases(in_body_b["ret_cases"], sym_in_ext_b)
-        in_early_ta, in_early_ra, in_early_ma = self._combine_ret_cases(in_body_a["ret_cases"], sym_in_ext_a)
-
-        in_leave_b, in_exit_edges_b = self._extract_edge_group(in_body_b["stopped_edges"], sb["suffix_and_exit_names"])
-        in_leave_a, in_exit_edges_a = self._extract_edge_group(in_body_a["stopped_edges"], sa["suffix_and_exit_names"])
-        if in_leave_b is None:
-            in_leave_b = z3.BoolVal(False)
-        if in_leave_a is None:
-            in_leave_a = z3.BoolVal(False)
-
-        in_read_only = (not in_body_b["wrote_ext_mem"]) and (not in_body_a["wrote_ext_mem"])
-
-        def make_in_inv(ib, ia, mb, ma, lb, la) -> z3.BoolRef:
-            cl = [mb == ma]
-            if len(pre_b["allocas"]) == len(pre_a["allocas"]) and len(pre_b["allocas"]) > 0:
-                cl.append(lb == la)
-            for kb, ka in in_pairs:
-                cl.append(ib[kb] == ia[ka])
-            for kb in in_rem_b:
-                cl.append(ib[kb] == init_in_b[kb])
-            for ka in in_rem_a:
-                cl.append(ia[ka] == init_in_a[ka])
-            if in_read_only:
-                cl.append(mb == pre_in_ext_b)
-                cl.append(ma == pre_in_ext_a)
-            return z3.And(cl)
-
-        # Obligation A: Outer Preheader + Outer Base
-        out_base_assume = z3.And(
-            pre_b["enter_cond"] == pre_a["enter_cond"],
-            z3.Implies(
-                z3.Not(pre_b["enter_cond"]),
-                z3.And(
-                    pre_b["bypass_term"] == pre_a["bypass_term"],
-                    z3.Implies(
-                        pre_b["bypass_term"],
-                        z3.And(
-                            pre_b["bypass_ret"] == pre_a["bypass_ret"],
-                            pre_b["bypass_mem"] == pre_a["bypass_mem"],
-                        ),
-                    ),
-                ),
-            ),
-            z3.Implies(
-                pre_b["enter_cond"],
-                make_out_inv(
-                    pre_b["init_phis"], pre_a["init_phis"],
-                    pre_b["pre_ext_mem"], pre_a["pre_ext_mem"],
-                    pre_b["pre_loc_mem"], pre_a["pre_loc_mem"],
-                ),
-            ),
-        )
-        s_base = z3.Solver()
-        s_base.set("timeout", timeout_ms)
-        s_base.add(z3.Not(out_base_assume))
-        if s_base.check() != z3.unsat:
-            return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
-
-        # Obligation B: Outer Inv => (Inner Entry Lockstep & Inner Base) AND (Outer+Inner Inv => Inner Step)
-        outer_rel_assume = make_out_inv(sym_out_b, sym_out_a, sym_out_ext_b, sym_out_ext_a, sym_out_loc_b, sym_out_loc_a)
-        in_base_goal = z3.And(
-            in_enter_b == in_enter_a,
-            z3.Implies(
-                in_enter_b,
-                make_in_inv(init_in_b, init_in_a, pre_in_ext_b, pre_in_ext_a, pre_in_loc_b, pre_in_loc_a),
-            ),
-        )
-        s_in_base = z3.Solver()
-        s_in_base.set("timeout", timeout_ms)
-        s_in_base.add(z3.And(outer_rel_assume, z3.Not(in_base_goal)))
-        if s_in_base.check() != z3.unsat:
-            return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
-
-        in_step_assume = z3.And(
-            outer_rel_assume,
-            in_enter_b,
-            make_in_inv(sym_in_b, sym_in_a, sym_in_ext_b, sym_in_ext_a, sym_in_loc_b, sym_in_loc_a),
-        )
-        in_step_goal = z3.And(
-            in_cont_b == in_cont_a,
-            in_early_tb == in_early_ta,
-            z3.Implies(
-                in_early_tb,
-                z3.And(in_early_rb == in_early_ra, in_early_mb == in_early_ma),
-            ),
-            z3.Implies(
-                in_cont_b,
-                make_in_inv(next_in_b, next_in_a, next_in_ext_b, next_in_ext_a, next_in_loc_b, next_in_loc_a),
-            ),
-            in_leave_b == in_leave_a,
-        )
-        s_in_step = z3.Solver()
-        s_in_step.set("timeout", timeout_ms)
-        s_in_step.add(z3.And(in_step_assume, z3.Not(in_step_goal)))
-        if s_in_step.check() != z3.unsat:
-            return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
-
-        # 4. Inner Loop Proven Equivalent -> Summarize post-inner exit state equally into Outer Suffix!
-        shared_post_in_ext = pre_in_ext_b if in_read_only else z3.Array("nest_post_in_ext", bv64, bv64)
-        shared_post_in_ext_a = pre_in_ext_a if in_read_only else shared_post_in_ext
-        no_loc = (len(pre_b["allocas"]) == 0 and len(pre_a["allocas"]) == 0)
-        shared_post_in_loc = pre_in_loc_b if no_loc else z3.Array("nest_post_in_loc", bv64, bv64)
-        shared_post_in_loc_a = pre_in_loc_a if no_loc else shared_post_in_loc
-
-        post_in_syms_b: Dict[Tuple[str, int], z3.BitVecRef] = {}
-        post_in_syms_a: Dict[Tuple[str, int], z3.BitVecRef] = {}
-        for idx_p, (kb, ka) in enumerate(in_pairs):
-            sv = z3.BitVec(f"nest_post_in_{idx_p}_{kb[0]}_{kb[1]}", 64)
-            post_in_syms_b[kb] = sv
-            post_in_syms_a[ka] = sv
-        for kb in in_rem_b:
-            post_in_syms_b[kb] = init_in_b[kb]
-        for ka in in_rem_a:
-            post_in_syms_a[ka] = init_in_a[ka]
-
-        def run_out_suffix_and_exit(
-            fn: SSAFunction,
-            s: Dict[str, Any],
-            pre: Dict[str, Any],
-            pref: Dict[str, Any],
-            post_in_syms: Dict[Tuple[str, int], z3.BitVecRef],
-            post_ext: z3.ArrayRef,
-            post_loc: z3.ArrayRef,
-            in_exit_edges: Dict[Tuple[str, str], z3.BoolRef],
-            sym_out_ext: z3.ArrayRef,
-            sym_out_loc: z3.ArrayRef,
-        ):
-            suf_env = dict(pref["env"])
-            for phi in s["h_in"].phi_nodes:
-                suf_env[phi.result] = post_in_syms[(phi.result.name, phi.result.version)]
-            # Collapse inner-exit edges conditioned on `in_enter` (since `leave` happens only when `in` was entered)
-            suf_edges = {e: z3.BoolVal(True) for e in in_exit_edges.keys() if e[1] in {b.name for b in s["out_suffix"]}}
-            suf_reach: Dict[str, z3.BoolRef] = {}
-            suf_ext = {src: post_ext for (src, _) in suf_edges.keys()}
-            suf_loc = {src: post_loc for (src, _) in suf_edges.keys()}
-
-            if s["out_suffix"] and suf_edges:
-                suf_res = self._run_dag_segment(
-                    fn=fn, blocks=s["out_suffix"], sym_params=sym_params,
-                    init_env=suf_env, init_alloca_bases=pre["allocas"],
-                    entry_reach=suf_reach, entry_edge_conds=suf_edges,
-                    entry_ext_mem=suf_ext, entry_loc_mem=suf_loc,
-                    default_ext_mem=post_ext, default_loc_mem=post_loc,
-                    stop_targets={s["h_out"].name} | s["exit_names"],
-                    skip_phi_blocks=set(), allow_allocas=False, allowed_ops=allowed_ops,
+            if blocks_a:
+                res_a = self._run_dag_segment(
+                    fn=ssa_after, blocks=blocks_a, sym_params=sym_params,
+                    init_env=init_env_a, init_alloca_bases=init_alloc_a,
+                    entry_reach=init_reach_a, entry_edge_conds=init_edges_a,
+                    entry_ext_mem=init_edge_ext_a, entry_loc_mem=init_edge_loc_a,
+                    default_ext_mem=default_ext_a, default_loc_mem=default_loc_a,
+                    stop_targets=stop_targets_a, skip_phi_blocks=skip_a,
+                    allow_allocas=allow_allocas, allowed_ops=allowed_ops,
                 )
-                if suf_res.get("error"):
-                    return None
-                back_c, back_edges_out = self._extract_edge_group(suf_res["stopped_edges"], {s["h_out"].name})
-                if back_c is None:
-                    return None
-                # Actual continue cond of outer loop requires entering inner & completing suffix back to h_out
-                actual_back_edges = {k: z3.And(in_enter_b if fn is ssa_before else in_enter_a, v) for k, v in back_edges_out.items()}
-                next_out = self._collect_header_phi_values(s["h_out"], actual_back_edges, suf_res)
-                if next_out is None:
-                    return None
-                next_out_ext, next_out_loc = self._merge_pred_mem(suf_res, actual_back_edges)
-                early_t, early_r, early_m = self._combine_ret_cases(suf_res["ret_cases"], post_ext)
             else:
-                return None
-
-            # Outer exits: combine exit edges from out_prefix & out_suffix
-            leave_conds: List[z3.BoolRef] = []
-            exit_edge_conds: Dict[Tuple[str, str], z3.BoolRef] = {}
-            exit_ext: Dict[str, z3.ArrayRef] = {}
-            exit_loc: Dict[str, z3.ArrayRef] = {}
-            for src_n, dst_n, ec in pref["stopped_edges"]:
-                if dst_n in s["exit_names"]:
-                    leave_conds.append(ec)
-                    prev = exit_edge_conds.get((src_n, dst_n))
-                    exit_edge_conds[(src_n, dst_n)] = ec if prev is None else z3.Or(prev, ec)
-                    exit_ext[src_n] = pref["ext_mem_out"][src_n]
-                    exit_loc[src_n] = pref["loc_mem_out"][src_n]
-            for src_n, dst_n, ec in suf_res["stopped_edges"]:
-                if dst_n in s["exit_names"]:
-                    c_eff = z3.And(in_enter_b if fn is ssa_before else in_enter_a, ec)
-                    leave_conds.append(c_eff)
-                    prev = exit_edge_conds.get((src_n, dst_n))
-                    exit_edge_conds[(src_n, dst_n)] = c_eff if prev is None else z3.Or(prev, c_eff)
-                    exit_ext[src_n] = suf_res["ext_mem_out"][src_n]
-                    exit_loc[src_n] = suf_res["loc_mem_out"][src_n]
-
-            leave_c = z3.BoolVal(False) if not leave_conds else (leave_conds[0] if len(leave_conds) == 1 else z3.Or(leave_conds))
-            if s["exit_blocks"] and exit_edge_conds:
-                exit_env = dict(pref["env"])
-                exit_env.update(suf_res["env"])
-                ex_res = self._run_dag_segment(
-                    fn=fn, blocks=s["exit_blocks"], sym_params=sym_params,
-                    init_env=exit_env, init_alloca_bases=pre["allocas"],
-                    entry_reach={}, entry_edge_conds=exit_edge_conds,
-                    entry_ext_mem=exit_ext, entry_loc_mem=exit_loc,
-                    default_ext_mem=sym_out_ext, default_loc_mem=sym_out_loc,
-                    stop_targets=set(), skip_phi_blocks=set(),
-                    allow_allocas=False, allowed_ops=allowed_ops,
-                )
-                if ex_res.get("error"):
-                    return None
-                ex_t, ex_r, ex_m = self._combine_ret_cases(ex_res["ret_cases"], sym_out_ext)
-            else:
-                ex_t, ex_r, ex_m = z3.BoolVal(False), z3.BitVecVal(0, 64), sym_out_ext
-
+                res_a = {
+                    "stopped_edges": [(s, d, ec) for (s, d), ec in init_edges_a.items()],
+                    "ret_cases": [],
+                    "env": dict(init_env_a),
+                    "alloca_bases": dict(init_alloc_a),
+                    "ext_mem_out": dict(init_edge_ext_a),
+                    "loc_mem_out": dict(init_edge_loc_a),
+                    "block_env": {},
+                    "wrote_ext_mem": False,
+                }
+            if res_b.get("error") or res_a.get("error"):
+                return {"status": "FALLBACK"}
             return {
-                "cont": z3.And(in_enter_b if fn is ssa_before else in_enter_a, back_c),
-                "next_phis": next_out,
-                "next_ext": next_out_ext,
-                "next_loc": next_out_loc,
-                "early_term": early_t,
-                "early_ret": early_r,
-                "early_mem": early_m,
-                "leave": leave_c,
-                "exit_term": ex_t,
-                "exit_ret": ex_r,
-                "exit_mem": ex_m,
+                "status": "OK",
+                "res_b": res_b,
+                "res_a": res_a,
+                "wrote_ext_mem": bool(res_b["wrote_ext_mem"] or res_a["wrote_ext_mem"]),
             }
 
-        end_b = run_out_suffix_and_exit(
-            ssa_before, sb, pre_b, pref_b, post_in_syms_b,
-            shared_post_in_ext, shared_post_in_loc, in_exit_edges_b, sym_out_ext_b, sym_out_loc_b
-        )
-        end_a = run_out_suffix_and_exit(
-            ssa_after, sa, pre_a, pref_a, post_in_syms_a,
-            shared_post_in_ext_a, shared_post_in_loc_a, in_exit_edges_a, sym_out_ext_a, sym_out_loc_a
-        )
-        if end_b is None or end_a is None:
-            return None
+        cur_pos_b, cur_pos_a = start_pos_b, start_pos_a
+        seen_b: Set[str] = set()
+        seen_a: Set[str] = set()
+        cur_reach_b, cur_reach_a = dict(init_reach_b), dict(init_reach_a)
+        cur_edges_b, cur_edges_a = dict(init_edges_b), dict(init_edges_a)
+        cur_edge_ext_b, cur_edge_ext_a = dict(init_edge_ext_b), dict(init_edge_ext_a)
+        cur_edge_loc_b, cur_edge_loc_a = dict(init_edge_loc_b), dict(init_edge_loc_a)
+        cur_ext_b, cur_ext_a = default_ext_b, default_ext_a
+        cur_loc_b, cur_loc_a = default_loc_b, default_loc_a
+        cur_env_b, cur_env_a = dict(init_env_b), dict(init_env_a)
+        cur_alloc_b, cur_alloc_a = dict(init_alloc_b), dict(init_alloc_a)
+        cur_skip_b, cur_skip_a = set(skip_b), set(skip_a)
+        cur_allow_allocas = allow_allocas
 
-        out_step_goal = z3.And(
-            end_b["cont"] == end_a["cont"],
-            end_b["early_term"] == end_a["early_term"],
-            z3.Implies(
-                end_b["early_term"],
-                z3.And(end_b["early_ret"] == end_a["early_ret"], end_b["early_mem"] == end_a["early_mem"]),
-            ),
-            z3.Implies(
-                end_b["cont"],
-                make_out_inv(
-                    end_b["next_phis"], end_a["next_phis"],
-                    end_b["next_ext"], end_a["next_ext"],
-                    end_b["next_loc"], end_a["next_loc"],
-                ),
-            ),
-            end_b["leave"] == end_a["leave"],
-            z3.Implies(
-                end_b["leave"],
-                z3.And(
-                    end_b["exit_term"] == end_a["exit_term"],
-                    z3.Implies(
-                        end_b["exit_term"],
-                        z3.And(end_b["exit_ret"] == end_a["exit_ret"], end_b["exit_mem"] == end_a["exit_mem"]),
-                    ),
-                ),
-            ),
-        )
-        s_out_step = z3.Solver()
-        s_out_step.set("timeout", timeout_ms)
-        s_out_step.add(z3.And(outer_rel_assume, z3.Not(out_step_goal)))
-        if s_out_step.check() == z3.unsat:
-            return {
-                "proven": True,
-                "status": "PROVEN_INDUCTIVE_EQUIVALENT",
-                "counterexample": None,
-                "bounded": False,
-            }
-        return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
+        accum_stopped_b: List[Tuple[str, str, z3.BoolRef]] = []
+        accum_stopped_a: List[Tuple[str, str, z3.BoolRef]] = []
+        accum_rets_b: List[Tuple[z3.BoolRef, z3.BitVecRef, z3.ArrayRef]] = []
+        accum_rets_a: List[Tuple[z3.BoolRef, z3.BitVecRef, z3.ArrayRef]] = []
+        accum_ext_out_b: Dict[str, z3.ArrayRef] = {}
+        accum_ext_out_a: Dict[str, z3.ArrayRef] = {}
+        accum_loc_out_b: Dict[str, z3.ArrayRef] = {}
+        accum_loc_out_a: Dict[str, z3.ArrayRef] = {}
+        accum_benv_b: Dict[str, Dict[SSAVar, z3.BitVecRef]] = {}
+        accum_benv_a: Dict[str, Dict[SSAVar, z3.BitVecRef]] = {}
+        accum_wrote_ext = False
 
-    def _verify_sequential_multi_loops(
-        self,
-        ssa_before: SSAFunction,
-        ssa_after: SSAFunction,
-        db: Dict[str, Any],
-        da: Dict[str, Any],
-        sym_params: List[z3.BitVecRef],
-        shared_ext_mem: z3.ArrayRef,
-        timeout_ms: int,
-    ) -> Optional[Dict[str, Any]]:
-        hb_list = db["headers"]
-        ha_list = da["headers"]
-        if len(hb_list) != len(ha_list):
-            return None
-        for i in range(len(hb_list)):
-            for j in range(i + 1, len(hb_list)):
-                if not db["loop_names"][hb_list[i]].isdisjoint(db["loop_names"][hb_list[j]]):
-                    return None
-                if not da["loop_names"][ha_list[i]].isdisjoint(da["loop_names"][ha_list[j]]):
-                    return None
+        for idx, (hb, ha) in enumerate(zip(top_b, top_a)):
+            hb_idx, ha_idx = db["rpo_idx"][hb], da["rpo_idx"][ha]
+            lb_set, la_set = db["loop_names"][hb], da["loop_names"][ha]
+            hb_blk, ha_blk = db["block_map"][hb], da["block_map"][ha]
 
-        bv64 = z3.BitVecSort(64)
-        allowed_ops = frozenset(set(self._allowed_opcodes()) | SUPPORTED_Z3_METADATA_OPCODES)
-        init_loc_b = z3.Array(f"loc_seq_init_B_{ssa_before.name}", bv64, bv64)
-        init_loc_a = z3.Array(f"loc_seq_init_A_{ssa_after.name}", bv64, bv64)
-
-        cur_reach_b = {db["entry"].name: z3.BoolVal(True)}
-        cur_reach_a = {da["entry"].name: z3.BoolVal(True)}
-        cur_edges_b: Dict[Tuple[str, str], z3.BoolRef] = {}
-        cur_edges_a: Dict[Tuple[str, str], z3.BoolRef] = {}
-        cur_edge_ext_b: Dict[str, z3.ArrayRef] = {}
-        cur_edge_ext_a: Dict[str, z3.ArrayRef] = {}
-        cur_edge_loc_b: Dict[str, z3.ArrayRef] = {}
-        cur_edge_loc_a: Dict[str, z3.ArrayRef] = {}
-        cur_ext_b, cur_ext_a = shared_ext_mem, shared_ext_mem
-        cur_loc_b, cur_loc_a = init_loc_b, init_loc_a
-        cur_env_b: Dict[SSAVar, z3.BitVecRef] = {}
-        cur_env_a: Dict[SSAVar, z3.BitVecRef] = {}
-        cur_alloc_b: Dict[SSAVar, z3.BitVecRef] = {}
-        cur_alloc_a: Dict[SSAVar, z3.BitVecRef] = {}
-        prev_pos_b = -1
-        prev_pos_a = -1
-        seen_loops_b: Set[str] = set()
-        seen_loops_a: Set[str] = set()
-
-        for idx, (hb, ha) in enumerate(zip(hb_list, ha_list)):
-            hb_idx = db["rpo_idx"][hb]
-            ha_idx = da["rpo_idx"][ha]
-            loop_b_set = db["loop_names"][hb]
-            loop_a_set = da["loop_names"][ha]
             pre_blocks_b = [
                 b for b in db["rpo_blocks"]
-                if prev_pos_b < db["rpo_idx"][b.name] < hb_idx
-                and b.name not in loop_b_set
-                and b.name not in seen_loops_b
+                if b.name in scope_b
+                and cur_pos_b <= db["rpo_idx"][b.name] < hb_idx
+                and b.name not in lb_set
+                and b.name not in seen_b
             ]
             pre_blocks_a = [
                 b for b in da["rpo_blocks"]
-                if prev_pos_a < da["rpo_idx"][b.name] < ha_idx
-                and b.name not in loop_a_set
-                and b.name not in seen_loops_a
+                if b.name in scope_a
+                and cur_pos_a <= da["rpo_idx"][b.name] < ha_idx
+                and b.name not in la_set
+                and b.name not in seen_a
             ]
 
-            # Bridge / preheader up to loop idx header
-            pre_res_b = self._run_dag_segment(
-                fn=ssa_before, blocks=pre_blocks_b, sym_params=sym_params,
-                init_env=cur_env_b, init_alloca_bases=cur_alloc_b,
-                entry_reach=cur_reach_b, entry_edge_conds=cur_edges_b,
-                entry_ext_mem=cur_edge_ext_b, entry_loc_mem=cur_edge_loc_b,
-                default_ext_mem=cur_ext_b, default_loc_mem=cur_loc_b,
-                stop_targets={hb}, skip_phi_blocks=set(),
-                allow_allocas=(idx == 0), allowed_ops=allowed_ops,
+            def run_pre_seg(fn, blocks, reach, edges, eext, eloc, dext, dloc, env, alloc, skip, allow_al, hname, stops):
+                if blocks:
+                    r = self._run_dag_segment(
+                        fn=fn, blocks=blocks, sym_params=sym_params,
+                        init_env=env, init_alloca_bases=alloc,
+                        entry_reach=reach, entry_edge_conds=edges,
+                        entry_ext_mem=eext, entry_loc_mem=eloc,
+                        default_ext_mem=dext, default_loc_mem=dloc,
+                        stop_targets={hname} | stops, skip_phi_blocks=skip,
+                        allow_allocas=allow_al, allowed_ops=allowed_ops,
+                    )
+                    if r.get("error"):
+                        return None
+                    return r
+                return {
+                    "stopped_edges": [(s, d, ec) for (s, d), ec in edges.items()],
+                    "ret_cases": [],
+                    "env": dict(env),
+                    "alloca_bases": dict(alloc),
+                    "ext_mem_out": dict(eext),
+                    "loc_mem_out": dict(eloc),
+                    "block_env": {},
+                    "wrote_ext_mem": False,
+                }
+
+            pre_res_b = run_pre_seg(
+                ssa_before, pre_blocks_b, cur_reach_b, cur_edges_b, cur_edge_ext_b, cur_edge_loc_b,
+                cur_ext_b, cur_loc_b, cur_env_b, cur_alloc_b, cur_skip_b, cur_allow_allocas, hb, stop_targets_b
             )
-            pre_res_a = self._run_dag_segment(
-                fn=ssa_after, blocks=pre_blocks_a, sym_params=sym_params,
-                init_env=cur_env_a, init_alloca_bases=cur_alloc_a,
-                entry_reach=cur_reach_a, entry_edge_conds=cur_edges_a,
-                entry_ext_mem=cur_edge_ext_a, entry_loc_mem=cur_edge_loc_a,
-                default_ext_mem=cur_ext_a, default_loc_mem=cur_loc_a,
-                stop_targets={ha}, skip_phi_blocks=set(),
-                allow_allocas=(idx == 0), allowed_ops=allowed_ops,
+            pre_res_a = run_pre_seg(
+                ssa_after, pre_blocks_a, cur_reach_a, cur_edges_a, cur_edge_ext_a, cur_edge_loc_a,
+                cur_ext_a, cur_loc_a, cur_env_a, cur_alloc_a, cur_skip_a, cur_allow_allocas, ha, stop_targets_a
             )
-            if pre_res_b.get("error") or pre_res_a.get("error"):
-                return None
+            if pre_res_b is None or pre_res_a is None:
+                return {"status": "FALLBACK"}
+
+            if pre_res_b["wrote_ext_mem"] or pre_res_a["wrote_ext_mem"]:
+                accum_wrote_ext = True
+
+            for src_n, dst_n, ec in pre_res_b["stopped_edges"]:
+                if dst_n in stop_targets_b:
+                    accum_stopped_b.append((src_n, dst_n, ec))
+                    if src_n in pre_res_b["ext_mem_out"]:
+                        accum_ext_out_b[src_n] = pre_res_b["ext_mem_out"][src_n]
+                        accum_loc_out_b[src_n] = pre_res_b["loc_mem_out"][src_n]
+                    if src_n in pre_res_b["block_env"]:
+                        accum_benv_b[src_n] = pre_res_b["block_env"][src_n]
+            for src_n, dst_n, ec in pre_res_a["stopped_edges"]:
+                if dst_n in stop_targets_a:
+                    accum_stopped_a.append((src_n, dst_n, ec))
+                    if src_n in pre_res_a["ext_mem_out"]:
+                        accum_ext_out_a[src_n] = pre_res_a["ext_mem_out"][src_n]
+                        accum_loc_out_a[src_n] = pre_res_a["loc_mem_out"][src_n]
+                    if src_n in pre_res_a["block_env"]:
+                        accum_benv_a[src_n] = pre_res_a["block_env"][src_n]
+            accum_rets_b.extend(pre_res_b["ret_cases"])
+            accum_rets_a.extend(pre_res_a["ret_cases"])
 
             enter_b, pre_em_b = self._extract_edge_group(pre_res_b["stopped_edges"], {hb})
             enter_a, pre_em_a = self._extract_edge_group(pre_res_a["stopped_edges"], {ha})
             if enter_b is None or enter_a is None:
-                return None
+                return {"status": "FALLBACK"}
 
-            hb_blk = db["block_map"][hb]
-            ha_blk = da["block_map"][ha]
             init_phi_b = self._collect_header_phi_values(hb_blk, pre_em_b, pre_res_b)
             init_phi_a = self._collect_header_phi_values(ha_blk, pre_em_a, pre_res_a)
             if init_phi_b is None or init_phi_a is None:
-                return None
+                return {"status": "FALLBACK"}
 
             pre_ext_b, pre_loc_b = self._merge_pred_mem(pre_res_b, pre_em_b)
             pre_ext_a, pre_loc_a = self._merge_pred_mem(pre_res_a, pre_em_a)
             bt_b, br_b, bm_b = self._combine_ret_cases(pre_res_b["ret_cases"], cur_ext_b)
             bt_a, br_a, bm_a = self._combine_ret_cases(pre_res_a["ret_cases"], cur_ext_a)
 
-            if idx == 0:
+            if cur_allow_allocas:
                 cur_alloc_b = pre_res_b["alloca_bases"]
                 cur_alloc_a = pre_res_a["alloca_bases"]
 
             pairs, rem_b, rem_a = self._pair_phi_keys(list(init_phi_b.keys()), list(init_phi_a.keys()))
-            sym_b = {k: z3.BitVec(f"seq_{idx}_B_{k[0]}_{k[1]}", 64) for k in init_phi_b}
-            sym_a = {k: z3.BitVec(f"seq_{idx}_A_{k[0]}_{k[1]}", 64) for k in init_phi_a}
-            sym_ext_b = z3.Array(f"seq_{idx}_ext_B", bv64, bv64)
-            sym_ext_a = z3.Array(f"seq_{idx}_ext_A", bv64, bv64)
-            sym_loc_b = z3.Array(f"seq_{idx}_loc_B", bv64, bv64)
-            sym_loc_a = z3.Array(f"seq_{idx}_loc_A", bv64, bv64)
+            sym_b = {k: z3.BitVec(f"{tag}_L{idx}_B_{k[0]}_{k[1]}", 64) for k in init_phi_b}
+            sym_a = {k: z3.BitVec(f"{tag}_L{idx}_A_{k[0]}_{k[1]}", 64) for k in init_phi_a}
+            sym_ext_b = z3.Array(f"{tag}_L{idx}_ext_B", bv64, bv64)
+            sym_ext_a = z3.Array(f"{tag}_L{idx}_ext_A", bv64, bv64)
+            sym_loc_b = z3.Array(f"{tag}_L{idx}_loc_B", bv64, bv64)
+            sym_loc_a = z3.Array(f"{tag}_L{idx}_loc_A", bv64, bv64)
 
-            next_start_b = hb_idx
-            next_start_a = ha_idx
-            seen_loops_b |= loop_b_set
-            seen_loops_a |= loop_a_set
-            after_b = {
-                b.name for b in db["rpo_blocks"]
-                if db["rpo_idx"][b.name] > hb_idx and b.name not in seen_loops_b
+            def make_inv(sb_m, sa_m, eb, ea, lb, la, read_only_flag: bool = False) -> z3.BoolRef:
+                cl = [eb == ea]
+                if len(cur_alloc_b) == len(cur_alloc_a) and len(cur_alloc_b) > 0:
+                    cl.append(lb == la)
+                for kb, ka in pairs:
+                    cl.append(sb_m[kb] == sa_m[ka])
+                for kb in rem_b:
+                    cl.append(sb_m[kb] == init_phi_b[kb])
+                for ka in rem_a:
+                    cl.append(sa_m[ka] == init_phi_a[ka])
+                if read_only_flag:
+                    cl.append(eb == pre_ext_b)
+                    cl.append(ea == pre_ext_a)
+                return z3.And(cl)
+
+            # Check Base Obligation & preheader lockstep under outer_rel_assume
+            pre_stop_eq_clauses: List[z3.BoolRef] = []
+            if parent_exit_targets_b or parent_exit_targets_a:
+                pb_leave = self._group_stop_cond(pre_res_b["stopped_edges"], parent_exit_targets_b)
+                pa_leave = self._group_stop_cond(pre_res_a["stopped_edges"], parent_exit_targets_a)
+                pre_stop_eq_clauses.append(pb_leave == pa_leave)
+            base_goal = z3.And(
+                pre_stop_eq_clauses + [
+                    enter_b == enter_a,
+                    bt_b == bt_a,
+                    z3.Implies(bt_b, z3.And(br_b == br_a, bm_b == bm_a)),
+                    z3.Implies(enter_b, make_inv(init_phi_b, init_phi_a, pre_ext_b, pre_ext_a, pre_loc_b, pre_loc_a)),
+                ]
+            )
+            sb_solver = z3.Solver()
+            sb_solver.set("timeout", timeout_ms)
+            sb_solver.add(z3.And(outer_rel_assume, z3.Not(base_goal)))
+            if sb_solver.check() != z3.unsat:
+                return {"status": "RESULT", "result": self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)}
+
+            exit_targets_b = {
+                s.name for n in lb_set for s in db["block_map"][n].successors if s.name not in lb_set
             }
-            after_a = {
-                b.name for b in da["rpo_blocks"]
-                if da["rpo_idx"][b.name] > ha_idx and b.name not in seen_loops_a
+            exit_targets_a = {
+                s.name for n in la_set for s in da["block_map"][n].successors if s.name not in la_set
             }
 
             l_env_b = dict(pre_res_b["env"])
@@ -2060,94 +1748,84 @@ class SSATranslationValidator:
             for phi in ha_blk.phi_nodes:
                 l_env_a[phi.result] = sym_a[(phi.result.name, phi.result.version)]
 
-            loop_b_blocks = [b for b in db["rpo_blocks"] if b.name in loop_b_set]
-            loop_a_blocks = [b for b in da["rpo_blocks"] if b.name in loop_a_set]
-            l_res_b = self._run_dag_segment(
-                fn=ssa_before, blocks=loop_b_blocks, sym_params=sym_params,
-                init_env=l_env_b, init_alloca_bases=cur_alloc_b,
-                entry_reach={hb: z3.BoolVal(True)}, entry_edge_conds={},
-                entry_ext_mem={}, entry_loc_mem={},
-                default_ext_mem=sym_ext_b, default_loc_mem=sym_loc_b,
-                stop_targets={hb} | after_b, skip_phi_blocks={hb},
-                allow_allocas=False, allowed_ops=allowed_ops,
+            loop_assume = z3.And(
+                outer_rel_assume,
+                enter_b,
+                make_inv(sym_b, sym_a, sym_ext_b, sym_ext_a, sym_loc_b, sym_loc_a),
             )
-            l_res_a = self._run_dag_segment(
-                fn=ssa_after, blocks=loop_a_blocks, sym_params=sym_params,
-                init_env=l_env_a, init_alloca_bases=cur_alloc_a,
-                entry_reach={ha: z3.BoolVal(True)}, entry_edge_conds={},
-                entry_ext_mem={}, entry_loc_mem={},
-                default_ext_mem=sym_ext_a, default_loc_mem=sym_loc_a,
-                stop_targets={ha} | after_a, skip_phi_blocks={ha},
-                allow_allocas=False, allowed_ops=allowed_ops,
+            body_ret = self._verify_loop_sequence_in_region(
+                ssa_before=ssa_before, ssa_after=ssa_after, db=db, da=da, sym_params=sym_params,
+                scope_b=lb_set, scope_a=la_set,
+                exclude_b=exclude_b | {hb}, exclude_a=exclude_a | {ha},
+                start_pos_b=hb_idx, start_pos_a=ha_idx,
+                init_reach_b={hb: z3.BoolVal(True)}, init_reach_a={ha: z3.BoolVal(True)},
+                init_edges_b={}, init_edges_a={},
+                init_edge_ext_b={}, init_edge_ext_a={},
+                init_edge_loc_b={}, init_edge_loc_a={},
+                default_ext_b=sym_ext_b, default_ext_a=sym_ext_a,
+                default_loc_b=sym_loc_b, default_loc_a=sym_loc_a,
+                init_env_b=l_env_b, init_env_a=l_env_a,
+                init_alloc_b=cur_alloc_b, init_alloc_a=cur_alloc_a,
+                skip_b={hb}, skip_a={ha},
+                stop_targets_b={hb} | exit_targets_b, stop_targets_a={ha} | exit_targets_a,
+                allow_allocas=False,
+                outer_rel_assume=loop_assume,
+                parent_exit_targets_b=exit_targets_b,
+                parent_exit_targets_a=exit_targets_a,
+                timeout_ms=timeout_ms,
+                tag=f"{tag}_d{idx}",
             )
-            if l_res_b.get("error") or l_res_a.get("error"):
-                return None
+            if body_ret["status"] != "OK":
+                return body_ret
 
+            l_res_b, l_res_a = body_ret["res_b"], body_ret["res_a"]
             cont_b, back_b = self._extract_edge_group(l_res_b["stopped_edges"], {hb})
             cont_a, back_a = self._extract_edge_group(l_res_a["stopped_edges"], {ha})
             if cont_b is None or cont_a is None:
-                return None
+                return {"status": "FALLBACK"}
+
             next_phi_b = self._collect_header_phi_values(hb_blk, back_b, l_res_b)
             next_phi_a = self._collect_header_phi_values(ha_blk, back_a, l_res_a)
             if next_phi_b is None or next_phi_a is None:
-                return None
+                return {"status": "FALLBACK"}
 
             next_ext_b, next_loc_b = self._merge_pred_mem(l_res_b, back_b)
             next_ext_a, next_loc_a = self._merge_pred_mem(l_res_a, back_a)
             et_b, er_b, em_b = self._combine_ret_cases(l_res_b["ret_cases"], sym_ext_b)
             et_a, er_a, em_a = self._combine_ret_cases(l_res_a["ret_cases"], sym_ext_a)
-            leave_b, leave_em_b = self._extract_edge_group(l_res_b["stopped_edges"], after_b)
-            leave_a, leave_em_a = self._extract_edge_group(l_res_a["stopped_edges"], after_a)
+            leave_b, leave_em_b = self._extract_edge_group(l_res_b["stopped_edges"], exit_targets_b)
+            leave_a, leave_em_a = self._extract_edge_group(l_res_a["stopped_edges"], exit_targets_a)
             if leave_b is None:
-                leave_b = z3.BoolVal(False)
+                leave_b, leave_em_b = z3.BoolVal(False), {}
             if leave_a is None:
-                leave_a = z3.BoolVal(False)
+                leave_a, leave_em_a = z3.BoolVal(False), {}
 
-            read_only = (not l_res_b["wrote_ext_mem"]) and (not l_res_a["wrote_ext_mem"])
-
-            def make_inv(mb_map, ma_map, eb, ea, lb, la) -> z3.BoolRef:
-                cl = [eb == ea]
-                if len(cur_alloc_b) == len(cur_alloc_a) and len(cur_alloc_b) > 0:
-                    cl.append(lb == la)
-                for kb, ka in pairs:
-                    cl.append(mb_map[kb] == ma_map[ka])
-                for kb in rem_b:
-                    cl.append(mb_map[kb] == init_phi_b[kb])
-                for ka in rem_a:
-                    cl.append(ma_map[ka] == init_phi_a[ka])
-                if read_only:
-                    cl.append(eb == pre_ext_b)
-                    cl.append(ea == pre_ext_a)
-                return z3.And(cl)
-
-            base_goal = z3.And(
-                enter_b == enter_a,
-                z3.Implies(z3.Not(enter_b), z3.And(bt_b == bt_a, z3.Implies(bt_b, z3.And(br_b == br_a, bm_b == bm_a)))),
-                z3.Implies(enter_b, make_inv(init_phi_b, init_phi_a, pre_ext_b, pre_ext_a, pre_loc_b, pre_loc_a)),
-            )
-            sb_solver = z3.Solver()
-            sb_solver.set("timeout", timeout_ms)
-            sb_solver.add(z3.Not(base_goal))
-            if sb_solver.check() != z3.unsat:
-                return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
+            read_only = not body_ret["wrote_ext_mem"]
+            if not read_only:
+                accum_wrote_ext = True
 
             step_goal = z3.And(
                 cont_b == cont_a,
                 et_b == et_a,
                 z3.Implies(et_b, z3.And(er_b == er_a, em_b == em_a)),
-                z3.Implies(cont_b, make_inv(next_phi_b, next_phi_a, next_ext_b, next_ext_a, next_loc_b, next_loc_a)),
+                z3.Implies(cont_b, make_inv(next_phi_b, next_phi_a, next_ext_b, next_ext_a, next_loc_b, next_loc_a, read_only_flag=read_only)),
                 leave_b == leave_a,
+            )
+            step_assume = (
+                z3.And(loop_assume, sym_ext_b == pre_ext_b, sym_ext_a == pre_ext_a)
+                if read_only
+                else loop_assume
             )
             st_solver = z3.Solver()
             st_solver.set("timeout", timeout_ms)
-            st_solver.add(z3.And(make_inv(sym_b, sym_a, sym_ext_b, sym_ext_a, sym_loc_b, sym_loc_a), z3.Not(step_goal)))
+            st_solver.add(z3.And(step_assume, z3.Not(step_goal)))
             if st_solver.check() != z3.unsat:
-                return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
+                return {"status": "RESULT", "result": self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)}
 
-            # Summarize Loop `idx` output into next segment cleanly
-            shared_ext_out = pre_ext_b if read_only else z3.Array(f"seq_{idx}_post_ext", bv64, bv64)
+            # Summarize proven-equivalent loop exit equally for downstream siblings / parent suffix
+            shared_ext_out = pre_ext_b if read_only else z3.Array(f"{tag}_L{idx}_post_ext", bv64, bv64)
             no_loc = (len(cur_alloc_b) == 0 and len(cur_alloc_a) == 0)
-            shared_loc_out = pre_loc_b if no_loc else z3.Array(f"seq_{idx}_post_loc", bv64, bv64)
+            shared_loc_out = pre_loc_b if no_loc else z3.Array(f"{tag}_L{idx}_post_loc", bv64, bv64)
             cur_ext_b = pre_ext_b if read_only else shared_ext_out
             cur_ext_a = pre_ext_a if read_only else shared_ext_out
             cur_loc_b = pre_loc_b if no_loc else shared_loc_out
@@ -2156,7 +1834,7 @@ class SSATranslationValidator:
             cur_env_b = dict(pre_res_b["env"])
             cur_env_a = dict(pre_res_a["env"])
             for p_idx, (kb, ka) in enumerate(pairs):
-                sv = z3.BitVec(f"seq_{idx}_post_{p_idx}_{kb[0]}_{kb[1]}", 64)
+                sv = z3.BitVec(f"{tag}_L{idx}_post_{p_idx}_{kb[0]}_{kb[1]}", 64)
                 for phi in hb_blk.phi_nodes:
                     if (phi.result.name, phi.result.version) == kb:
                         cur_env_b[phi.result] = sv
@@ -2172,61 +1850,112 @@ class SSATranslationValidator:
                     if (phi.result.name, phi.result.version) == ka:
                         cur_env_a[phi.result] = init_phi_a[ka]
 
+            if not leave_em_b or not leave_em_a:
+                return {"status": "FALLBACK"}
+
             cur_reach_b, cur_reach_a = {}, {}
-            cur_edges_b = {e: z3.BoolVal(True) for e in leave_em_b.keys()}
-            cur_edges_a = {e: z3.BoolVal(True) for e in leave_em_a.keys()}
-            if not cur_edges_b or not cur_edges_a:
-                return None
+            cur_edges_b = {e: enter_b for e in leave_em_b.keys()}
+            cur_edges_a = {e: enter_a for e in leave_em_a.keys()}
             cur_edge_ext_b = {src: cur_ext_b for (src, _) in cur_edges_b.keys()}
             cur_edge_ext_a = {src: cur_ext_a for (src, _) in cur_edges_a.keys()}
             cur_edge_loc_b = {src: cur_loc_b for (src, _) in cur_edges_b.keys()}
             cur_edge_loc_a = {src: cur_loc_a for (src, _) in cur_edges_a.keys()}
-            prev_pos_b = next_start_b
-            prev_pos_a = next_start_a
 
-        # Final tail segment after last loop
+            seen_b |= lb_set
+            seen_a |= la_set
+            cur_pos_b = hb_idx + 1
+            cur_pos_a = ha_idx + 1
+            cur_skip_b, cur_skip_a = set(), set()
+            cur_allow_allocas = False
+
+        # Tail segment after final top-level loop in scope
         tail_blocks_b = [
             b for b in db["rpo_blocks"]
-            if db["rpo_idx"][b.name] > prev_pos_b and b.name not in seen_loops_b
+            if b.name in scope_b and b.name not in seen_b and db["rpo_idx"][b.name] >= cur_pos_b
         ]
         tail_blocks_a = [
             b for b in da["rpo_blocks"]
-            if da["rpo_idx"][b.name] > prev_pos_a and b.name not in seen_loops_a
+            if b.name in scope_a and b.name not in seen_a and da["rpo_idx"][b.name] >= cur_pos_a
         ]
-        tail_res_b = self._run_dag_segment(
-            fn=ssa_before, blocks=tail_blocks_b, sym_params=sym_params,
-            init_env=cur_env_b, init_alloca_bases=cur_alloc_b,
-            entry_reach=cur_reach_b, entry_edge_conds=cur_edges_b,
-            entry_ext_mem=cur_edge_ext_b, entry_loc_mem=cur_edge_loc_b,
-            default_ext_mem=cur_ext_b, default_loc_mem=cur_loc_b,
-            stop_targets=set(), skip_phi_blocks=set(),
-            allow_allocas=False, allowed_ops=allowed_ops,
-        )
-        tail_res_a = self._run_dag_segment(
-            fn=ssa_after, blocks=tail_blocks_a, sym_params=sym_params,
-            init_env=cur_env_a, init_alloca_bases=cur_alloc_a,
-            entry_reach=cur_reach_a, entry_edge_conds=cur_edges_a,
-            entry_ext_mem=cur_edge_ext_a, entry_loc_mem=cur_edge_loc_a,
-            default_ext_mem=cur_ext_a, default_loc_mem=cur_loc_a,
-            stop_targets=set(), skip_phi_blocks=set(),
-            allow_allocas=False, allowed_ops=allowed_ops,
-        )
-        if tail_res_b.get("error") or tail_res_a.get("error"):
-            return None
 
-        ft_b, fr_b, fm_b = self._combine_ret_cases(tail_res_b["ret_cases"], cur_ext_b)
-        ft_a, fr_a, fm_a = self._combine_ret_cases(tail_res_a["ret_cases"], cur_ext_a)
-        fin_solver = z3.Solver()
-        fin_solver.set("timeout", timeout_ms)
-        fin_solver.add(z3.Not(z3.And(ft_b == ft_a, z3.Implies(ft_b, z3.And(fr_b == fr_a, fm_b == fm_a)))))
-        if fin_solver.check() == z3.unsat:
-            return {
-                "proven": True,
-                "status": "PROVEN_INDUCTIVE_EQUIVALENT",
-                "counterexample": None,
-                "bounded": False,
-            }
-        return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
+        if tail_blocks_b:
+            t_res_b = self._run_dag_segment(
+                fn=ssa_before, blocks=tail_blocks_b, sym_params=sym_params,
+                init_env=cur_env_b, init_alloca_bases=cur_alloc_b,
+                entry_reach=cur_reach_b, entry_edge_conds=cur_edges_b,
+                entry_ext_mem=cur_edge_ext_b, entry_loc_mem=cur_edge_loc_b,
+                default_ext_mem=cur_ext_b, default_loc_mem=cur_loc_b,
+                stop_targets=stop_targets_b, skip_phi_blocks=cur_skip_b,
+                allow_allocas=False, allowed_ops=allowed_ops,
+            )
+            if t_res_b.get("error"):
+                return {"status": "FALLBACK"}
+            if t_res_b["wrote_ext_mem"]:
+                accum_wrote_ext = True
+            accum_stopped_b.extend(t_res_b["stopped_edges"])
+            accum_rets_b.extend(t_res_b["ret_cases"])
+            accum_ext_out_b.update(t_res_b["ext_mem_out"])
+            accum_loc_out_b.update(t_res_b["loc_mem_out"])
+            accum_benv_b.update(t_res_b["block_env"])
+            tail_env_b = t_res_b["env"]
+        else:
+            for (src_n, dst_n), ec in cur_edges_b.items():
+                accum_stopped_b.append((src_n, dst_n, ec))
+            accum_ext_out_b.update(cur_edge_ext_b)
+            accum_loc_out_b.update(cur_edge_loc_b)
+            tail_env_b = cur_env_b
+
+        if tail_blocks_a:
+            t_res_a = self._run_dag_segment(
+                fn=ssa_after, blocks=tail_blocks_a, sym_params=sym_params,
+                init_env=cur_env_a, init_alloca_bases=cur_alloc_a,
+                entry_reach=cur_reach_a, entry_edge_conds=cur_edges_a,
+                entry_ext_mem=cur_edge_ext_a, entry_loc_mem=cur_edge_loc_a,
+                default_ext_mem=cur_ext_a, default_loc_mem=cur_loc_a,
+                stop_targets=stop_targets_a, skip_phi_blocks=cur_skip_a,
+                allow_allocas=False, allowed_ops=allowed_ops,
+            )
+            if t_res_a.get("error"):
+                return {"status": "FALLBACK"}
+            if t_res_a["wrote_ext_mem"]:
+                accum_wrote_ext = True
+            accum_stopped_a.extend(t_res_a["stopped_edges"])
+            accum_rets_a.extend(t_res_a["ret_cases"])
+            accum_ext_out_a.update(t_res_a["ext_mem_out"])
+            accum_loc_out_a.update(t_res_a["loc_mem_out"])
+            accum_benv_a.update(t_res_a["block_env"])
+            tail_env_a = t_res_a["env"]
+        else:
+            for (src_n, dst_n), ec in cur_edges_a.items():
+                accum_stopped_a.append((src_n, dst_n, ec))
+            accum_ext_out_a.update(cur_edge_ext_a)
+            accum_loc_out_a.update(cur_edge_loc_a)
+            tail_env_a = cur_env_a
+
+        return {
+            "status": "OK",
+            "res_b": {
+                "stopped_edges": accum_stopped_b,
+                "ret_cases": accum_rets_b,
+                "env": tail_env_b,
+                "alloca_bases": cur_alloc_b,
+                "ext_mem_out": accum_ext_out_b,
+                "loc_mem_out": accum_loc_out_b,
+                "block_env": accum_benv_b,
+                "wrote_ext_mem": accum_wrote_ext,
+            },
+            "res_a": {
+                "stopped_edges": accum_stopped_a,
+                "ret_cases": accum_rets_a,
+                "env": tail_env_a,
+                "alloca_bases": cur_alloc_a,
+                "ext_mem_out": accum_ext_out_a,
+                "loc_mem_out": accum_loc_out_a,
+                "block_env": accum_benv_a,
+                "wrote_ext_mem": accum_wrote_ext,
+            },
+            "wrote_ext_mem": accum_wrote_ext,
+        }
 
     def _verify_multi_loop_inductive_equivalence(
         self,
@@ -2241,18 +1970,51 @@ class SSATranslationValidator:
         sym_params = [z3.BitVec(f"p_{i}_{name}", 64) for i, name in enumerate(ssa_before.params)]
         bv64 = z3.BitVecSort(64)
         shared_ext_mem = z3.Array("shared_multi_ext_mem_0", bv64, bv64)
+        init_loc_b = z3.Array(f"loc_tree_init_B_{ssa_before.name}", bv64, bv64)
+        init_loc_a = z3.Array(f"loc_tree_init_A_{ssa_after.name}", bv64, bv64)
 
-        if len(db["headers"]) == 2 and len(da["headers"]) == 2:
-            if db["loop_names"][db["headers"][1]] < db["loop_names"][db["headers"][0]]:
-                nested_res = self._verify_nested_two_level_loops(
-                    ssa_before, ssa_after, db, da, sym_params, shared_ext_mem, timeout_ms
-                )
-                if nested_res is not None:
-                    return nested_res
-
-        return self._verify_sequential_multi_loops(
-            ssa_before, ssa_after, db, da, sym_params, shared_ext_mem, timeout_ms
+        root_ret = self._verify_loop_sequence_in_region(
+            ssa_before=ssa_before, ssa_after=ssa_after, db=db, da=da, sym_params=sym_params,
+            scope_b={b.name for b in db["rpo_blocks"]},
+            scope_a={b.name for b in da["rpo_blocks"]},
+            exclude_b=set(), exclude_a=set(),
+            start_pos_b=0, start_pos_a=0,
+            init_reach_b={db["entry"].name: z3.BoolVal(True)},
+            init_reach_a={da["entry"].name: z3.BoolVal(True)},
+            init_edges_b={}, init_edges_a={},
+            init_edge_ext_b={}, init_edge_ext_a={},
+            init_edge_loc_b={}, init_edge_loc_a={},
+            default_ext_b=shared_ext_mem, default_ext_a=shared_ext_mem,
+            default_loc_b=init_loc_b, default_loc_a=init_loc_a,
+            init_env_b={}, init_env_a={},
+            init_alloc_b={}, init_alloc_a={},
+            skip_b=set(), skip_a=set(),
+            stop_targets_b=set(), stop_targets_a=set(),
+            allow_allocas=True,
+            outer_rel_assume=z3.BoolVal(True),
+            parent_exit_targets_b=set(),
+            parent_exit_targets_a=set(),
+            timeout_ms=timeout_ms,
+            tag="rt",
         )
+        if root_ret["status"] == "RESULT":
+            return root_ret["result"]
+        if root_ret["status"] != "OK":
+            return None
+
+        ft_b, fr_b, fm_b = self._combine_ret_cases(root_ret["res_b"]["ret_cases"], shared_ext_mem)
+        ft_a, fr_a, fm_a = self._combine_ret_cases(root_ret["res_a"]["ret_cases"], shared_ext_mem)
+        fin_solver = z3.Solver()
+        fin_solver.set("timeout", timeout_ms)
+        fin_solver.add(z3.Not(z3.And(ft_b == ft_a, z3.Implies(ft_b, z3.And(fr_b == fr_a, fm_b == fm_a)))))
+        if fin_solver.check() == z3.unsat:
+            return {
+                "proven": True,
+                "status": "PROVEN_INDUCTIVE_EQUIVALENT",
+                "counterexample": None,
+                "bounded": False,
+            }
+        return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
 
     def _verify_inductive_loop_equivalence(
         self,

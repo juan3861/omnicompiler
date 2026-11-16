@@ -380,16 +380,27 @@ class _PolyglotParser:
             return None
 
         if self.language in ("javascript", "typescript"):
+            if t.val == "exports" and self._peek(1).kind == "OP" and self._peek(1).val == ".":
+                arrow_fn = self._try_parse_exports_arrow_function()
+                if arrow_fn is not None:
+                    return arrow_fn
+                self.pos = save
+                return None
+
             if t.val == "export":
                 self._advance()
                 if self._at("ID", "default"):
                     self._advance()
             if self._at("ID", "async"):
                 self._advance()
-            if not self._at("ID", "function"):
-                self.pos = save
-                return None
-            return self._parse_js_ts_function()
+            if self._at("ID", "function"):
+                return self._parse_js_ts_function()
+            if self._peek().kind == "ID" and self._peek().val in ("const", "let", "var"):
+                arrow_fn = self._try_parse_const_arrow_function()
+                if arrow_fn is not None:
+                    return arrow_fn
+            self.pos = save
+            return None
 
         if self.language == "rust":
             if t.val == "pub":
@@ -419,12 +430,7 @@ class _PolyglotParser:
     # ------------------------------------------------------------------
     # Signatures
     # ------------------------------------------------------------------
-    def _parse_js_ts_function(self) -> ast.FunctionDef:
-        fn_tok = self._expect("ID", "function")
-        name_tok = self._expect("ID")
-        # Optional TS generics <T, U>
-        if self._at("OP", "<"):
-            self._skip_type_args()
+    def _parse_js_ts_param_list(self) -> List[str]:
         self._expect("PUNCT", "(")
         params: List[str] = []
         while not self._at("PUNCT", ")"):
@@ -443,12 +449,86 @@ class _PolyglotParser:
             else:
                 break
         self._expect("PUNCT", ")")
-        # Optional return type `: number`
+        return params
+
+    def _parse_js_ts_function(self) -> ast.FunctionDef:
+        fn_tok = self._expect("ID", "function")
+        name_tok = self._expect("ID")
+        if self._at("OP", "<"):
+            self._skip_type_args()
+        params = self._parse_js_ts_param_list()
         if self._at("OP", ":"):
             self._advance()
             self._skip_type_annotation(stop_tokens={"{"})
         body = self._parse_block()
         return self._make_function_def(name_tok.val, params, body, fn_tok.line)
+
+    def _parse_arrow_rhs(self, fn_name: str, line: int) -> Optional[ast.FunctionDef]:
+        if self._at("ID", "async"):
+            self._advance()
+        if self._at("OP", "<"):
+            self._skip_type_args()
+        if self._at("PUNCT", "("):
+            params = self._parse_js_ts_param_list()
+        elif self._at("ID"):
+            params = [self._advance().val]
+        else:
+            return None
+        if self._at("OP", ":"):
+            self._advance()
+            self._skip_type_annotation(stop_tokens={"=>"})
+        if not self._at("OP", "=>"):
+            return None
+        self._advance()
+        if self._at("PUNCT", "{"):
+            body = self._parse_block()
+        else:
+            expr = self._parse_expr()
+            body = [ast.Return(value=expr, lineno=line)]
+        self._consume_optional_semi()
+        return self._make_function_def(fn_name, params, body, line)
+
+    def _try_parse_const_arrow_function(self) -> Optional[ast.FunctionDef]:
+        save = self.pos
+        kw = self._advance()
+        if not self._at("ID"):
+            self.pos = save
+            return None
+        name_tok = self._advance()
+        if self._at("OP", ":"):
+            self._advance()
+            self._skip_type_annotation(stop_tokens={"="})
+        if not self._at("OP", "="):
+            self.pos = save
+            return None
+        self._advance()
+        try:
+            fn = self._parse_arrow_rhs(name_tok.val, kw.line)
+        except PolyglotLoweringError:
+            self.pos = save
+            raise
+        if fn is None:
+            self.pos = save
+            return None
+        return fn
+
+    def _try_parse_exports_arrow_function(self) -> Optional[ast.FunctionDef]:
+        save = self.pos
+        self._expect("ID", "exports")
+        self._expect("OP", ".")
+        if not self._at("ID"):
+            self.pos = save
+            return None
+        name_tok = self._advance()
+        if not self._at("OP", "="):
+            self.pos = save
+            return None
+        self._advance()
+        fn = self._parse_arrow_rhs(name_tok.val, name_tok.line)
+        if fn is None:
+            self.pos = save
+            return None
+        return fn
 
     def _parse_rust_function(self) -> ast.FunctionDef:
         fn_tok = self._expect("ID", "fn")
@@ -666,15 +746,25 @@ class _PolyglotParser:
             return [ast.Return(value=expr, lineno=line)], semi
 
         if t.kind == "ID" and t.val in ("let", "const", "var"):
-            stmt = self._parse_var_decl()
+            stmts = [self._parse_var_decl()]
+            if self.language in ("javascript", "typescript"):
+                while self._at("PUNCT", ","):
+                    self._advance()
+                    stmts.append(self._parse_var_item(kw_line=line))
             semi = self._consume_optional_semi()
-            return [stmt], semi
+            return stmts, semi
 
         if t.kind == "ID" and t.val == "if":
             return [self._parse_if_stmt()], True
 
         if t.kind == "ID" and t.val == "switch":
             return [self._parse_switch_stmt()], True
+
+        if t.kind == "ID" and t.val == "match" and self.language == "rust":
+            return [self._parse_match_stmt()], False
+
+        if t.kind == "ID" and t.val == "do" and self.language in ("javascript", "typescript"):
+            return [self._parse_do_while_stmt()], True
 
         if t.kind == "ID" and t.val == "while":
             return [self._parse_while_stmt()], True
@@ -702,31 +792,67 @@ class _PolyglotParser:
         simple, ended_semi = self._parse_simple_stmt(consume_semi=True)
         return [simple], ended_semi
 
-    def _parse_var_decl(self) -> ast.stmt:
-        kw = self._advance()
+    def _parse_var_item(self, kw_line: int) -> ast.stmt:
         if self._at("ID", "mut"):
             self._advance()
         name_tok = self._expect("ID")
         if self._at("OP", ":"):
             self._advance()
-            self._skip_type_annotation(stop_tokens={"=", ";", "}"})
+            self._skip_type_annotation(stop_tokens={"=", ";", "}", ","})
         elif self.language == "go" and self._at("ID"):
             # Go `var x int64 = 0` or `var x int64`
-            self._skip_go_type(stop_tokens={"=", ";", "}"})
+            self._skip_go_type(stop_tokens={"=", ";", "}", ","})
         if self._at("OP", "="):
             self._advance()
             val = self._parse_expr()
         else:
-            val = ast.Constant(value=0, lineno=kw.line)
+            val = ast.Constant(value=0, lineno=kw_line)
         return ast.Assign(
             targets=[ast.Name(id=name_tok.val, ctx=ast.Store(), lineno=name_tok.line)],
             value=val,
-            lineno=kw.line,
+            lineno=kw_line,
         )
+
+    def _parse_var_decl(self) -> ast.stmt:
+        kw = self._advance()
+        return self._parse_var_item(kw_line=kw.line)
 
     def _parse_simple_stmt(self, consume_semi: bool = True) -> Tuple[ast.stmt, bool]:
         t = self._peek()
         line = t.line
+
+        # Multi-variable parallel / tuple assignment: `a, b := expr1, expr2` or `a, b = b, a + b`
+        if t.kind == "ID" and self._peek(1).kind == "PUNCT" and self._peek(1).val == ",":
+            save = self.pos
+            lhs_ids: List[ast.Name] = []
+            valid_tuple = True
+            while True:
+                if not self._at("ID"):
+                    valid_tuple = False
+                    break
+                it = self._advance()
+                lhs_ids.append(ast.Name(id=it.val, ctx=ast.Store(), lineno=it.line))
+                if self._at("PUNCT", ","):
+                    self._advance()
+                else:
+                    break
+            if valid_tuple and self._peek().kind == "OP" and self._peek().val in (":=", "="):
+                self._advance()
+                rhs_vals: List[ast.expr] = [self._parse_expr()]
+                while self._at("PUNCT", ","):
+                    self._advance()
+                    rhs_vals.append(self._parse_expr())
+                if len(lhs_ids) == len(rhs_vals):
+                    semi = self._consume_optional_semi() if consume_semi else False
+                    return (
+                        ast.Assign(
+                            targets=[ast.Tuple(elts=lhs_ids, ctx=ast.Store(), lineno=line)],
+                            value=ast.Tuple(elts=rhs_vals, ctx=ast.Load(), lineno=line),
+                            lineno=line,
+                        ),
+                        semi,
+                    )
+            self.pos = save
 
         # Lookahead for assignment / := / ++ / -- / += ...
         if t.kind == "ID":
@@ -959,6 +1085,85 @@ class _PolyglotParser:
             node = ast.If(test=cmp_test, body=cbody, orelse=tail, lineno=cline)
             tail = [node]
         return tail[0]  # type: ignore[return-value]
+
+    def _parse_match_stmt(self) -> ast.If:
+        m_tok = self._expect("ID", "match")
+        disc = self._parse_expr()
+        self._expect("PUNCT", "{")
+        arms: List[Tuple[List[ast.expr], List[ast.stmt], int]] = []
+        default_stmts: Optional[List[ast.stmt]] = None
+
+        while not self._at("PUNCT", "}") and not self._at("EOF"):
+            if self._at("PUNCT", ","):
+                self._advance()
+                continue
+            pt = self._peek()
+            if pt.kind == "ID" and pt.val == "_":
+                self._advance()
+                pats: Optional[List[ast.expr]] = None
+            else:
+                pats = [self._parse_bit_xor()]  # avoids consuming top-level pattern separator `|`
+                while self._at("OP", "|"):
+                    self._advance()
+                    pats.append(self._parse_bit_xor())
+            self._expect("OP", "=>")
+            if self._at("PUNCT", "{"):
+                arm_body = self._parse_block(allow_tail_return=False)
+            else:
+                parsed, _ = self._parse_stmt()
+                arm_body = parsed
+            if self._at("PUNCT", ","):
+                self._advance()
+            if pats is None:
+                default_stmts = arm_body or [ast.Pass(lineno=pt.line)]
+            else:
+                arms.append((pats, arm_body or [ast.Pass(lineno=pt.line)], pt.line))
+
+        self._expect("PUNCT", "}")
+        if not arms:
+            return ast.If(
+                test=ast.Constant(value=1, lineno=m_tok.line),
+                body=default_stmts or [ast.Pass(lineno=m_tok.line)],
+                orelse=[],
+                lineno=m_tok.line,
+            )
+
+        tail: List[ast.stmt] = default_stmts or []
+        for pats, arm_body, aline in reversed(arms):
+            test_expr: ast.expr = ast.Compare(
+                left=disc, ops=[ast.Eq()], comparators=[pats[-1]], lineno=aline
+            )
+            for p_alt in reversed(pats[:-1]):
+                alt_cmp = ast.Compare(
+                    left=disc, ops=[ast.Eq()], comparators=[p_alt], lineno=aline
+                )
+                test_expr = ast.IfExp(
+                    test=alt_cmp,
+                    body=ast.Constant(value=1, lineno=aline),
+                    orelse=test_expr,
+                    lineno=aline,
+                )
+            tail = [ast.If(test=test_expr, body=arm_body, orelse=tail, lineno=aline)]
+        return tail[0]  # type: ignore[return-value]
+
+    def _parse_do_while_stmt(self) -> ast.While:
+        d_tok = self._expect("ID", "do")
+        body = self._parse_block()
+        self._expect("ID", "while")
+        cond = self._parse_condition_expr()
+        self._consume_optional_semi()
+        guard = ast.If(
+            test=ast.UnaryOp(op=ast.Not(), operand=cond, lineno=d_tok.line),
+            body=[ast.Break(lineno=d_tok.line)],
+            orelse=[],
+            lineno=d_tok.line,
+        )
+        return ast.While(
+            test=ast.Constant(value=1, lineno=d_tok.line),
+            body=body + [guard],
+            orelse=[],
+            lineno=d_tok.line,
+        )
 
     def _parse_while_stmt(self) -> ast.While:
         w_tok = self._expect("ID", "while")
