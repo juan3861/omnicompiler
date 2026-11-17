@@ -13,6 +13,7 @@ import os
 import struct
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional, Set, Tuple
 
@@ -193,6 +194,8 @@ class OmniRepoCompiler:
         self._salsa_obj_cache: Dict[Tuple[Any, ...], CompiledFunctionArtifact] = {}
         self._salsa_bounds_cache: Dict[Tuple[Any, ...], Tuple[Dict[str, Any], Dict[str, Any]]] = {}
         self._salsa_preflight_cache: Dict[Tuple[Any, ...], Any] = {}
+        self._salsa_ssa_cache: Dict[str, Any] = {}
+        self._salsa_summary_cache: Dict[str, Tuple[Any, Any]] = {}
         self._cpg_topo_digest: Optional[str] = None
         self._cpg_last_taint_leak: Optional[Any] = None
         self.salsa.register_query("parsed_module", self._salsa_parse_file)
@@ -307,6 +310,8 @@ class OmniRepoCompiler:
         }
 
         # Stage 1: Parallel Repository Manifest & Salsa Incremental AST Ingestion
+        _timings_ms: Dict[str, float] = {}
+        _t_stage = time.perf_counter()
         self._salsa_hits = 0
         self._salsa_misses = 0
         self._salsa_obj_hits = 0
@@ -369,6 +374,8 @@ class OmniRepoCompiler:
         }
 
         # Stage 2: Inter-Repo Topology Resolution
+        _timings_ms["stage1_ingestion"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
+        _t_stage = time.perf_counter()
         topo = self.topology_resolver.resolve_topology(manifests)
         results["stages"]["topology"] = {
             "compile_order": topo["compile_order"],
@@ -413,6 +420,8 @@ class OmniRepoCompiler:
         }
 
         # Stage 3: Batched Persistent CPG Construction & Single-CTE Inter-Repo Taint Security Audit
+        _timings_ms["stage2_topology_slicing"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
+        _t_stage = time.perf_counter()
         cpg_sig_parts = [
             (m.repo_name, fp)
             for m in manifests
@@ -495,6 +504,8 @@ class OmniRepoCompiler:
         }
 
         # Stage 5: Real AST -> Z3-Gated Optimization -> Omni-SSA -> Native Machine Code Generation
+        _timings_ms["stage3_4_cpg_biabduction_cegis"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
+        _t_stage = time.perf_counter()
         retained_export_names = {exp.name for m in manifests for exp in m.exports}
         compilable_ast_pool = {
             k: v for k, v in all_ast_funcs.items() if k in retained_export_names
@@ -532,6 +543,15 @@ class OmniRepoCompiler:
         defined_symbols_across_mods: Set[str] = set()
 
         # Stage 4.9: ThinLTO Whole-Program Inter-Procedural Optimization Index
+        from compiler.ip_sccp_gvn import clone_ssa_function
+        struct_luts_sig = hashlib.sha256(
+            repr((sorted(global_struct_layouts.items()), sorted(global_luts.items()))).encode("utf-8")
+        ).hexdigest()
+        fn_ast_digests: Dict[str, str] = {
+            fname: hashlib.sha256(ast.dump(fdef).encode("utf-8")).hexdigest()
+            for fname, fdef in all_ast_funcs.items()
+        }
+
         thin_lto_opt = None
         try:
             from compiler.thin_lto import ThinLTOOptimizer
@@ -539,13 +559,19 @@ class OmniRepoCompiler:
             for r_name, r_funcs in repo_funcs_map.items():
                 for f_name, (f_src, f_ast) in r_funcs.items():
                     try:
-                        s_fn = lower_ast_to_ssa(
-                            f_ast,
-                            optimize=True,
-                            struct_layouts=global_struct_layouts,
-                            global_luts=global_luts,
-                        )
-                        summary = thin_lto_opt.build_function_summary(f_name, r_name, f_ast, s_fn)
+                        sum_key = f"{r_name}:{f_name}:{fn_ast_digests.get(f_name, '')}:{struct_luts_sig}"
+                        cached_sum = self._salsa_summary_cache.get(sum_key)
+                        if cached_sum is not None:
+                            summary = cached_sum[1]
+                        else:
+                            s_fn = lower_ast_to_ssa(
+                                f_ast,
+                                optimize=True,
+                                struct_layouts=global_struct_layouts,
+                                global_luts=global_luts,
+                            )
+                            summary = thin_lto_opt.build_function_summary(f_name, r_name, f_ast, s_fn)
+                            self._salsa_summary_cache[sum_key] = (s_fn, summary)
                         thin_lto_opt.index.add_function(summary)
                     except Exception:
                         pass
@@ -555,6 +581,8 @@ class OmniRepoCompiler:
         # Collect lowered SSA units across repositories for inter-procedural specialization
         repo_order_objs: List[Tuple[RepoManifest, ObjectModule, List[Tuple[str, bool]]]] = []
         ssa_program: Dict[str, Any] = {}
+        ssa_opt_keys: Dict[str, str] = {}
+        ssa_preoptimized_names: Set[str] = set()
         unit_owner_repo: Dict[str, str] = {}
         unit_export_flag: Dict[str, bool] = {}
 
@@ -570,6 +598,30 @@ class OmniRepoCompiler:
                     src_file, orig_fn_def = f_map[exp.name]
                     primary_source_file = src_file
                     active_fn_def = orig_fn_def
+
+                    callees_dig = tuple(
+                        (c, fn_ast_digests.get(c, ""))
+                        for c in call_map.get(exp.name, [])
+                    )
+                    fn_opt_key = hashlib.sha256(repr((
+                        exp.name,
+                        fn_ast_digests.get(exp.name, ""),
+                        struct_luts_sig,
+                        callees_dig,
+                        tuple(sorted((speculative_targets or {}).items())),
+                    )).encode("utf-8")).hexdigest()
+                    ssa_opt_keys[exp.name] = fn_opt_key
+
+                    cached_opt_ssa = self._salsa_ssa_cache.get(fn_opt_key)
+                    if cached_opt_ssa is not None:
+                        ssa_fn = clone_ssa_function(cached_opt_ssa)
+                        ssa_fn.source_file = src_file
+                        ssa_preoptimized_names.add(exp.name)
+                        ssa_program[exp.name] = ssa_fn
+                        unit_owner_repo[exp.name] = m.repo_name
+                        unit_export_flag[exp.name] = True
+                        defined_symbols_across_mods.add(exp.name)
+                        continue
 
                     # Apply OmniMutator + Z3 Fail-Closed Refinement Gate on single-return expressions
                     if (
@@ -695,6 +747,8 @@ class OmniRepoCompiler:
             return out_fn, p_stats.get(counter_key, 0) if counter_key else p_stats
 
         for fn_name in list(ssa_program.keys()):
+            if fn_name in ssa_preoptimized_names:
+                continue
             ssa_fn = ssa_program[fn_name]
 
             # 6. Sparse Conditional Constant Propagation (SCCP)
@@ -769,8 +823,12 @@ class OmniRepoCompiler:
                 pass
 
             ssa_program[fn_name] = ssa_fn
+            if fn_name in ssa_opt_keys:
+                self._salsa_ssa_cache[ssa_opt_keys[fn_name]] = clone_ssa_function(ssa_fn)
 
         # Stage 5c: Z3 SSA Memory Bounds & Pointer Disjointness Verification (Salsa-cached by SSA digest)
+        _timings_ms["stage5_ssa_opt_smt"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
+        _t_stage = time.perf_counter()
         from validation.ssa_translation_validator import canonical_ssa_digest
         z3_bounds_checks_passed = 0
         z3_bounds_violations: List[Dict[str, Any]] = []
@@ -949,6 +1007,8 @@ class OmniRepoCompiler:
             return results
 
         # Native / LLVM O3 Codegen + Object Ingestion per Repository
+        _timings_ms["stage5c_z3_bounds"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
+        _t_stage = time.perf_counter()
         backend_proofs_proven = 0
         backend_refuted = 0
         backend_verdicts: Dict[str, str] = {}
@@ -1145,6 +1205,8 @@ class OmniRepoCompiler:
                         raise RuntimeError(f"Assembly invariant audit failed for '{sym_def.name}': {asm_rep.errors}")
 
         # Stage 6: Native Object Linking & Cross-Repo Relocation Resolution
+        _timings_ms["stage5_5_codegen_asm_audit"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
+        _t_stage = time.perf_counter()
         link_res = self.linker.link(entry_symbol=entry_export)
         combined_code = link_res["combined_code"]
         global_syms = link_res["global_symbols"]
@@ -1249,6 +1311,8 @@ class OmniRepoCompiler:
                     )
 
         # Stage 7: Multi-Symbol Binary Emission
+        _timings_ms["stage6_link_unicorn_debug"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
+        _t_stage = time.perf_counter()
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         if target_format == "shared_lib":
             if effective_os == "windows":
@@ -1321,6 +1385,9 @@ class OmniRepoCompiler:
             formal_proofs_passed=formal_proofs,
         )
         save_audit_ledger(ledger_record, ledger_path)
+        _timings_ms["stage7_9_emit_audit_ledger"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
+        _timings_ms["total_measured_stages"] = round(sum(_timings_ms.values()), 2)
+        results["stages"]["timings_ms"] = _timings_ms
         results["stages"]["audit_ledger"] = ledger_record
         results["ledger_path"] = ledger_path
 

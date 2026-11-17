@@ -30,6 +30,7 @@ test_modules = [
     "tests.test_alpha_c36_match_switch_and_rodata_luts",
     "tests.test_alpha_c37_z3_bounds_salsa_and_os_cdll",
     "tests.test_alpha_c38_cli_and_top100_ceiling_audit",
+    "tests.test_alpha_c40_stress_metacognition",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]
