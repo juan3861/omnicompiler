@@ -57,6 +57,7 @@ def clone_ssa_function(fn: SSAFunction, new_name: Optional[str] = None) -> SSAFu
         return_type=getattr(fn, "return_type", "i64"),
     )
     cloned.source_file = fn.source_file
+    cloned.luts = dict(getattr(fn, "luts", {}) or {})
 
     block_map: Dict[str, BasicBlock] = {}
     for b in fn.blocks:

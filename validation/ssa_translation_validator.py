@@ -41,7 +41,7 @@ SUPPORTED_Z3_OPCODES = frozenset({
     "br", "br_cond", "ret",
 })
 
-SUPPORTED_Z3_MEMORY_OPCODES = frozenset({"alloca", "load", "store", "load_off", "store_off"})
+SUPPORTED_Z3_MEMORY_OPCODES = frozenset({"alloca", "load", "store", "load_off", "store_off", "lut_load"})
 SUPPORTED_Z3_METADATA_OPCODES = frozenset({"unroll_meta", "unroll_factor"})
 SUPPORTED_Z3_FLOAT_OPCODES = frozenset({
     "fconst", "fneg", "fadd", "fsub", "fmul", "fdiv",
@@ -146,6 +146,32 @@ class SSATranslationValidator:
         "i16": (16, True), "u16": (16, False),
         "i32": (32, True), "u32": (32, False),
     }
+
+    @classmethod
+    def _eval_lut_load_z3(cls, fn: SSAFunction, lut_name: str, width: str, idx_bv: z3.BitVecRef) -> z3.BitVecRef:
+        luts_m = getattr(fn, "luts", {}) or {}
+        wt, vals = luts_m.get(lut_name, (width, (0,)))
+        if not vals:
+            return z3.BitVecVal(0, 64)
+        elem_bvs: List[z3.BitVecRef] = []
+        for v in vals:
+            if width == "f32":
+                f32_val = float(struct.unpack("<f", struct.pack("<f", float(v)))[0])
+                elem_bvs.append(cls._float_to_bv(f32_val))
+            elif width == "f64":
+                elem_bvs.append(cls._float_to_bv(float(v)))
+            elif width in cls._INT_WIDTH_SPEC:
+                bits, is_signed = cls._INT_WIDTH_SPEC[width]
+                iv = int(v) & ((1 << bits) - 1)
+                if is_signed and (iv & (1 << (bits - 1))):
+                    iv -= (1 << bits)
+                elem_bvs.append(z3.BitVecVal(iv, 64))
+            else:
+                elem_bvs.append(z3.BitVecVal(int(v), 64))
+        acc = elem_bvs[0]
+        for k in range(1, len(elem_bvs)):
+            acc = z3.If(idx_bv == z3.BitVecVal(k, 64), elem_bvs[k], acc)
+        return acc
 
     @classmethod
     def _load_off_z3(cls, raw_bv: z3.BitVecRef, width: str) -> z3.BitVecRef:
@@ -489,6 +515,16 @@ class SSATranslationValidator:
                             cur_loc_mem = z3.Store(cur_loc_mem, addr, w_val)
                         else:
                             cur_ext_mem = z3.Store(cur_ext_mem, addr, w_val)
+
+                    elif op == "lut_load":
+                        if inst.result is None or len(inst.operands) < 3:
+                            return {"error": "INVALID_LUT_LOAD"}
+                        lut_name = str(inst.operands[0])
+                        width = str(inst.operands[1])
+                        idx_v = eval_op(inst.operands[2])
+                        if idx_v is None:
+                            return {"error": "UNRESOLVED_LUT_LOAD"}
+                        env_levels[lvl][inst.result] = self._eval_lut_load_z3(fn, lut_name, width, idx_v)
 
                     elif op in ("neg", "not"):
                         if len(inst.operands) != 1 or inst.result is None:
@@ -933,6 +969,16 @@ class SSATranslationValidator:
                     else:
                         cur_ext_mem = z3.Store(cur_ext_mem, addr, w_val)
                         wrote_ext_mem = True
+
+                elif op == "lut_load":
+                    if inst.result is None or len(inst.operands) < 3:
+                        return {"error": "INVALID_LUT_LOAD"}
+                    lut_name = str(inst.operands[0])
+                    width = str(inst.operands[1])
+                    idx_v = eval_op(inst.operands[2])
+                    if idx_v is None:
+                        return {"error": "UNRESOLVED_LUT_LOAD"}
+                    local_env[inst.result] = self._eval_lut_load_z3(fn, lut_name, width, idx_v)
 
                 elif op in ("neg", "not"):
                     if len(inst.operands) != 1 or inst.result is None:

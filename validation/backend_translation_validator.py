@@ -200,6 +200,23 @@ class LLVMIRToSSALifter:
         fptrunc_f32_map: Dict[str, Any] = {}
         load_narrow_map: Dict[str, Tuple[Any, Any, str]] = {}
         load_f32_map: Dict[str, Tuple[Any, Any, bool]] = {}
+        module_luts: Dict[str, Tuple[str, Tuple[Any, ...]]] = {}
+        lut_gep_map: Dict[str, Tuple[str, Any]] = {}
+        load_lut_narrow_map: Dict[str, Tuple[str, Any]] = {}
+
+        for lm in re.finditer(
+            r"@([A-Za-z0-9_.$]+)\s*=\s*[^\n]*?constant\s*\[(\d+)\s+x\s+(i8|i16|i32|i64|float|double)\]\s*\[([^\]]+)\]",
+            llvm_ir,
+        ):
+            g_sym, _n, e_ty, raw_vals = lm.group(1), lm.group(2), lm.group(3), lm.group(4)
+            is_f_elem = e_ty in ("float", "double")
+            parsed_vals = tuple(
+                parse_val(v.replace(f"{e_ty} ", "").strip(), as_float=is_f_elem)
+                for v in raw_vals.split(",")
+                if v.strip()
+            )
+            default_wt = {"float": "f32", "double": "f64"}.get(e_ty, e_ty)
+            module_luts[g_sym] = (default_wt, parsed_vals)
 
         def ensure_block(label: str) -> BasicBlock:
             if label not in blocks:
@@ -347,6 +364,16 @@ class LLVMIRToSSALifter:
                 alias_ptr[lhs_name] = (parse_val(m_itop.group(1)), 0, False)
                 continue
 
+            m_lut_gep = re.match(
+                r"^getelementptr\s+\[(\d+)\s+x\s+(?:i8|i16|i32|i64|float|double)\],\s*ptr\s+@([A-Za-z0-9_.$]+),\s*i64\s+0,\s*i64\s+(.+)$",
+                rhs,
+            )
+            if m_lut_gep:
+                g_sym = m_lut_gep.group(2)
+                if g_sym in module_luts:
+                    lut_gep_map[lhs_name] = (g_sym, parse_val(m_lut_gep.group(3)))
+                    continue
+
             m_gep = re.match(r"^getelementptr\s+(i64|double|i8),\s*ptr\s+(%[A-Za-z0-9_.$]+),\s*i64\s+(.+)$", rhs)
             if m_gep:
                 elem_t = m_gep.group(1)
@@ -360,6 +387,17 @@ class LLVMIRToSSALifter:
             if m_load:
                 ld_ty = m_load.group(1)
                 p_name = m_load.group(2)[1:]
+                if p_name in lut_gep_map:
+                    g_sym, idx_op = lut_gep_map[p_name]
+                    def_wt, p_vals = module_luts[g_sym]
+                    ssa_fn.luts[g_sym] = (def_wt, p_vals)
+                    if ld_ty in ("i8", "i16", "i32", "float"):
+                        load_lut_narrow_map[lhs_name] = (g_sym, idx_op)
+                        continue
+                    is_f_ld = ld_ty == "double"
+                    res_v = get_or_create_var(lhs_tok, var_type="f64" if is_f_ld else "i64")
+                    cur_bb.add_instruction(SSAInstruction(res_v, "lut_load", [g_sym, "f64" if is_f_ld else "i64", idx_op]))
+                    continue
                 pt_entry = alias_ptr.get(p_name)
                 if pt_entry is None:
                     base_op, idx_op, is_byte_off = get_or_create_var(m_load.group(2)), 0, False
@@ -384,9 +422,16 @@ class LLVMIRToSSALifter:
             m_ext = re.match(r"^(sext|zext)\s+(i8|i16|i32)\s+(%[A-Za-z0-9_.$]+)\s+to\s+i64$", rhs)
             if m_ext:
                 ext_kind, ext_ty, src_n = m_ext.group(1), m_ext.group(2), m_ext.group(3)[1:]
+                width_lbl = ext_ty if ext_kind == "sext" else ("u" + ext_ty[1:])
+                if src_n in load_lut_narrow_map:
+                    g_sym, idx_op = load_lut_narrow_map[src_n]
+                    _, p_vals = module_luts[g_sym]
+                    ssa_fn.luts[g_sym] = (width_lbl, p_vals)
+                    res_v = get_or_create_var(lhs_tok, var_type="i64")
+                    cur_bb.add_instruction(SSAInstruction(res_v, "lut_load", [g_sym, width_lbl, idx_op]))
+                    continue
                 if src_n in load_narrow_map:
                     base_op, off_op, _ = load_narrow_map[src_n]
-                    width_lbl = ext_ty if ext_kind == "sext" else ("u" + ext_ty[1:])
                     res_v = get_or_create_var(lhs_tok, var_type="i64")
                     cur_bb.add_instruction(SSAInstruction(res_v, "load_off", [base_op, off_op, width_lbl]))
                     continue
@@ -394,6 +439,13 @@ class LLVMIRToSSALifter:
             m_fpext = re.match(r"^fpext\s+float\s+(%[A-Za-z0-9_.$]+)\s+to\s+double$", rhs)
             if m_fpext:
                 src_n = m_fpext.group(1)[1:]
+                if src_n in load_lut_narrow_map:
+                    g_sym, idx_op = load_lut_narrow_map[src_n]
+                    _, p_vals = module_luts[g_sym]
+                    ssa_fn.luts[g_sym] = ("f32", p_vals)
+                    res_v = get_or_create_var(lhs_tok, var_type="f64")
+                    cur_bb.add_instruction(SSAInstruction(res_v, "lut_load", [g_sym, "f32", idx_op]))
+                    continue
                 if src_n in load_f32_map:
                     base_op, off_op, _ = load_f32_map[src_n]
                     res_v = get_or_create_var(lhs_tok, var_type="f64")
@@ -704,6 +756,23 @@ class WATToSSALifter:
         if chunk is None:
             return None, "WAT_FUNC_NOT_FOUND"
         func_arities, func_ret_types = cls._extract_func_signatures(wat)
+        ro_luts: Dict[int, bytes] = {}
+        for dm in re.finditer(r'\(data\s+\(i32\.const\s+(\d+)\)\s+"([^"]*)"\)', wat):
+            addr = int(dm.group(1))
+            raw_s = dm.group(2)
+            out_b = bytearray()
+            si = 0
+            while si < len(raw_s):
+                if raw_s[si] == "\\" and si + 2 < len(raw_s):
+                    try:
+                        out_b.append(int(raw_s[si + 1 : si + 3], 16))
+                        si += 3
+                        continue
+                    except ValueError:
+                        pass
+                out_b.append(ord(raw_s[si]) & 0xFF)
+                si += 1
+            ro_luts[addr] = bytes(out_b)
 
         lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
         header = lines[0]
@@ -769,6 +838,7 @@ class WATToSSALifter:
             err = cls._lower_wat_block_lines(
                 body_lines, entry, env, next_var, has_return_ref=[False],
                 func_arities=func_arities, func_ret_types=func_ret_types,
+                ro_luts=ro_luts, out_luts=ssa_fn.luts,
             )
             if err:
                 return None, err
@@ -864,6 +934,8 @@ class WATToSSALifter:
                 next_var, edge_writes, preds_of, edges_by_src,
                 func_arities=func_arities,
                 func_ret_types=func_ret_types,
+                ro_luts=ro_luts,
+                out_luts=ssa_fn.luts,
             )
             if err:
                 return None, err
@@ -931,6 +1003,8 @@ class WATToSSALifter:
         pending_edge_locs: Optional[Dict[str, Any]] = None,
         func_arities: Optional[Dict[str, int]] = None,
         func_ret_types: Optional[Dict[str, str]] = None,
+        ro_luts: Optional[Dict[int, bytes]] = None,
+        out_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
     ) -> Optional[str]:
         if ln.startswith("i64.const "):
             stack.append(int(ln.split()[1]))
@@ -1096,6 +1170,30 @@ class WATToSSALifter:
                 base_op, idx_op, is_byte = addr_tok[1], addr_tok[2], False
             else:
                 base_op, idx_op, is_byte = addr_tok, 0, (ln == "f32.load" or ln in _wat_ld_widths)
+            if ro_luts and isinstance(base_op, int) and base_op in ro_luts and out_luts is not None:
+                from compiler.native_codegen import _LUT_PACK_SPEC
+                ro_w = _wat_ld_widths[ln] if ln in _wat_ld_widths else ("f32" if ln == "f32.load" else ("f64" if ln == "f64.load" else "i64"))
+                fmt_c, stride_b, sh_b = _LUT_PACK_SPEC.get(ro_w, ("q", 8, 3))
+                raw_seg = ro_luts[base_op]
+                cnt_e = max(1, len(raw_seg) // stride_b)
+                vals_t = struct.unpack(f"<{cnt_e}{fmt_c}", raw_seg[:cnt_e * stride_b])
+                ro_sym = f"_wro_{base_op}_{ro_w}"
+                out_luts[ro_sym] = (ro_w, vals_t)
+                unscaled_idx = idx_op
+                if stride_b != 1 and isinstance(idx_op, SSAVar):
+                    for prev_i in reversed(bb.instructions):
+                        if prev_i.result == idx_op:
+                            if prev_i.opcode == "mul" and len(prev_i.operands) == 2 and prev_i.operands[1] == stride_b:
+                                unscaled_idx = prev_i.operands[0]
+                            elif prev_i.opcode == "shl" and len(prev_i.operands) == 2 and prev_i.operands[1] == sh_b:
+                                unscaled_idx = prev_i.operands[0]
+                            break
+                elif stride_b != 1 and isinstance(idx_op, int) and idx_op % stride_b == 0:
+                    unscaled_idx = idx_op // stride_b
+                rv = next_var("wlut", var_type="f64" if ro_w in ("f32", "f64") else "i64")
+                bb.add_instruction(SSAInstruction(rv, "lut_load", [ro_sym, ro_w, unscaled_idx]))
+                stack.append(rv)
+                return None
             if ln in _wat_ld_widths:
                 w_lbl = _wat_ld_widths[ln]
                 rv = next_var(f"wld_{w_lbl}", var_type="i64")
@@ -1165,6 +1263,8 @@ class WATToSSALifter:
         has_return_ref: List[bool],
         func_arities: Optional[Dict[str, int]] = None,
         func_ret_types: Optional[Dict[str, str]] = None,
+        ro_luts: Optional[Dict[int, bytes]] = None,
+        out_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
     ) -> Optional[str]:
         stack: List[Any] = []
         for ln in body_lines:
@@ -1174,6 +1274,8 @@ class WATToSSALifter:
                 ln, stack, bb, env, next_var,
                 func_arities=func_arities,
                 func_ret_types=func_ret_types,
+                ro_luts=ro_luts,
+                out_luts=out_luts,
             )
             if err:
                 return err
@@ -1196,6 +1298,8 @@ class WATToSSALifter:
         edges_by_src: Dict[int, List[Tuple[int, Dict[str, Any]]]],
         func_arities: Optional[Dict[str, int]] = None,
         func_ret_types: Optional[Dict[str, str]] = None,
+        ro_luts: Optional[Dict[int, bytes]] = None,
+        out_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
     ) -> Optional[str]:
         stack: List[Any] = []
         i = 0
@@ -1267,6 +1371,8 @@ class WATToSSALifter:
                             bl, br_stack, bb, branch_env, next_var,
                             func_arities=func_arities,
                             func_ret_types=func_ret_types,
+                            ro_luts=ro_luts,
+                            out_luts=out_luts,
                         )
                         if err_s:
                             return None, {}, err_s
@@ -1295,6 +1401,8 @@ class WATToSSALifter:
                 ln, stack, bb, env, next_var,
                 func_arities=func_arities,
                 func_ret_types=func_ret_types,
+                ro_luts=ro_luts,
+                out_luts=out_luts,
             )
             if err:
                 return err

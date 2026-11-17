@@ -112,6 +112,7 @@ class SSAFunction:
         self.entry_block: Optional[BasicBlock] = None
         self.blocks: List[BasicBlock] = []
         self.source_file: str = "<module>"
+        self.luts: Dict[str, Tuple[str, Tuple[Any, ...]]] = {}
 
     def add_block(self, block: BasicBlock):
         if self.entry_block is None:
@@ -257,7 +258,11 @@ class AstToSsaLowering:
         ast.GtE: "fcmp_ge",
     }
 
-    def __init__(self, struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None):
+    def __init__(
+        self,
+        struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None,
+        global_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
+    ):
         self.var_versions: Dict[str, int] = {}
         self._block_counter: int = 0
         # Braun SSA bookkeeping
@@ -273,6 +278,7 @@ class AstToSsaLowering:
         self.struct_layouts: Dict[str, Dict[str, Tuple[int, str]]] = dict(struct_layouts or {})
         self.struct_meta: Dict[str, Tuple[int, int]] = {}
         self._var_struct_types: Dict[str, str] = {}
+        self.global_luts: Dict[str, Tuple[str, Tuple[Any, ...]]] = dict(global_luts or {})
 
     _CABI_SIZE_ALIGN: Dict[str, Tuple[int, int]] = {
         "i8": (1, 1), "u8": (1, 1),
@@ -366,6 +372,44 @@ class AstToSsaLowering:
                         changed = True
             if not changed:
                 break
+
+    @staticmethod
+    def _extract_const_num(node: ast.AST) -> Optional[Any]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            inner = AstToSsaLowering._extract_const_num(node.operand)
+            if inner is not None:
+                return -inner
+        return None
+
+    def register_luts_from_statements(self, stmts: List[ast.stmt]) -> None:
+        """Extracts top-level constant numeric array declarations into static .rodata LUT metadata."""
+        for stmt in stmts:
+            name: Optional[str] = None
+            val_node: Optional[ast.AST] = None
+            ann_node: Optional[ast.AST] = None
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                name = stmt.targets[0].id
+                val_node = stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                name = stmt.target.id
+                val_node = stmt.value
+                ann_node = stmt.annotation
+            if name and isinstance(val_node, (ast.List, ast.Tuple)) and val_node.elts:
+                nums = [self._extract_const_num(e) for e in val_node.elts]
+                if all(v is not None for v in nums):
+                    elem_wt: Optional[str] = None
+                    if ann_node is not None:
+                        norm = self._normalize_cabi_type(ann_node)
+                        if norm and norm.startswith("arr:"):
+                            elem_wt = norm.split(":", 2)[1]
+                        elif norm:
+                            elem_wt = norm
+                    if elem_wt is None:
+                        elem_wt = "f64" if any(isinstance(v, float) for v in nums) else "i64"
+                    coerced = tuple(float(v) if elem_wt in ("f32", "f64") else int(v) for v in nums)
+                    self.global_luts[name] = (elem_wt, coerced)
 
     def _resolve_lvalue_address(
         self, node: ast.AST
@@ -854,8 +898,8 @@ class AstToSsaLowering:
             isinstance(n, ast.Constant) and isinstance(n.value, float)
             for n in ast.walk(func_def)
         )
-        has_struct_or_width = bool(self.struct_layouts) or any(
-            isinstance(n, ast.Attribute) or (
+        has_struct_or_width = bool(self.struct_layouts) or bool(self.global_luts) or any(
+            isinstance(n, (ast.Attribute, ast.Match)) or (
                 isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Name)
                 and n.func.id in (
@@ -1100,6 +1144,92 @@ class AstToSsaLowering:
                 self._cur_block = None
             else:
                 self._cur_block = merge_bb
+
+        elif hasattr(ast, "Match") and isinstance(stmt, ast.Match):
+            subj = self._lower_expr(stmt.subject)
+            merge_bb = self._new_block("match_merge", seal=False)
+            for mcase in stmt.cases:
+                if self._cur_block is None or self._cur_block.is_terminated:
+                    break
+                cur_bb = self._cur_block
+                pat = mcase.pattern
+                is_uncond = (
+                    isinstance(pat, ast.MatchAs)
+                    and pat.pattern is None
+                    and pat.name is None
+                    and mcase.guard is None
+                )
+                if is_uncond:
+                    self._lower_stmt_list(mcase.body)
+                    end_bb = self._cur_block
+                    if end_bb is not None and not end_bb.is_terminated:
+                        end_bb.connect_to(merge_bb)
+                        self._emit(None, "br", [merge_bb.name], line=line)
+                    self._cur_block = None
+                    break
+
+                def _lower_pat_cond(p_node: ast.pattern) -> SSAVar:
+                    if isinstance(p_node, ast.MatchAs):
+                        if p_node.name is not None and self._cur_block is not None:
+                            self._write_variable(p_node.name, self._cur_block, subj)
+                        if p_node.pattern is None:
+                            return self._emit_const(1, line=line)
+                        return _lower_pat_cond(p_node.pattern)
+                    if isinstance(p_node, ast.MatchValue):
+                        pv = self._lower_expr(p_node.value)
+                        if subj.var_type == "f64" or pv.var_type == "f64":
+                            sf = self._promote_to_f64(subj, line=line)
+                            pf = self._promote_to_f64(pv, line=line)
+                            c = self._next_var("mfeq")
+                            self._emit(c, "fcmp_eq", [sf, pf], line=line)
+                            return c
+                        c = self._next_var("meq")
+                        self._emit(c, "cmp_eq", [subj, pv], line=line)
+                        return c
+                    if isinstance(p_node, ast.MatchSingleton):
+                        sv = self._emit_const(1 if p_node.value is True else 0, line=line)
+                        c = self._next_var("meqs")
+                        self._emit(c, "cmp_eq", [subj, sv], line=line)
+                        return c
+                    if isinstance(p_node, ast.MatchOr):
+                        acc_c = _lower_pat_cond(p_node.patterns[0])
+                        for sub_p in p_node.patterns[1:]:
+                            sub_c = _lower_pat_cond(sub_p)
+                            nxt_c = self._next_var("mor")
+                            self._emit(nxt_c, "or", [acc_c, sub_c], line=line)
+                            acc_c = nxt_c
+                        return acc_c
+                    return self._emit_const(0, line=line)
+
+                cond_v = _lower_pat_cond(pat)
+                if mcase.guard is not None:
+                    guard_v = self._lower_expr(mcase.guard)
+                    cmb = self._next_var("mguard")
+                    self._emit(cmb, "and", [cond_v, guard_v], line=line)
+                    cond_v = cmb
+
+                case_bb = self._new_block("match_case", seal=False)
+                next_bb = self._new_block("match_next", seal=False)
+                cur_bb.connect_to(case_bb)
+                cur_bb.connect_to(next_bb)
+                self._emit(None, "br_cond", [cond_v, case_bb.name, next_bb.name], line=line)
+
+                self._seal_block(case_bb)
+                self._cur_block = case_bb
+                self._lower_stmt_list(mcase.body)
+                c_end = self._cur_block
+                if c_end is not None and not c_end.is_terminated:
+                    c_end.connect_to(merge_bb)
+                    self._emit(None, "br", [merge_bb.name], line=line)
+
+                self._seal_block(next_bb)
+                self._cur_block = next_bb
+
+            if self._cur_block is not None and not self._cur_block.is_terminated:
+                self._cur_block.connect_to(merge_bb)
+                self._emit(None, "br", [merge_bb.name], line=line)
+            self._seal_block(merge_bb)
+            self._cur_block = merge_bb if merge_bb.predecessors else None
 
         elif isinstance(stmt, ast.While):
             pre_bb = self._cur_block
@@ -1493,6 +1623,15 @@ class AstToSsaLowering:
             return res
 
         elif isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and node.value.id in self.global_luts and not isinstance(node.slice, ast.Slice):
+                lut_name = node.value.id
+                l_wt, l_vals = self.global_luts[lut_name]
+                if self._fn is not None:
+                    self._fn.luts[lut_name] = (l_wt, l_vals)
+                idx_var = self._lower_expr(node.slice)
+                res = self._next_var("lut", var_type="f64" if l_wt in ("f32", "f64") else "i64")
+                self._emit(res, "lut_load", [lut_name, l_wt, idx_var], line=line)
+                return res
             base_var = self._lower_expr(node.value)
             if isinstance(node.slice, ast.Slice):
                 start_v = self._lower_expr(node.slice.lower) if node.slice.lower is not None else self._emit_const(0, line=line)
@@ -1952,11 +2091,13 @@ def lower_ast_to_ssa(
     param_names: Optional[List[str]] = None,
     optimize: bool = False,
     struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None,
+    global_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
 ) -> SSAFunction:
     """Lowers an AST FunctionDef, Module (first FunctionDef), or expression into Omni-SSA."""
-    lowering = AstToSsaLowering(struct_layouts=struct_layouts)
+    lowering = AstToSsaLowering(struct_layouts=struct_layouts, global_luts=global_luts)
     if isinstance(node, ast.Module):
         lowering.register_structs_from_statements(node.body)
+        lowering.register_luts_from_statements(node.body)
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef):
                 fn = lowering.lower_function_def(stmt)
@@ -1973,11 +2114,13 @@ def lower_source_to_ssa(
     fn_name: Optional[str] = None,
     optimize: bool = True,
     struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None,
+    global_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
 ) -> SSAFunction:
     """Parses Python source code and lowers the target function (or expression) into Omni-SSA."""
     tree = ast.parse(source_code)
-    lowering = AstToSsaLowering(struct_layouts=struct_layouts)
+    lowering = AstToSsaLowering(struct_layouts=struct_layouts, global_luts=global_luts)
     lowering.register_structs_from_statements(tree.body)
+    lowering.register_luts_from_statements(tree.body)
     for stmt in tree.body:
         if isinstance(stmt, ast.FunctionDef):
             if fn_name is None or stmt.name == fn_name:

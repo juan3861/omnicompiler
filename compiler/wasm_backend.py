@@ -204,7 +204,34 @@ class WasmBackend:
     # ------------------------------------------------------------------
     # Multi-Block Omni-SSA -> Structured WAT Lowering
     # ------------------------------------------------------------------
-    def _ssa_function_to_wat_func(self, ssa_func: SSAFunction) -> str:
+    _WASM_LUT_STRIDE = {
+        "i8": (1, "i64.load8_s"), "u8": (1, "i64.load8_u"),
+        "i16": (2, "i64.load16_s"), "u16": (2, "i64.load16_u"),
+        "i32": (4, "i64.load32_s"), "u32": (4, "i64.load32_u"),
+        "f32": (4, "f32.load"), "i64": (8, "i64.load"), "u64": (8, "i64.load"), "f64": (8, "f64.load"),
+    }
+
+    @classmethod
+    def _build_wat_rodata(cls, ssa_funcs: List[SSAFunction]) -> Tuple[Dict[Tuple[str, str], Tuple[int, str, int]], List[str]]:
+        """Assigns linear-memory .rodata addresses >= 245760 (0x3C000) and emits WAT (data ...) directives."""
+        from compiler.native_codegen import _pack_lut_bytes
+        ro_cursor = 245760  # Page 3 (0x3C000) cleanly disjoint from user vectors at < 240 KiB
+        addr_map: Dict[Tuple[str, str], Tuple[int, str, int]] = {}
+        data_lines: List[str] = []
+        for fn in ssa_funcs:
+            for lut_name, (wt, vals) in sorted((getattr(fn, "luts", {}) or {}).items()):
+                ro_cursor = (ro_cursor + 7) & ~7
+                packed = _pack_lut_bytes(wt, vals)
+                esc = "".join(f"\\{b:02x}" for b in packed)
+                data_lines.append(f'  (data (i32.const {ro_cursor}) "{esc}")')
+                stride, _ = cls._WASM_LUT_STRIDE.get(wt, (8, "i64.load"))
+                addr_map[(fn.name, lut_name)] = (ro_cursor, wt, stride)
+                ro_cursor += max(8, len(packed))
+        return addr_map, data_lines
+
+    def _ssa_function_to_wat_func(
+        self, ssa_func: SSAFunction, lut_addr_map: Optional[Dict[Tuple[str, str], Tuple[int, str, int]]] = None
+    ) -> str:
         """Lowers a single `SSAFunction` into a `(func ...)` WAT definition."""
         def _wty(vtype: str) -> str:
             return "f64" if vtype == "f64" else "i64"
@@ -437,6 +464,23 @@ class WasmBackend:
                         wat_lines.append(f"{indent}f64.store")
                     else:
                         wat_lines.append(f"{indent}i64.store")
+                elif opcode == "lut_load":
+                    lut_name = str(inst.operands[0])
+                    width = str(inst.operands[1])
+                    idx_op = inst.operands[2]
+                    base_ro, _w, stride = (lut_addr_map or {}).get((ssa_func.name, lut_name), (245760, width, 8))
+                    _, ld_instr = self._WASM_LUT_STRIDE.get(width, (8, "i64.load"))
+                    wat_lines.append(f"{indent}i64.const {base_ro}")
+                    wat_lines.append(f"{indent}{emit_operand(idx_op)}")
+                    if stride != 1:
+                        wat_lines.append(f"{indent}i64.const {stride}")
+                        wat_lines.append(f"{indent}i64.mul")
+                    wat_lines.append(f"{indent}i64.add")
+                    wat_lines.append(f"{indent}i32.wrap_i64")
+                    wat_lines.append(f"{indent}{ld_instr}")
+                    if width == "f32":
+                        wat_lines.append(f"{indent}f64.promote_f32")
+                    set_result(inst.result, indent)
                 elif opcode == "call":
                     callee = str(inst.operands[0])
                     for a in inst.operands[1:]:
@@ -507,21 +551,25 @@ class WasmBackend:
         Lowers single-block AND arbitrary multi-block `SSAFunction` CFGs (loops, branches,
         Phi nodes, recursion) into structured WebAssembly Text (WAT) with Linear Memory.
         """
-        return "\n".join([
-            "(module",
-            '  (memory (export "memory") 2)',
-            self._ssa_function_to_wat_func(ssa_func),
-            ")",
-        ])
+        lut_map, data_lines = self._build_wat_rodata([ssa_func])
+        pages = 4 if data_lines else 2
+        parts = ["(module", f'  (memory (export "memory") {pages})']
+        parts.extend(data_lines)
+        parts.append(self._ssa_function_to_wat_func(ssa_func, lut_addr_map=lut_map))
+        parts.append(")")
+        return "\n".join(parts)
 
     def ssa_module_to_wat(self, ssa_funcs: List[SSAFunction]) -> str:
         """Lowers multiple `SSAFunction`s into a unified multi-export WAT module."""
+        lut_map, data_lines = self._build_wat_rodata(ssa_funcs)
+        pages = 4 if data_lines else 2
         parts = [
             "(module",
-            '  (memory (export "memory") 2)',
+            f'  (memory (export "memory") {pages})',
         ]
+        parts.extend(data_lines)
         for fn in ssa_funcs:
-            parts.append(self._ssa_function_to_wat_func(fn))
+            parts.append(self._ssa_function_to_wat_func(fn, lut_addr_map=lut_map))
         parts.append(")")
         return "\n".join(parts)
 

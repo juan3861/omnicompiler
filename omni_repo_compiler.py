@@ -260,13 +260,18 @@ class OmniRepoCompiler:
         from compiler.ssa_ir import AstToSsaLowering
         struct_extractor = AstToSsaLowering()
         all_cls_stmts: List[ast.stmt] = []
+        all_lut_stmts: List[ast.stmt] = []
         for m, (mods, f_map, alias_map) in zip(manifests, scanned):
             for _fpath, mod_ast in mods:
                 for node in getattr(mod_ast, "body", []):
                     if isinstance(node, ast.ClassDef):
                         all_cls_stmts.append(node)
+                    elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                        all_lut_stmts.append(node)
         struct_extractor.register_structs_from_statements(all_cls_stmts)
+        struct_extractor.register_luts_from_statements(all_lut_stmts)
         global_struct_layouts.update(struct_extractor.struct_layouts)
+        global_luts = dict(struct_extractor.global_luts)
 
         for m, (mods, f_map, alias_map) in zip(manifests, scanned):
             # Resolve top-level function aliases (e.g., `colossus_entrypoint = omnicompiler_entrypoint`)
@@ -449,7 +454,12 @@ class OmniRepoCompiler:
             for r_name, r_funcs in repo_funcs_map.items():
                 for f_name, (f_src, f_ast) in r_funcs.items():
                     try:
-                        s_fn = lower_ast_to_ssa(f_ast, optimize=True, struct_layouts=global_struct_layouts)
+                        s_fn = lower_ast_to_ssa(
+                            f_ast,
+                            optimize=True,
+                            struct_layouts=global_struct_layouts,
+                            global_luts=global_luts,
+                        )
                         summary = thin_lto_opt.build_function_summary(f_name, r_name, f_ast, s_fn)
                         thin_lto_opt.index.add_function(summary)
                     except Exception:
@@ -502,7 +512,12 @@ class OmniRepoCompiler:
                         except Exception:
                             active_fn_def = orig_fn_def
 
-                    ssa_fn = lower_ast_to_ssa(active_fn_def, optimize=True, struct_layouts=global_struct_layouts)
+                    ssa_fn = lower_ast_to_ssa(
+                        active_fn_def,
+                        optimize=True,
+                        struct_layouts=global_struct_layouts,
+                        global_luts=global_luts,
+                    )
                     ssa_fn.source_file = src_file
 
                     # 1. Whole-Program ThinLTO (Cross-Repo Inlining & Constant Folding)
@@ -865,7 +880,7 @@ class OmniRepoCompiler:
                 artifact = codegen.compile_ssa(ssa_fn)
                 irc_coalesced_moves += getattr(artifact, "coalesced_moves", 0)
 
-                if effective_arch == "x86_64" and not artifact.relocations:
+                if effective_arch == "x86_64" and not artifact.relocations and not getattr(ssa_fn, "luts", None):
                     try:
                         from compiler.tco_and_layout import PeepholeMachineOptimizer
                         opt_bytes, ph_stats = PeepholeMachineOptimizer().optimize_bytes(
@@ -882,6 +897,8 @@ class OmniRepoCompiler:
                     artifact.code_bytes,
                     is_exported=unit_export_flag.get(ssa_fn.name, True),
                 )
+                if 0 < getattr(artifact, "code_end_offset", 0) < len(artifact.code_bytes):
+                    obj_mod.symbols[ssa_fn.name].size = artifact.code_end_offset
                 for rel in artifact.relocations:
                     obj_mod.add_call_relocation(
                         offset_in_text=sym_base_off + rel.offset,

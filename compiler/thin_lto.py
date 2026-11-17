@@ -94,22 +94,41 @@ class ThinLtoOptimizer:
         inst_count = sum(len(b.instructions) for b in ssa_fn.blocks)
         callees: List[str] = []
         has_calls = False
-        const_ret: Optional[int] = None
+        has_mem_writes = False
+        ret_constants: List[Any] = []
+        has_nonconst_ret = False
 
         for b in ssa_fn.blocks:
             for inst in b.instructions:
-                if inst.opcode == "call":
+                if inst.opcode in ("store", "store_off"):
+                    has_mem_writes = True
+                elif inst.opcode == "call":
                     has_calls = True
                     callee_name = str(inst.operands[0])
                     callees.append(callee_name)
-                elif inst.opcode == "ret" and inst.operands:
+                elif inst.opcode == "ret":
+                    if not inst.operands:
+                        has_nonconst_ret = True
+                        continue
                     ret_op = inst.operands[0]
-                    if isinstance(ret_op, (int, float)):
-                        const_ret = ret_op
+                    matched_c: Optional[Any] = None
+                    if isinstance(ret_op, (int, float)) and not isinstance(ret_op, bool):
+                        matched_c = ret_op
                     elif isinstance(ret_op, SSAVar):
                         for prev in b.instructions:
                             if prev.result == ret_op and prev.opcode in ("const", "fconst") and prev.operands and isinstance(prev.operands[0], (int, float)):
-                                const_ret = prev.operands[0]
+                                matched_c = prev.operands[0]
+                                break
+                    if matched_c is not None:
+                        ret_constants.append(matched_c)
+                    else:
+                        has_nonconst_ret = True
+
+        const_ret: Optional[Any] = None
+        if not has_nonconst_ret and not has_calls and not has_mem_writes and ret_constants:
+            first_c = ret_constants[0]
+            if all(type(c) is type(first_c) and c == first_c for c in ret_constants):
+                const_ret = first_c
 
         # Leaf function: has zero external function calls
         is_leaf = not has_calls
@@ -147,6 +166,8 @@ class ThinLtoOptimizer:
         call_inst = caller_block.instructions[call_idx]
         callee_fn = summary.ssa_fn
         assert callee_fn is not None
+        if getattr(callee_fn, "luts", None):
+            caller_fn.luts.update(callee_fn.luts)
 
         # 1. Split caller_block into head (stays in caller_block) and tail
         head_insts = caller_block.instructions[:call_idx]
@@ -332,6 +353,8 @@ class ThinLtoOptimizer:
 
                         # Pass 2: Single-block leaf function inlining
                         if summary and summary.can_inline and summary.ssa_fn and len(summary.ssa_fn.blocks) == 1:
+                            if getattr(summary.ssa_fn, "luts", None):
+                                ssa_fn.luts.update(summary.ssa_fn.luts)
                             target_blk = summary.ssa_fn.blocks[0]
                             param_map: Dict[str, Any] = {
                                 p_name: arg for p_name, arg in zip(summary.params, call_args)

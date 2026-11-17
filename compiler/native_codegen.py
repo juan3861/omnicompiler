@@ -42,6 +42,21 @@ class CompiledFunctionArtifact:
     leaf_register_mode: bool = False
     coalesced_moves: int = 0
     live_across_call_count: int = 0
+    code_end_offset: int = 0
+
+
+_LUT_PACK_SPEC: Dict[str, Tuple[str, int, int]] = {
+    "i8": ("b", 1, 0), "u8": ("B", 1, 0),
+    "i16": ("h", 2, 1), "u16": ("H", 2, 1),
+    "i32": ("i", 4, 2), "u32": ("I", 4, 2), "f32": ("f", 4, 2),
+    "i64": ("q", 8, 3), "u64": ("Q", 8, 3), "f64": ("d", 8, 3),
+}
+
+
+def _pack_lut_bytes(width: str, vals: Tuple[Any, ...]) -> bytes:
+    fmt, _, _ = _LUT_PACK_SPEC.get(width, ("q", 8, 3))
+    coerced = [float(v) if fmt in ("f", "d") else int(v) for v in vals]
+    return struct.pack(f"<{len(coerced)}{fmt}", *coerced)
 
 
 # ==============================================================================
@@ -95,6 +110,11 @@ class X64LabelBuffer:
 
     def call_label(self, label: str):
         self.emit(b"\xe8\x00\x00\x00\x00")
+        self.fixups.append((len(self.code) - 4, label))
+
+    def lea_r11_label(self, label: str):
+        # lea r11, [rip + disp32] -> 4C 8D 1D <disp32>
+        self.emit(b"\x4c\x8d\x1d\x00\x00\x00\x00")
         self.fixups.append((len(self.code) - 4, label))
 
     def call_external(self, symbol_name: str):
@@ -710,6 +730,35 @@ class X64CodeGenerator:
                         buf.emit(b"\x49\x8b\x03")                    # mov rax, qword ptr [r11]
                     write_result_from_reg(inst.result, "rax")
 
+                elif op == "lut_load":
+                    lut_name = str(inst.operands[0])
+                    width = str(inst.operands[1])
+                    idx_op = inst.operands[2]
+                    buf.lea_r11_label(f".L_ro_{lut_name}")
+                    resolve_operand_to_reg(idx_op, "rcx")
+                    _, _, sh = _LUT_PACK_SPEC.get(width, ("q", 8, 3))
+                    if sh > 0:
+                        buf.emit(b"\x48\xc1\xe1" + struct.pack("<B", sh))  # shl rcx, sh
+                    buf.emit(b"\x49\x01\xcb")                              # add r11, rcx
+                    if width == "i8":
+                        buf.emit(b"\x49\x0f\xbe\x03")
+                    elif width == "u8":
+                        buf.emit(b"\x41\x0f\xb6\x03")
+                    elif width == "i16":
+                        buf.emit(b"\x49\x0f\xbf\x03")
+                    elif width == "u16":
+                        buf.emit(b"\x41\x0f\xb7\x03")
+                    elif width == "i32":
+                        buf.emit(b"\x49\x63\x03")
+                    elif width == "u32":
+                        buf.emit(b"\x41\x8b\x03")
+                    elif width == "f32":
+                        buf.emit(b"\xf3\x41\x0f\x5a\x03")
+                        buf.emit(_x64_movq_r64_xmm("rax", 0))
+                    else:
+                        buf.emit(b"\x49\x8b\x03")
+                    write_result_from_reg(inst.result, "rax")
+
                 elif op == "store_off":
                     resolve_operand_to_reg(inst.operands[0], "r11")  # base ptr
                     resolve_operand_to_reg(inst.operands[1], "rcx")  # byte offset
@@ -840,6 +889,16 @@ class X64CodeGenerator:
             buf.emit(b"\x5d")  # pop rbp
             buf.emit(b"\xc3")  # ret
 
+        code_end_off = len(buf.code)
+        luts_map = getattr(fn, "luts", {}) or {}
+        if luts_map:
+            pad_rem = (-len(buf.code)) & 7
+            if pad_rem:
+                buf.emit(b"\x90" * pad_rem)
+            for l_name, (l_wt, l_vals) in sorted(luts_map.items()):
+                buf.mark(f".L_ro_{l_name}")
+                buf.emit(_pack_lut_bytes(l_wt, l_vals))
+
         final_bytes = buf.finalize()
         return CompiledFunctionArtifact(
             name=fn.name,
@@ -854,6 +913,7 @@ class X64CodeGenerator:
             leaf_register_mode=leaf_mode,
             coalesced_moves=alloc.get("coalesced_moves", 0),
             live_across_call_count=len(alloc.get("live_across_call", [])),
+            code_end_offset=code_end_off,
         )
 
     def emit_avx2_vector_add_i64(self) -> bytes:
@@ -1367,6 +1427,34 @@ class Arm64CodeGenerator:
                     else:
                         code.extend(_a64_u32(0xF940012B))  # LDR X11, [X9]
                     store_res(inst.result, 11)
+                elif op == "lut_load":
+                    lut_name = str(inst.operands[0])
+                    width = str(inst.operands[1])
+                    idx_op = inst.operands[2]
+                    b_fixups.append((len(code), "ADR", f".L_ro_{lut_name}"))
+                    code.extend(_a64_u32(0x10000009))  # ADR X9, #0 (patched)
+                    load_op(idx_op, 10)
+                    _, _, sh = _LUT_PACK_SPEC.get(width, ("q", 8, 3))
+                    code.extend(_a64_u32(0x8B0A0129 | ((sh & 63) << 10)))  # ADD X9, X9, X10, LSL #sh
+                    if width == "i8":
+                        code.extend(_a64_u32(0x3980012B))
+                    elif width == "u8":
+                        code.extend(_a64_u32(0x3940012B))
+                    elif width == "i16":
+                        code.extend(_a64_u32(0x7980012B))
+                    elif width == "u16":
+                        code.extend(_a64_u32(0x7940012B))
+                    elif width == "i32":
+                        code.extend(_a64_u32(0xB980012B))
+                    elif width == "u32":
+                        code.extend(_a64_u32(0xB940012B))
+                    elif width == "f32":
+                        code.extend(_a64_u32(0xBD400120))
+                        code.extend(_a64_u32(0x1E22C000))
+                        code.extend(_a64_u32(0x9E66000B))
+                    else:
+                        code.extend(_a64_u32(0xF940012B))
+                    store_res(inst.result, 11)
                 elif op == "store_off":
                     load_op(inst.operands[0], 9)   # base ptr in X9
                     load_op(inst.operands[1], 10)  # byte offset in X10
@@ -1478,17 +1566,34 @@ class Arm64CodeGenerator:
         code.extend(_a64_u32(0x910003FF | ((frame_size & 0xFFF) << 10)))
         # RET -> 0xD65F03C0
         code.extend(_a64_u32(0xD65F03C0))
+        a64_code_end = len(code)
+
+        luts_map = getattr(fn, "luts", {}) or {}
+        if luts_map:
+            if len(code) % 8 != 0:
+                code.extend(_a64_u32(0xD503201F))
+            for l_name, (l_wt, l_vals) in sorted(luts_map.items()):
+                mark(f".L_ro_{l_name}")
+                packed = _pack_lut_bytes(l_wt, l_vals)
+                rem4 = (-len(packed)) & 3
+                code.extend(packed + b"\x00" * rem4)
 
         # Patch branches
         for off, kind, lbl in b_fixups:
             target = labels[lbl]
-            imm_words = (target - off) // 4
-            if kind == "B":
-                inst_w = 0x14000000 | (imm_words & 0x03FFFFFF)
-            elif kind == "BL":
-                inst_w = 0x94000000 | (imm_words & 0x03FFFFFF)
-            else:  # CBNZ X9
-                inst_w = 0xB5000009 | ((imm_words & 0x7FFFF) << 5)
+            if kind == "ADR":
+                delta_b = target - off
+                immlo = delta_b & 0x3
+                immhi = (delta_b >> 2) & 0x7FFFF
+                inst_w = 0x10000009 | (immlo << 29) | (immhi << 5)
+            else:
+                imm_words = (target - off) // 4
+                if kind == "B":
+                    inst_w = 0x14000000 | (imm_words & 0x03FFFFFF)
+                elif kind == "BL":
+                    inst_w = 0x94000000 | (imm_words & 0x03FFFFFF)
+                else:  # CBNZ X9
+                    inst_w = 0xB5000009 | ((imm_words & 0x7FFFF) << 5)
             struct.pack_into("<I", code, off, inst_w)
 
         return CompiledFunctionArtifact(
@@ -1502,6 +1607,7 @@ class Arm64CodeGenerator:
             saved_nonvolatile_regs=["x29", "x30"],
             prologue_size=prologue_size,
             leaf_register_mode=False,
+            code_end_offset=a64_code_end,
         )
 
     def emit_neon_vector_add_f64(self) -> bytes:

@@ -404,6 +404,29 @@ class LLVMBackend:
                     else:
                         lines.append(f"    store i64 {val_op}, ptr {gep_v}, align 1")
 
+                elif opcode == "lut_load":
+                    lut_name = str(inst.operands[0])
+                    width = str(inst.operands[1])
+                    idx_op = ops[2]
+                    luts_m = getattr(ssa_func, "luts", {}) or {}
+                    n_elems = len(luts_m[lut_name][1]) if lut_name in luts_m else 1
+                    elem_ty, ext_kind = self._LLVM_LUT_ELEM.get(width, ("i64", None))
+                    gep_v = next_aux("lutp")
+                    lines.append(
+                        f"    {gep_v} = getelementptr [{n_elems} x {elem_ty}], ptr @__omni_lut_{ssa_func.name}_{lut_name}, i64 0, i64 {idx_op}"
+                    )
+                    if ext_kind in ("sext", "zext"):
+                        lv = next_aux("lutld")
+                        lines.append(f"    {lv} = load {elem_ty}, ptr {gep_v}, align 1")
+                        lines.append(f"    {lhs} = {ext_kind} {elem_ty} {lv} to i64")
+                    elif ext_kind == "fpext":
+                        lv = next_aux("lutf")
+                        lines.append(f"    {lv} = load float, ptr {gep_v}, align 1")
+                        lines.append(f"    {lhs} = fpext float {lv} to double")
+                    else:
+                        lines.append(f"    {lhs} = load {elem_ty}, ptr {gep_v}, align 1")
+                    last_val = lhs
+
                 elif opcode == "call":
                     callee = str(inst.operands[0])
                     arg_pairs = []
@@ -443,6 +466,32 @@ class LLVMBackend:
         lines.append("}")
         return "\n".join(lines)
 
+    _LLVM_LUT_ELEM = {
+        "i8": ("i8", "sext"), "u8": ("i8", "zext"),
+        "i16": ("i16", "sext"), "u16": ("i16", "zext"),
+        "i32": ("i32", "sext"), "u32": ("i32", "zext"),
+        "f32": ("float", "fpext"),
+        "i64": ("i64", None), "u64": ("i64", None),
+        "f64": ("double", None),
+    }
+
+    @classmethod
+    def _emit_llvm_luts(cls, ssa_funcs: List[SSAFunction]) -> List[str]:
+        out: List[str] = []
+        for fn in ssa_funcs:
+            for lut_name, (wt, vals) in sorted((getattr(fn, "luts", {}) or {}).items()):
+                elem_ty, _ = cls._LLVM_LUT_ELEM.get(wt, ("i64", None))
+                items = []
+                for v in vals:
+                    if elem_ty in ("double", "float"):
+                        items.append(f"{elem_ty} {repr(float(v))}")
+                    else:
+                        items.append(f"{elem_ty} {int(v)}")
+                out.append(
+                    f"@__omni_lut_{fn.name}_{lut_name} = private unnamed_addr constant [{len(vals)} x {elem_ty}] [{', '.join(items)}], align 8"
+                )
+        return out
+
     def ssa_to_llvm_ir(self, ssa_func: SSAFunction) -> str:
         """Lowers a single OmniCompiler `SSAFunction` (including multi-block CFGs & external decls) to LLVM IR."""
         externals: Dict[str, Any] = {}
@@ -451,6 +500,7 @@ class LLVMBackend:
             f'; ModuleID = "omni_{ssa_func.name}"',
             f'target triple = "{self.target_triple}"',
         ]
+        header.extend(self._emit_llvm_luts([ssa_func]))
         for ext_name, spec in sorted(externals.items()):
             if isinstance(spec, int):
                 ret_ty, arg_tys = "i64", ["i64"] * spec
@@ -469,6 +519,7 @@ class LLVMBackend:
             f'; ModuleID = "{module_name}"',
             f'target triple = "{self.target_triple}"',
         ]
+        lines.extend(self._emit_llvm_luts(ssa_funcs))
         for ext_name, spec in sorted(externals.items()):
             if ext_name not in defined:
                 if isinstance(spec, int):

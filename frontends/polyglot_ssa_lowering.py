@@ -336,6 +336,7 @@ class _PolyglotParser:
     def parse_module(self) -> Tuple[ast.Module, List[ast.FunctionDef], List[str]]:
         funcs: List[ast.FunctionDef] = []
         structs: List[ast.ClassDef] = []
+        luts: List[ast.stmt] = []
         errors: List[str] = []
 
         while not self._at("EOF"):
@@ -361,6 +362,11 @@ class _PolyglotParser:
                 structs.append(st_cls)
                 continue
 
+            lut_stmt = self._try_parse_top_level_lut()
+            if lut_stmt is not None:
+                luts.append(lut_stmt)
+                continue
+
             fn_start = self.pos
             try:
                 fn = self._try_parse_top_level_function()
@@ -377,9 +383,91 @@ class _PolyglotParser:
             # Skip non-function top-level declarations (package, import, type, struct, interface, etc.)
             self._skip_top_level_non_function()
 
-        mod = ast.Module(body=list(structs) + list(funcs), type_ignores=[])
+        mod = ast.Module(body=list(structs) + list(luts) + list(funcs), type_ignores=[])
         ast.fix_missing_locations(mod)
         return mod, funcs, errors
+
+    def _try_parse_top_level_lut(self) -> Optional[ast.stmt]:
+        save = self.pos
+        t = self._peek()
+        if t.kind != "ID":
+            return None
+        if t.val in ("pub", "export"):
+            self._advance()
+        if not self._at("ID") or self._peek().val not in ("const", "var", "let", "static"):
+            self.pos = save
+            return None
+        kw = self._advance()
+        if not self._at("ID"):
+            self.pos = save
+            return None
+        name_tok = self._advance()
+        ann_toks: List[str] = []
+        if self._at("OP", ":"):
+            self._advance()
+            br_l = 0
+            while not self._at("OP", "=") and not self._at("EOF"):
+                pk = self._peek()
+                if pk.val == "[":
+                    br_l += 1
+                elif pk.val == "]":
+                    br_l = max(0, br_l - 1)
+                if br_l == 0 and self._at("PUNCT", ";"):
+                    self.pos = save
+                    return None
+                ann_toks.append(self._advance().val)
+        if not self._at("OP", "="):
+            self.pos = save
+            return None
+        self._advance()
+        # Optional Go typed literal prefix: [N]T { ... }
+        if self.language == "go" and self._at("PUNCT", "["):
+            go_t: List[str] = []
+            while not self._at("PUNCT", "]") and not self._at("EOF"):
+                go_t.append(self._advance().val)
+            if self._at("PUNCT", "]"):
+                go_t.append(self._advance().val)
+            if self._at("ID"):
+                go_t.append(self._advance().val)
+            if not ann_toks:
+                ann_toks = go_t
+        if not (self._at("PUNCT", "[") or self._at("PUNCT", "{")):
+            self.pos = save
+            return None
+        close_delim = "]" if self._advance().val == "[" else "}"
+        elts: List[ast.expr] = []
+        while not self._at("PUNCT", close_delim) and not self._at("EOF"):
+            if self._at("PUNCT", ","):
+                self._advance()
+                continue
+            elt = self._parse_expr()
+            if isinstance(elt, (ast.Constant, ast.UnaryOp)):
+                elts.append(elt)
+            else:
+                self.pos = save
+                return None
+            if self._at("PUNCT", ","):
+                self._advance()
+        if not self._at("PUNCT", close_delim) or not elts:
+            self.pos = save
+            return None
+        self._advance()
+        self._consume_optional_semi()
+        list_node = ast.List(elts=elts, ctx=ast.Load(), lineno=name_tok.line)
+        if ann_toks:
+            ann_node = self._build_cabi_field_annotation(ann_toks, name_tok.line)
+            return ast.AnnAssign(
+                target=ast.Name(id=name_tok.val, ctx=ast.Store(), lineno=name_tok.line),
+                annotation=ann_node,
+                value=list_node,
+                simple=1,
+                lineno=name_tok.line,
+            )
+        return ast.Assign(
+            targets=[ast.Name(id=name_tok.val, ctx=ast.Store(), lineno=name_tok.line)],
+            value=list_node,
+            lineno=name_tok.line,
+        )
 
     @staticmethod
     def _build_cabi_field_annotation(ftype_toks: List[str], line: int) -> ast.expr:
@@ -1085,6 +1173,10 @@ class _PolyglotParser:
             ):
                 semi = self._consume_optional_semi()
                 return [ast.Return(value=ast.Constant(value=0), lineno=line)], semi
+            if self._at("ID", "match") and self.language == "rust":
+                m_if = self._parse_match_stmt()
+                semi = self._consume_optional_semi()
+                return [self._convert_if_tail_to_return(m_if)], semi
             expr = self._parse_expr()
             semi = self._consume_optional_semi()
             return [ast.Return(value=expr, lineno=line)], semi
@@ -1367,13 +1459,17 @@ class _PolyglotParser:
         sw_tok = self._expect("ID", "switch")
         disc = self._parse_condition_expr()
         self._expect("PUNCT", "{")
-        cases: List[Tuple[Optional[ast.expr], List[ast.stmt], int]] = []
+        cases: List[Tuple[List[ast.expr], List[ast.stmt], int]] = []
+        pending_vals: List[ast.expr] = []
         default_stmts: Optional[List[ast.stmt]] = None
 
         while not self._at("PUNCT", "}") and not self._at("EOF"):
             if self._at("ID", "case"):
                 ct = self._advance()
-                cval = self._parse_expr()
+                cvals = [self._parse_expr()]
+                while self._at("PUNCT", ","):
+                    self._advance()
+                    cvals.append(self._parse_expr())
                 self._expect("OP", ":")
                 cbody: List[ast.stmt] = []
                 while (
@@ -1391,8 +1487,11 @@ class _PolyglotParser:
                             continue
                         cbody.append(st)
                 if not cbody:
-                    cbody = [ast.Pass(lineno=ct.line)]
-                cases.append((cval, cbody, ct.line))
+                    # Empty fallthrough case (`case 1: case 2: ...`) merges into next non-empty case
+                    pending_vals.extend(cvals)
+                else:
+                    cases.append((pending_vals + cvals, cbody, ct.line))
+                    pending_vals = []
             elif self._at("ID", "default"):
                 dt = self._advance()
                 self._expect("OP", ":")
@@ -1412,11 +1511,16 @@ class _PolyglotParser:
                             continue
                         dbody.append(st)
                 default_stmts = dbody or [ast.Pass(lineno=dt.line)]
+                if pending_vals:
+                    cases.append((pending_vals, default_stmts, dt.line))
+                    pending_vals = []
             else:
                 raise PolyglotLoweringError(
                     f"Line {self._peek().line}: expected 'case' or 'default' inside switch"
                 )
         self._expect("PUNCT", "}")
+        if pending_vals:
+            cases.append((pending_vals, default_stmts or [ast.Pass(lineno=sw_tok.line)], sw_tok.line))
 
         if not cases:
             if default_stmts:
@@ -1434,10 +1538,19 @@ class _PolyglotParser:
             )
 
         tail: List[ast.stmt] = default_stmts or []
-        for cval, cbody, cline in reversed(cases):
-            cmp_test = ast.Compare(
-                left=disc, ops=[ast.Eq()], comparators=[cval], lineno=cline
+        for cvals, cbody, cline in reversed(cases):
+            cmp_test: ast.expr = ast.Compare(
+                left=disc, ops=[ast.Eq()], comparators=[cvals[0]], lineno=cline
             )
+            for extra_v in cvals[1:]:
+                cmp_test = ast.BoolOp(
+                    op=ast.Or(),
+                    values=[
+                        cmp_test,
+                        ast.Compare(left=disc, ops=[ast.Eq()], comparators=[extra_v], lineno=cline),
+                    ],
+                    lineno=cline,
+                )
             node = ast.If(test=cmp_test, body=cbody, orelse=tail, lineno=cline)
             tail = [node]
         return tail[0]  # type: ignore[return-value]

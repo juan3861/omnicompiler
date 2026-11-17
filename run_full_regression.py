@@ -27,6 +27,7 @@ test_modules = [
     "tests.test_alpha_c33_cabi_structs_narrow_widths_and_f64_ffi",
     "tests.test_alpha_c34_sub32_widths_and_nested_structs",
     "tests.test_alpha_c35_embedded_arrays_and_cabi_strides",
+    "tests.test_alpha_c36_match_switch_and_rodata_luts",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]
