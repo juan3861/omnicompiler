@@ -79,6 +79,7 @@ class SSATranslationValidator:
 
     _PROOF_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     _PROOF_CACHE_LOCK = threading.Lock()
+    _Z3_MAIN_CTX_LOCK = threading.RLock()
     _PROOF_CACHE_MAX = 4096
 
     def __init__(
@@ -88,12 +89,14 @@ class SSATranslationValidator:
         enable_inductive_loops: bool = False,
         enable_call_congruence: bool = False,
         enable_float_theory: bool = False,
+        disk_cache: Optional[Any] = None,
     ):
         self.enable_memory_theory = enable_memory_theory
         self.max_loop_unroll = max(0, int(max_loop_unroll))
         self.enable_inductive_loops = bool(enable_inductive_loops)
         self.enable_call_congruence = bool(enable_call_congruence)
         self.enable_float_theory = bool(enable_float_theory)
+        self.disk_cache = disk_cache
         self.proof_cache_hits = 0
         self.proof_cache_misses = 0
 
@@ -2517,13 +2520,30 @@ class SSATranslationValidator:
             res_copy["cached"] = True
             return res_copy
 
+        disk_key = "|".join(str(x) for x in cache_key)
+        if self.disk_cache is not None and self.disk_cache.is_enabled:
+            disk_cached = self.disk_cache.get_smt_proof(disk_key)
+            if disk_cached is not None:
+                with self._PROOF_CACHE_LOCK:
+                    self._PROOF_CACHE[cache_key] = dict(disk_cached)
+                self.proof_cache_hits += 1
+                res_copy = dict(disk_cached)
+                res_copy["cached"] = True
+                return res_copy
+
         self.proof_cache_misses += 1
-        res = self._verify_equivalence_uncached(ssa_before, ssa_after, timeout_ms=timeout_ms)
+        with self._Z3_MAIN_CTX_LOCK:
+            res = self._verify_equivalence_uncached(ssa_before, ssa_after, timeout_ms=timeout_ms)
         if not str(res.get("status", "")).startswith("UNKNOWN"):
             with self._PROOF_CACHE_LOCK:
                 if len(self._PROOF_CACHE) >= self._PROOF_CACHE_MAX:
                     self._PROOF_CACHE.clear()
                 self._PROOF_CACHE[cache_key] = dict(res)
+            if self.disk_cache is not None and self.disk_cache.is_enabled:
+                try:
+                    self.disk_cache.put_smt_proof(disk_key, res)
+                except Exception:
+                    pass
         return res
 
     def _verify_equivalence_uncached(
@@ -2733,12 +2753,14 @@ class VerifiedPassRunner:
         max_loop_unroll: int = 0,
         enable_inductive_loops: bool = False,
         enable_float_theory: bool = False,
+        disk_cache: Optional[Any] = None,
     ):
         self.validator = SSATranslationValidator(
             enable_memory_theory=enable_memory_theory,
             max_loop_unroll=max_loop_unroll,
             enable_inductive_loops=enable_inductive_loops,
             enable_float_theory=enable_float_theory,
+            disk_cache=disk_cache,
         )
         self.timeout_ms = timeout_ms
 

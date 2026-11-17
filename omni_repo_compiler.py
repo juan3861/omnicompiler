@@ -19,6 +19,7 @@ from typing import Dict, List, Any, Optional, Set, Tuple
 
 from orchestrator.repo_manifest_ingestor import RepoManifestIngestor, RepoTopologyResolver, RepoManifest
 from orchestrator.salsa_query_engine import SalsaQueryEngine
+from orchestrator.persistent_salsa_cache import PersistentSalsaCache
 from slicer.persistent_cpg import PersistentCodePropertyGraph
 from adapters.universal_abi_bridge import UniversalAbiBridge
 from compiler.object_linker import NativeObjectLinker, ObjectModule, load_coff_object, load_elf_object
@@ -187,6 +188,9 @@ class OmniRepoCompiler:
         self.dwarf_emitter = DwarfV5Emitter()
         self._salsa_lock = threading.Lock()
         self.salsa = SalsaQueryEngine()
+        cache_db_path = f"{db_path}.salsa_cache.db" if (db_path and db_path != ":memory:") else ":memory:"
+        self._disk_cache = PersistentSalsaCache(cache_db_path)
+        self.backend_validator.validator.disk_cache = self._disk_cache
         self._salsa_hits = 0
         self._salsa_misses = 0
         self._salsa_obj_hits = 0
@@ -199,6 +203,12 @@ class OmniRepoCompiler:
         self._cpg_topo_digest: Optional[str] = None
         self._cpg_last_taint_leak: Optional[Any] = None
         self.salsa.register_query("parsed_module", self._salsa_parse_file)
+
+    def close(self) -> None:
+        if getattr(self, "_disk_cache", None) is not None:
+            self._disk_cache.close()
+        if getattr(self, "cpg", None) is not None:
+            self.cpg.close()
 
     def _salsa_parse_file(self, norm_path: str) -> Optional[_CachedAstPayload]:
         self._salsa_misses += 1
@@ -726,7 +736,7 @@ class OmniRepoCompiler:
             except Exception:
                 pass
 
-        # Passes 6-11: SMT-Gated Optimization Passes (QF_ABV Memory + Bounded + Unbounded Inductive Loops)
+        # Passes 6-11: Parallel SMT-Gated Optimization Passes (QF_ABV Memory + Bounded + Unbounded Inductive Loops)
         from validation.ssa_translation_validator import VerifiedPassRunner
         smt_runner = VerifiedPassRunner(
             timeout_ms=300,
@@ -734,94 +744,117 @@ class OmniRepoCompiler:
             max_loop_unroll=4,
             enable_inductive_loops=True,
             enable_float_theory=True,
+            disk_cache=self._disk_cache,
         )
 
-        def _run_smt_gated_pass(fn_obj, pass_callable, counter_key=None):
-            nonlocal smt_pass_proofs, smt_pass_rollbacks
-            out_fn, p_stats, ver_rep = smt_runner.run_verified_pass(fn_obj, pass_callable)
-            if ver_rep.get("verified"):
-                smt_pass_proofs += 1
-            if ver_rep.get("rolled_back"):
-                smt_pass_rollbacks += 1
-                return out_fn, 0
-            return out_fn, p_stats.get(counter_key, 0) if counter_key else p_stats
+        def _optimize_single_fn_smt_passes(item: Tuple[str, Any]) -> Tuple[str, Any, Dict[str, int]]:
+            f_name, s_fn = item
+            local_stats = {
+                "smt_pass_proofs": 0,
+                "smt_pass_rollbacks": 0,
+                "sccp_folded_branches": 0,
+                "gvn_eliminated_exprs": 0,
+                "licm_hoisted_insts": 0,
+                "sroa_replaced_allocas": 0,
+                "sroa_eliminated_mem_ops": 0,
+                "dse_eliminated_stores": 0,
+                "forwarded_loads": 0,
+                "devirtualized_calls": 0,
+                "tco_converted_calls": 0,
+                "reordered_blocks": 0,
+            }
 
-        for fn_name in list(ssa_program.keys()):
-            if fn_name in ssa_preoptimized_names:
-                continue
-            ssa_fn = ssa_program[fn_name]
+            def _run_local(fn_obj, pass_callable, counter_key=None):
+                out_fn, p_stats, ver_rep = smt_runner.run_verified_pass(fn_obj, pass_callable)
+                if ver_rep.get("verified"):
+                    local_stats["smt_pass_proofs"] += 1
+                if ver_rep.get("rolled_back"):
+                    local_stats["smt_pass_rollbacks"] += 1
+                    return out_fn, 0
+                return out_fn, p_stats.get(counter_key, 0) if counter_key else p_stats
 
-            # 6. Sparse Conditional Constant Propagation (SCCP)
             try:
                 from compiler.ip_sccp_gvn import SCCPPass
-                ssa_fn, c_val = _run_smt_gated_pass(ssa_fn, SCCPPass().run_on_function, "sccp_folded_branches")
-                sccp_folded_branches += c_val
+                s_fn, c_val = _run_local(s_fn, SCCPPass().run_on_function, "sccp_folded_branches")
+                local_stats["sccp_folded_branches"] += c_val
             except Exception:
                 pass
-
-            # 7. Dominator-Tree Scoped Global Value Numbering (GVN)
             try:
                 from compiler.ip_sccp_gvn import GlobalValueNumberingPass
-                ssa_fn, c_val = _run_smt_gated_pass(ssa_fn, GlobalValueNumberingPass().run_on_function, "gvn_eliminated_exprs")
-                gvn_eliminated_exprs += c_val
+                s_fn, c_val = _run_local(s_fn, GlobalValueNumberingPass().run_on_function, "gvn_eliminated_exprs")
+                local_stats["gvn_eliminated_exprs"] += c_val
             except Exception:
                 pass
-
-            # 8. Loop-Invariant Code Motion (LICM)
             try:
                 from compiler.licm_and_dse import LICMPass
-                ssa_fn, c_val = _run_smt_gated_pass(ssa_fn, LICMPass().run_on_function, "licm_hoisted_insts")
-                licm_hoisted_insts += c_val
+                s_fn, c_val = _run_local(s_fn, LICMPass().run_on_function, "licm_hoisted_insts")
+                local_stats["licm_hoisted_insts"] += c_val
             except Exception:
                 pass
-
-            # 8b. Scalar Replacement of Aggregates (SROA)
             try:
                 from compiler.sroa_and_devirt import SROAPass
-                ssa_fn, p_stats = _run_smt_gated_pass(ssa_fn, SROAPass().run_on_function)
+                s_fn, p_stats = _run_local(s_fn, SROAPass().run_on_function)
                 if isinstance(p_stats, dict):
-                    sroa_replaced_allocas += p_stats.get("sroa_replaced_allocas", 0)
-                    sroa_eliminated_mem_ops += p_stats.get("sroa_eliminated_mem_ops", 0)
+                    local_stats["sroa_replaced_allocas"] += p_stats.get("sroa_replaced_allocas", 0)
+                    local_stats["sroa_eliminated_mem_ops"] += p_stats.get("sroa_eliminated_mem_ops", 0)
             except Exception:
                 pass
-
-            # 9. Alias-Guided Dead Store Elimination (DSE) & Store-to-Load Forwarding
             try:
                 from compiler.licm_and_dse import DSEPass
-                ssa_fn, p_stats = _run_smt_gated_pass(ssa_fn, DSEPass().run_on_function)
+                s_fn, p_stats = _run_local(s_fn, DSEPass().run_on_function)
                 if isinstance(p_stats, dict):
-                    dse_eliminated_stores += p_stats.get("dse_eliminated_stores", 0)
-                    forwarded_loads += p_stats.get("forwarded_loads", 0)
+                    local_stats["dse_eliminated_stores"] += p_stats.get("dse_eliminated_stores", 0)
+                    local_stats["forwarded_loads"] += p_stats.get("forwarded_loads", 0)
             except Exception:
                 pass
-
-            # 9b. Speculative Devirtualization with Guarded Fallback
             if speculative_targets:
                 try:
                     from compiler.sroa_and_devirt import DevirtualizationPass
-                    ssa_fn, dev_stats = DevirtualizationPass().run_on_function(
-                        ssa_fn, speculative_targets=speculative_targets
+                    s_fn, dev_stats = DevirtualizationPass().run_on_function(
+                        s_fn, speculative_targets=speculative_targets
                     )
-                    devirtualized_calls += dev_stats.get("devirtualized_calls", 0)
+                    local_stats["devirtualized_calls"] += dev_stats.get("devirtualized_calls", 0)
                 except Exception:
                     pass
-
-            # 10. Tail-Call Optimization (TCO)
             try:
                 from compiler.tco_and_layout import TailCallOptimizationPass
-                ssa_fn, c_val = _run_smt_gated_pass(ssa_fn, TailCallOptimizationPass().run_on_function, "tco_converted_calls")
-                tco_converted_calls += c_val
+                s_fn, c_val = _run_local(s_fn, TailCallOptimizationPass().run_on_function, "tco_converted_calls")
+                local_stats["tco_converted_calls"] += c_val
             except Exception:
                 pass
-
-            # 11. Hot/Cold Basic-Block Layout Ordering
             try:
                 from compiler.tco_and_layout import BlockLayoutPass
-                ssa_fn, c_val = _run_smt_gated_pass(ssa_fn, BlockLayoutPass().run_on_function, "reordered_blocks")
-                reordered_blocks += c_val
+                s_fn, c_val = _run_local(s_fn, BlockLayoutPass().run_on_function, "reordered_blocks")
+                local_stats["reordered_blocks"] += c_val
             except Exception:
                 pass
 
+            return f_name, s_fn, local_stats
+
+        opt_targets = [
+            (fn_name, ssa_program[fn_name])
+            for fn_name in list(ssa_program.keys())
+            if fn_name not in ssa_preoptimized_names
+        ]
+        if len(opt_targets) >= 4:
+            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+                opt_results = list(pool.map(_optimize_single_fn_smt_passes, opt_targets))
+        else:
+            opt_results = [_optimize_single_fn_smt_passes(it) for it in opt_targets]
+
+        for fn_name, ssa_fn, st in opt_results:
+            smt_pass_proofs += st["smt_pass_proofs"]
+            smt_pass_rollbacks += st["smt_pass_rollbacks"]
+            sccp_folded_branches += st["sccp_folded_branches"]
+            gvn_eliminated_exprs += st["gvn_eliminated_exprs"]
+            licm_hoisted_insts += st["licm_hoisted_insts"]
+            sroa_replaced_allocas += st["sroa_replaced_allocas"]
+            sroa_eliminated_mem_ops += st["sroa_eliminated_mem_ops"]
+            dse_eliminated_stores += st["dse_eliminated_stores"]
+            forwarded_loads += st["forwarded_loads"]
+            devirtualized_calls += st["devirtualized_calls"]
+            tco_converted_calls += st["tco_converted_calls"]
+            reordered_blocks += st["reordered_blocks"]
             ssa_program[fn_name] = ssa_fn
             if fn_name in ssa_opt_keys:
                 self._salsa_ssa_cache[ssa_opt_keys[fn_name]] = clone_ssa_function(ssa_fn)
@@ -845,6 +878,11 @@ class OmniRepoCompiler:
             ssa_dig = canonical_ssa_digest(ssa_fn)
             b_cache_key = (ssa_dig, tuple(sorted(p_struct_map.items())), struct_sizes_key)
             cached_bd = self._salsa_bounds_cache.get(b_cache_key)
+            if cached_bd is None and self._disk_cache.is_enabled:
+                disk_bd = self._disk_cache.get_bounds_proof(repr(b_cache_key))
+                if disk_bd is not None:
+                    cached_bd = disk_bd
+                    self._salsa_bounds_cache[b_cache_key] = disk_bd
             if cached_bd is not None:
                 b_res, d_res = cached_bd
                 if b_res is not None:
@@ -875,6 +913,11 @@ class OmniRepoCompiler:
 
             for f_n, c_key, b_r, d_r in eval_results:
                 self._salsa_bounds_cache[c_key] = (b_r, d_r)
+                if self._disk_cache.is_enabled:
+                    try:
+                        self._disk_cache.put_bounds_proof(repr(c_key), b_r, d_r)
+                    except Exception:
+                        pass
                 if b_r is not None:
                     z3_bounds_checks_passed += b_r.get("checks_passed", 0)
                     for v in b_r.get("violations", []):
@@ -1083,6 +1126,11 @@ class OmniRepoCompiler:
                     continue
                 obj_key = (canonical_ssa_digest(ssa_fn), effective_arch, effective_os, "native")
                 cached_art = self._salsa_obj_cache.get(obj_key)
+                if cached_art is None and self._disk_cache.is_enabled:
+                    disk_art = self._disk_cache.get_compiled_obj(repr(obj_key))
+                    if disk_art is not None:
+                        cached_art = disk_art
+                        self._salsa_obj_cache[obj_key] = disk_art
                 if cached_art is not None:
                     self._salsa_obj_hits += 1
                     artifact = cached_art
@@ -1100,6 +1148,11 @@ class OmniRepoCompiler:
                         except Exception:
                             pass
                     self._salsa_obj_cache[obj_key] = artifact
+                    if self._disk_cache.is_enabled:
+                        try:
+                            self._disk_cache.put_compiled_obj(repr(obj_key), artifact)
+                        except Exception:
+                            pass
                 irc_coalesced_moves += getattr(artifact, "coalesced_moves", 0)
 
                 sym_base_off = len(obj_mod.text_bytes)
