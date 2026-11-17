@@ -826,7 +826,7 @@ class OmniRepoCompiler:
             if fn_name in ssa_opt_keys:
                 self._salsa_ssa_cache[ssa_opt_keys[fn_name]] = clone_ssa_function(ssa_fn)
 
-        # Stage 5c: Z3 SSA Memory Bounds & Pointer Disjointness Verification (Salsa-cached by SSA digest)
+        # Stage 5c: Z3 SSA Memory Bounds & Pointer Disjointness Verification (Salsa-cached + parallel z3.Context)
         _timings_ms["stage5_ssa_opt_smt"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
         _t_stage = time.perf_counter()
         from validation.ssa_translation_validator import canonical_ssa_digest
@@ -834,6 +834,7 @@ class OmniRepoCompiler:
         z3_bounds_violations: List[Dict[str, Any]] = []
         pointer_disjoint_reports: List[Dict[str, Any]] = []
         struct_sizes_key = tuple(sorted(global_struct_sizes.items()))
+        bounds_misses: List[Tuple[str, Any, Dict[str, str], Tuple[Any, ...]]] = []
         for fn_name, ssa_fn in ssa_program.items():
             fdef = all_ast_funcs.get(fn_name) or all_ast_funcs.get(fn_name.split("__spec_", 1)[0])
             p_struct_map: Dict[str, str] = {}
@@ -846,21 +847,40 @@ class OmniRepoCompiler:
             cached_bd = self._salsa_bounds_cache.get(b_cache_key)
             if cached_bd is not None:
                 b_res, d_res = cached_bd
+                if b_res is not None:
+                    z3_bounds_checks_passed += b_res.get("checks_passed", 0)
+                    for v in b_res.get("violations", []):
+                        z3_bounds_violations.append({"function": fn_name, **v})
+                if d_res.get("pointer_params"):
+                    pointer_disjoint_reports.append({"function": fn_name, **d_res})
             else:
-                b_res = None
-                if p_struct_map and global_struct_sizes:
-                    b_res = self.biabduction.verify_ssa_memory_bounds(
-                        ssa_fn, struct_sizes=global_struct_sizes, param_struct_map=p_struct_map
-                    )
-                d_res = self.biabduction.verify_ssa_pointer_disjointness(ssa_fn)
-                self._salsa_bounds_cache[b_cache_key] = (b_res, d_res)
+                bounds_misses.append((fn_name, ssa_fn, p_struct_map, b_cache_key))
 
-            if b_res is not None:
-                z3_bounds_checks_passed += b_res.get("checks_passed", 0)
-                for v in b_res.get("violations", []):
-                    z3_bounds_violations.append({"function": fn_name, **v})
-            if d_res.get("pointer_params"):
-                pointer_disjoint_reports.append({"function": fn_name, **d_res})
+        if bounds_misses:
+            def _eval_bounds(item: Tuple[str, Any, Dict[str, str], Tuple[Any, ...]]):
+                f_n, s_fn, p_map, c_key = item
+                b_r = None
+                if p_map and global_struct_sizes:
+                    b_r = self.biabduction.verify_ssa_memory_bounds(
+                        s_fn, struct_sizes=global_struct_sizes, param_struct_map=p_map
+                    )
+                d_r = self.biabduction.verify_ssa_pointer_disjointness(s_fn)
+                return f_n, c_key, b_r, d_r
+
+            if len(bounds_misses) >= 4:
+                with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+                    eval_results = list(pool.map(_eval_bounds, bounds_misses))
+            else:
+                eval_results = [_eval_bounds(it) for it in bounds_misses]
+
+            for f_n, c_key, b_r, d_r in eval_results:
+                self._salsa_bounds_cache[c_key] = (b_r, d_r)
+                if b_r is not None:
+                    z3_bounds_checks_passed += b_r.get("checks_passed", 0)
+                    for v in b_r.get("violations", []):
+                        z3_bounds_violations.append({"function": f_n, **v})
+                if d_r.get("pointer_params"):
+                    pointer_disjoint_reports.append({"function": f_n, **d_r})
 
         results["stages"]["separation_logic"]["z3_bounds_verified"] = len(z3_bounds_violations) == 0
         results["stages"]["separation_logic"]["z3_bounds_checks_passed"] = z3_bounds_checks_passed

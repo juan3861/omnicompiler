@@ -2748,7 +2748,22 @@ class VerifiedPassRunner:
         pass_fn: Callable[[SSAFunction], Tuple[SSAFunction, Dict[str, Any]]],
     ) -> Tuple[SSAFunction, Dict[str, Any], Dict[str, Any]]:
         snapshot = clone_ssa_function(fn)
+        dig_before = canonical_ssa_digest(snapshot)
         candidate_fn, pass_stats = pass_fn(fn)
+        dig_after = canonical_ssa_digest(candidate_fn)
+        if dig_before == dig_after:
+            self.validator.proof_cache_hits += 1
+            return candidate_fn, pass_stats, {
+                "verified": True,
+                "rolled_back": False,
+                "verdict": {
+                    "proven": True,
+                    "status": "PROVEN_IDENTITY_NOOP",
+                    "counterexample": None,
+                    "bounded": False,
+                    "cached": True,
+                },
+            }
         verdict = self.validator.verify_equivalence(snapshot, candidate_fn, timeout_ms=self.timeout_ms)
 
         if verdict["status"] == "REFUTED_COUNTEREXAMPLE":
