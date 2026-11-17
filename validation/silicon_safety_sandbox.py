@@ -52,6 +52,7 @@ try:
         UC_ARM64_REG_SP,
         UC_ARM64_REG_LR,
         UC_ARM64_REG_PC,
+        UC_ARM64_REG_CPACR_EL1,
     )
     UNICORN_AVAILABLE = True
 except ImportError:
@@ -210,6 +211,8 @@ class SiliconSafetySandbox:
 
         try:
             mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+            cpacr = mu.reg_read(UC_ARM64_REG_CPACR_EL1)
+            mu.reg_write(UC_ARM64_REG_CPACR_EL1, cpacr | (0x3 << 20))
             mu.mem_map(self.CODE_ADDR, code_map_sz)
             mu.mem_map(self.STACK_ADDR, self.MEMORY_SIZE)
             mu.mem_map(self.STOP_ADDR, self.MEMORY_SIZE)

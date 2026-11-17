@@ -37,10 +37,14 @@ GVN_PURE_OPCODES = frozenset({
     "shl", "shr", "sar", "and", "or", "xor",
     "neg", "not",
     "cmp_eq", "cmp_ne", "cmp_lt", "cmp_le", "cmp_gt", "cmp_ge",
+    "fconst", "fneg", "fadd", "fsub", "fmul", "fdiv",
+    "fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge",
+    "sitofp", "fptosi",
 })
 
 COMMUTATIVE_OPCODES = frozenset({
     "add", "mul", "and", "or", "xor", "cmp_eq", "cmp_ne",
+    "fadd", "fmul", "fcmp_eq", "fcmp_ne",
 })
 
 
@@ -50,6 +54,7 @@ def clone_ssa_function(fn: SSAFunction, new_name: Optional[str] = None) -> SSAFu
         name=new_name or fn.name,
         params=list(fn.params),
         param_types=dict(fn.param_types),
+        return_type=getattr(fn, "return_type", "i64"),
     )
     cloned.source_file = fn.source_file
 

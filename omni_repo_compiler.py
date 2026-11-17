@@ -38,10 +38,12 @@ from compiler.audit_ledger import create_compilation_audit_ledger, save_audit_le
 
 
 NATIVE_BUILTIN_CALLS = frozenset({
-    "abs", "min", "max", "int", "range", "len",
+    "abs", "min", "max", "int", "float", "range", "len",
     "omni_alloc", "omni_list_new", "omni_list_len", "omni_list_get", "omni_list_set", "omni_list_append",
     "omni_dict_new", "omni_dict_set", "omni_dict_get", "omni_dict_len",
     "omni_item_get", "omni_item_set", "omni_item_len",
+    "omni_list_vec_add", "omni_list_vec_dot", "omni_list_sum",
+    "omni_list_vec_add_f64", "omni_list_vec_dot_f64", "omni_list_sum_f64",
 })
 
 
@@ -560,6 +562,7 @@ class OmniRepoCompiler:
             enable_memory_theory=True,
             max_loop_unroll=4,
             enable_inductive_loops=True,
+            enable_float_theory=True,
         )
 
         def _run_smt_gated_pass(fn_obj, pass_callable, counter_key=None):
@@ -941,7 +944,8 @@ class OmniRepoCompiler:
         asm_all_valid = True
         if effective_arch == "x86_64":
             for mod in self.linker.modules:
-                sorted_syms = sorted(mod.symbols.values(), key=lambda sd: sd.offset)
+                text_syms = [sd for sd in mod.symbols.values() if getattr(sd, "section", ".text") == ".text"]
+                sorted_syms = sorted(text_syms, key=lambda sd: sd.offset)
                 for idx_s, sym_def in enumerate(sorted_syms):
                     next_off = sorted_syms[idx_s + 1].offset if idx_s + 1 < len(sorted_syms) else sym_def.offset + sym_def.size
                     end_off = min(sym_def.offset + sym_def.size, next_off)
@@ -973,6 +977,15 @@ class OmniRepoCompiler:
         if entry_export in all_ast_funcs:
             entry_arity = max(1, len(all_ast_funcs[entry_export].args.args))
         sim_args = [10] + [1] * max(0, entry_arity - 1)
+        if entry_export in ssa_program:
+            ent_ssa = ssa_program[entry_export]
+            if any(ent_ssa.param_types.get(p) in ("ptr", "ptr_f64") for p in ent_ssa.params):
+                sim_args = [
+                    (self.sandbox.STACK_ADDR + 0x9000 + idx_p * 0x800)
+                    if ent_ssa.param_types.get(p) in ("ptr", "ptr_f64")
+                    else 2
+                    for idx_p, p in enumerate(ent_ssa.params)
+                ]
 
         if effective_arch == "x86_64":
             preflight_res = self.sandbox.emulate_x86_64(

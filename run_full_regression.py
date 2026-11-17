@@ -23,6 +23,7 @@ test_modules = [
     "tests.test_alpha_c29_recursive_loops_and_polyglot_ext",
     "tests.test_alpha_c30_ieee754_float_stack",
     "tests.test_alpha_c31_f64_memory_and_inductive_qfabvfp",
+    "tests.test_alpha_c32_f64_autovec_thinlto_and_omnirepo",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]

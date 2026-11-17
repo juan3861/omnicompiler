@@ -65,6 +65,9 @@ class ThinLtoSummaryIndex:
         self.functions[summary.name] = summary
         self.call_graph[summary.name] = set(summary.callees)
 
+    def add_function(self, summary: FunctionSummary):
+        self.add_function_summary(summary)
+
     def compute_reachable_symbols(self, root_symbols: List[str]) -> Set[str]:
         """Traverses the global call-graph from root symbols to determine live code."""
         reachable: Set[str] = set()
@@ -101,11 +104,11 @@ class ThinLtoOptimizer:
                     callees.append(callee_name)
                 elif inst.opcode == "ret" and inst.operands:
                     ret_op = inst.operands[0]
-                    if isinstance(ret_op, int):
+                    if isinstance(ret_op, (int, float)):
                         const_ret = ret_op
                     elif isinstance(ret_op, SSAVar):
                         for prev in b.instructions:
-                            if prev.result == ret_op and prev.opcode == "const" and prev.operands and isinstance(prev.operands[0], int):
+                            if prev.result == ret_op and prev.opcode in ("const", "fconst") and prev.operands and isinstance(prev.operands[0], (int, float)):
                                 const_ret = prev.operands[0]
 
         # Leaf function: has zero external function calls
@@ -177,7 +180,11 @@ class ThinLtoOptimizer:
         for b in callee_fn.blocks:
             for phi in b.phi_nodes:
                 if phi.result:
-                    new_res = SSAVar(f"inl_{phi.result.name}_{inline_id}", phi.result.version + inline_id * 1000)
+                    new_res = SSAVar(
+                        f"inl_{phi.result.name}_{inline_id}",
+                        phi.result.version + inline_id * 1000,
+                        var_type=phi.result.var_type,
+                    )
                     var_map[phi.result] = new_res
             for inst in b.instructions:
                 if inst.opcode == "param":
@@ -185,7 +192,11 @@ class ThinLtoOptimizer:
                     if inst.result:
                         var_map[inst.result] = param_map.get(p_name, 0)
                 elif inst.opcode != "ret" and inst.result:
-                    new_res = SSAVar(f"inl_{inst.result.name}_{inline_id}", inst.result.version + inline_id * 1000)
+                    new_res = SSAVar(
+                        f"inl_{inst.result.name}_{inline_id}",
+                        inst.result.version + inline_id * 1000,
+                        var_type=inst.result.var_type,
+                    )
                     var_map[inst.result] = new_res
 
         # Pass B: populate cloned block instructions and connect internal CFG edges
@@ -245,6 +256,8 @@ class ThinLtoOptimizer:
 
         # 4. Handle return value in tail_block
         if call_inst.result is not None:
+            if getattr(callee_fn, "return_type", "i64") == "f64":
+                call_inst.result.var_type = "f64"
             if len(ret_sites) == 1:
                 tail_block.instructions.insert(
                     0, SSAInstruction(call_inst.result, "mov", [ret_sites[0][1]], source_line=call_inst.source_line)
@@ -298,11 +311,20 @@ class ThinLtoOptimizer:
                         call_args = inst.operands[1:]
 
                         summary = self.index.functions.get(callee_name)
+                        if summary and summary.ssa_fn and getattr(summary.ssa_fn, "return_type", "i64") == "f64":
+                            if inst.result is not None:
+                                inst.result.var_type = "f64"
 
                         # Pass 1: Constant return folding
                         if summary and summary.constant_return is not None:
+                            is_f_const = isinstance(summary.constant_return, float) and not isinstance(summary.constant_return, bool)
+                            if is_f_const and inst.result is not None:
+                                inst.result.var_type = "f64"
                             block.instructions[idx] = SSAInstruction(
-                                inst.result, "const", [summary.constant_return], source_line=inst.source_line
+                                inst.result,
+                                "fconst" if is_f_const else "const",
+                                [summary.constant_return],
+                                source_line=inst.source_line,
                             )
                             stats["folded_constants"] += 1
                             changed = True
@@ -333,7 +355,8 @@ class ThinLtoOptimizer:
                                     if leaf_inst.result:
                                         new_res = SSAVar(
                                             f"inl_{callee_name}_{leaf_inst.result.name}",
-                                            leaf_inst.result.version + 1000 + inline_counter
+                                            leaf_inst.result.version + 1000 + inline_counter,
+                                            var_type=leaf_inst.result.var_type,
                                         )
                                         var_subst[leaf_inst.result] = new_res
                                     splice_insts.append(
@@ -341,6 +364,8 @@ class ThinLtoOptimizer:
                                     )
 
                             if inst.result is not None and ret_val is not None:
+                                if isinstance(ret_val, float) or (isinstance(ret_val, SSAVar) and ret_val.var_type == "f64"):
+                                    inst.result.var_type = "f64"
                                 splice_insts.append(
                                     SSAInstruction(inst.result, "mov", [ret_val], source_line=inst.source_line)
                                 )
@@ -367,7 +392,62 @@ class ThinLtoOptimizer:
                 if multiblock_done:
                     break
 
+        # Propagate f64 types across instructions and phis after cross-module call/inline resolution
+        int_to_fp_op = {
+            "add": "fadd",
+            "sub": "fsub",
+            "mul": "fmul",
+            "imul": "fmul",
+            "sdiv": "fdiv",
+            "div": "fdiv",
+            "neg": "fneg",
+            "cmp_eq": "fcmp_eq",
+            "cmp_ne": "fcmp_ne",
+            "cmp_lt": "fcmp_lt",
+            "cmp_le": "fcmp_le",
+            "cmp_gt": "fcmp_gt",
+            "cmp_ge": "fcmp_ge",
+        }
+        type_changed = True
+        while type_changed:
+            type_changed = False
+            for b in ssa_fn.blocks:
+                for phi in b.phi_nodes:
+                    if phi.result and phi.result.var_type != "f64":
+                        if any(
+                            isinstance(op, float) or (isinstance(op, SSAVar) and op.var_type == "f64")
+                            for op in phi.operands
+                        ):
+                            phi.result.var_type = "f64"
+                            type_changed = True
+                for inst in b.instructions:
+                    has_fp_op = any(
+                        isinstance(op, float) or (isinstance(op, SSAVar) and op.var_type == "f64")
+                        for op in inst.operands
+                    )
+                    if inst.opcode in int_to_fp_op and has_fp_op:
+                        inst.opcode = int_to_fp_op[inst.opcode]
+                        if inst.result and not inst.opcode.startswith("fcmp_"):
+                            inst.result.var_type = "f64"
+                        type_changed = True
+                    elif inst.opcode == "mov" and has_fp_op and inst.result and inst.result.var_type != "f64":
+                        inst.result.var_type = "f64"
+                        type_changed = True
+                    elif inst.opcode == "select" and inst.result and inst.result.var_type != "f64" and len(inst.operands) >= 3:
+                        if any(
+                            isinstance(op, float) or (isinstance(op, SSAVar) and op.var_type == "f64")
+                            for op in inst.operands[1:3]
+                        ):
+                            inst.result.var_type = "f64"
+                            type_changed = True
+
         optimized_fn = optimize_ssa(ssa_fn)
+        for b in optimized_fn.blocks:
+            for inst in b.instructions:
+                if inst.opcode == "ret" and inst.operands:
+                    rv = inst.operands[0]
+                    if isinstance(rv, float) or (isinstance(rv, SSAVar) and rv.var_type == "f64"):
+                        optimized_fn.return_type = "f64"
         return optimized_fn, stats
 
 

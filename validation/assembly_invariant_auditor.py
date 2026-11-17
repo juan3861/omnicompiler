@@ -68,6 +68,7 @@ class AssemblyInvariantAuditor:
         # and `add rsp, imm` (48 83 C4 imm8 or 48 81 C4 imm32)
         stack_alloc = 0
         stack_free = 0
+        free_sizes: List[int] = []
 
         i = 0
         branch_safe = True
@@ -101,6 +102,7 @@ class AssemblyInvariantAuditor:
                 if i + 3 < n:
                     imm = code_bytes[i+3]
                     stack_free += imm
+                    free_sizes.append(imm)
                     i += 4
                     continue
                 else:
@@ -112,6 +114,7 @@ class AssemblyInvariantAuditor:
                 if i + 6 < n:
                     imm = struct.unpack("<I", code_bytes[i+3:i+7])[0]
                     stack_free += imm
+                    free_sizes.append(imm)
                     i += 7
                     continue
                 else:
@@ -134,7 +137,9 @@ class AssemblyInvariantAuditor:
 
             i += 1
 
-        stack_balanced = (stack_alloc == stack_free)
+        stack_balanced = (stack_alloc == stack_free) or (
+            stack_alloc > 0 and len(free_sizes) >= 1 and all(f == stack_alloc for f in free_sizes)
+        )
         if not stack_balanced:
             errors.append(f"Stack frame imbalance in {symbol_name}: allocated {stack_alloc} bytes but freed {stack_free} bytes")
 

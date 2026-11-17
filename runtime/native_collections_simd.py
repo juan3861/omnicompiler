@@ -13,12 +13,13 @@ from runtime.native_heap import omni_list_new, omni_list_len
 
 # Cached JIT callable singletons
 _AVX2_VEC_ADD = None
+_AVX2_VEC_ADD_F64 = None
 _AVX2_DOT_SUM = None
 _SIMD_INIT_ATTEMPTED = False
 
 
 def _init_simd_kernels():
-    global _AVX2_VEC_ADD, _AVX2_DOT_SUM, _SIMD_INIT_ATTEMPTED
+    global _AVX2_VEC_ADD, _AVX2_VEC_ADD_F64, _AVX2_DOT_SUM, _SIMD_INIT_ATTEMPTED
     if _SIMD_INIT_ATTEMPTED:
         return
     _SIMD_INIT_ATTEMPTED = True
@@ -29,11 +30,15 @@ def _init_simd_kernels():
         if hasattr(jit, "compile_avx2_vector_add_i64"):
             fn_add, _, _ = jit.compile_avx2_vector_add_i64()
             _AVX2_VEC_ADD = fn_add
+        if hasattr(jit, "compile_avx2_vector_add_f64"):
+            fn_add_f64, _, _ = jit.compile_avx2_vector_add_f64()
+            _AVX2_VEC_ADD_F64 = fn_add_f64
         if hasattr(jit, "compile_avx2_dot_sum_i64"):
             fn_dot, _, _ = jit.compile_avx2_dot_sum_i64()
             _AVX2_DOT_SUM = fn_dot
     except Exception:
         _AVX2_VEC_ADD = None
+        _AVX2_VEC_ADD_F64 = None
         _AVX2_DOT_SUM = None
 
 
@@ -154,8 +159,82 @@ def omni_list_sum(list_ptr: int) -> int:
     return total
 
 
+def omni_list_vec_add_f64(list_a: int, list_b: int) -> int:
+    """
+    Computes elementwise IEEE-754 double-precision vector addition: out[i] = a[i] + b[i]
+    using hardware 256-bit AVX2 YMM registers (`vaddpd`) when available.
+    """
+    if list_a == 0 or list_b == 0:
+        return omni_list_new(4)
+
+    len_a = omni_list_len(list_a)
+    len_b = omni_list_len(list_b)
+    n = min(len_a, len_b)
+    if n <= 0:
+        return omni_list_new(4)
+
+    out_list = omni_list_new(n)
+    ctypes.c_int64.from_address(out_list + 8).value = n
+
+    ptr_a = list_a + 16
+    ptr_b = list_b + 16
+    ptr_out = out_list + 16
+
+    _init_simd_kernels()
+    if _AVX2_VEC_ADD_F64 is not None and n >= 1:
+        try:
+            _AVX2_VEC_ADD_F64(ptr_a, ptr_b, ptr_out, n)
+            return out_list
+        except Exception:
+            pass
+
+    for i in range(n):
+        ctypes.c_double.from_address(ptr_out + i * 8).value = (
+            ctypes.c_double.from_address(ptr_a + i * 8).value
+            + ctypes.c_double.from_address(ptr_b + i * 8).value
+        )
+    return out_list
+
+
+def omni_list_vec_dot_f64(list_a: int, list_b: int) -> float:
+    """Computes IEEE-754 f64 vector dot product: sum(a[i] * b[i])."""
+    if list_a == 0 or list_b == 0:
+        return 0.0
+    len_a = omni_list_len(list_a)
+    len_b = omni_list_len(list_b)
+    n = min(len_a, len_b)
+    if n <= 0:
+        return 0.0
+    ptr_a = list_a + 16
+    ptr_b = list_b + 16
+    total = 0.0
+    for i in range(n):
+        total += (
+            ctypes.c_double.from_address(ptr_a + i * 8).value
+            * ctypes.c_double.from_address(ptr_b + i * 8).value
+        )
+    return float(total)
+
+
+def omni_list_sum_f64(list_ptr: int) -> float:
+    """Computes IEEE-754 f64 reduction sum of all elements in OmniList."""
+    if list_ptr == 0:
+        return 0.0
+    n = omni_list_len(list_ptr)
+    if n <= 0:
+        return 0.0
+    ptr = list_ptr + 16
+    total = 0.0
+    for i in range(n):
+        total += ctypes.c_double.from_address(ptr + i * 8).value
+    return float(total)
+
+
 NATIVE_SIMD_SYMBOLS: Dict[str, Tuple[Any, List[Any], Any]] = {
     "omni_list_vec_add": (omni_list_vec_add, [ctypes.c_int64, ctypes.c_int64], ctypes.c_int64),
     "omni_list_vec_dot": (omni_list_vec_dot, [ctypes.c_int64, ctypes.c_int64], ctypes.c_int64),
     "omni_list_sum": (omni_list_sum, [ctypes.c_int64], ctypes.c_int64),
+    "omni_list_vec_add_f64": (omni_list_vec_add_f64, [ctypes.c_int64, ctypes.c_int64], ctypes.c_int64),
+    "omni_list_vec_dot_f64": (omni_list_vec_dot_f64, [ctypes.c_int64, ctypes.c_int64], ctypes.c_double),
+    "omni_list_sum_f64": (omni_list_sum_f64, [ctypes.c_int64], ctypes.c_double),
 }

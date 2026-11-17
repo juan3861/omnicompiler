@@ -1472,6 +1472,7 @@ def optimize_ssa(fn: SSAFunction) -> SSAFunction:
         changed = False
         iters += 1
         const_map: Dict[SSAVar, int] = {}
+        fconst_map: Dict[SSAVar, float] = {}
         copy_map: Dict[SSAVar, SSAVar] = {}
 
         def resolve(op: Any) -> Any:
@@ -1510,17 +1511,87 @@ def optimize_ssa(fn: SSAFunction) -> SSAFunction:
                     const_map[inst.result] = inst.operands[0]
                     continue
 
+                if inst.opcode == "fconst" and inst.result and len(inst.operands) == 1 and isinstance(inst.operands[0], float):
+                    inst.result.var_type = "f64"
+                    fconst_map[inst.result] = inst.operands[0]
+                    continue
+
+                if inst.opcode == "sitofp" and inst.result and len(inst.operands) == 1:
+                    src_fp = inst.operands[0]
+                    if isinstance(src_fp, float) or (isinstance(src_fp, SSAVar) and src_fp.var_type == "f64"):
+                        inst.opcode = "mov"
+                        inst.result.var_type = "f64"
+                        changed = True
+
                 if inst.opcode == "mov" and inst.result and len(inst.operands) == 1:
                     src = inst.operands[0]
-                    if isinstance(src, int):
+                    if isinstance(src, float):
+                        inst.opcode = "fconst"
+                        inst.result.var_type = "f64"
+                        fconst_map[inst.result] = src
+                        changed = True
+                        continue
+                    elif isinstance(src, int):
                         inst.opcode = "const"
                         const_map[inst.result] = src
                         changed = True
                         continue
                     elif isinstance(src, SSAVar):
+                        if src.var_type == "f64":
+                            inst.result.var_type = "f64"
                         copy_map[inst.result] = src
                         changed = True
                         continue
+
+                if inst.opcode == "fneg" and inst.result and len(inst.operands) == 1:
+                    o0 = inst.operands[0]
+                    fc0 = fconst_map.get(o0) if isinstance(o0, SSAVar) else (o0 if isinstance(o0, float) else None)
+                    if fc0 is not None:
+                        inst.opcode = "fconst"
+                        inst.operands = [-fc0]
+                        inst.result.var_type = "f64"
+                        fconst_map[inst.result] = -fc0
+                        changed = True
+                        continue
+
+                if inst.result and len(inst.operands) == 2 and inst.opcode in (
+                    "fadd", "fsub", "fmul", "fdiv",
+                    "fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge",
+                ):
+                    o0, o1 = inst.operands[0], inst.operands[1]
+                    fc0 = fconst_map.get(o0) if isinstance(o0, SSAVar) else (o0 if isinstance(o0, float) else None)
+                    fc1 = fconst_map.get(o1) if isinstance(o1, SSAVar) else (o1 if isinstance(o1, float) else None)
+                    if fc0 is not None and fc1 is not None:
+                        if inst.opcode in ("fadd", "fsub", "fmul") or (inst.opcode == "fdiv" and fc1 != 0.0):
+                            fval = (
+                                fc0 + fc1 if inst.opcode == "fadd"
+                                else fc0 - fc1 if inst.opcode == "fsub"
+                                else fc0 * fc1 if inst.opcode == "fmul"
+                                else fc0 / fc1
+                            )
+                            inst.opcode = "fconst"
+                            inst.operands = [float(fval)]
+                            inst.result.var_type = "f64"
+                            fconst_map[inst.result] = float(fval)
+                            changed = True
+                            continue
+                        elif inst.opcode.startswith("fcmp_"):
+                            c_res = (
+                                1 if (
+                                    (inst.opcode == "fcmp_eq" and fc0 == fc1)
+                                    or (inst.opcode == "fcmp_ne" and fc0 != fc1)
+                                    or (inst.opcode == "fcmp_lt" and fc0 < fc1)
+                                    or (inst.opcode == "fcmp_le" and fc0 <= fc1)
+                                    or (inst.opcode == "fcmp_gt" and fc0 > fc1)
+                                    or (inst.opcode == "fcmp_ge" and fc0 >= fc1)
+                                ) else 0
+                            )
+                            inst.opcode = "const"
+                            inst.operands = [c_res]
+                            inst.result.var_type = "i64"
+                            const_map[inst.result] = c_res
+                            changed = True
+                            continue
 
                 if inst.result and len(inst.operands) == 2 and inst.opcode in (
                     "add", "sub", "mul", "sdiv", "srem", "shl", "shr", "and", "or", "xor",

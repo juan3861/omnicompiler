@@ -153,17 +153,27 @@ def test_speedup_benchmark():
     for test_x in [0, 1, 7, 16, 255, 1024, 65535, 1000000]:
         assert unevolved_kernel(test_x) == evolved_kernel(test_x), f"Mismatch for x={test_x}"
 
-    # Benchmark
+    # Benchmark (best of 5 rounds after warmup to filter out shared-VM OS scheduler noise)
     iters = 500000
-    t0 = time.perf_counter()
-    for i in range(iters):
+    for i in range(10000):
         unevolved_kernel(i)
-    t_unevolved = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    for i in range(iters):
         evolved_kernel(i)
-    t_evolved = time.perf_counter() - t0
+
+    un_samples = []
+    ev_samples = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        for i in range(iters):
+            unevolved_kernel(i)
+        un_samples.append(time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        for i in range(iters):
+            evolved_kernel(i)
+        ev_samples.append(time.perf_counter() - t0)
+
+    t_unevolved = min(un_samples)
+    t_evolved = min(ev_samples)
 
     ns_un = (t_unevolved / iters) * 1e9
     ns_ev = (t_evolved / iters) * 1e9

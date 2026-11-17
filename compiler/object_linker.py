@@ -168,6 +168,21 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
     mod = ObjectModule(repo_name=repo_name)
     mod.text_bytes.extend(obj_bytes[text_sec["raw_ptr"]:text_sec["raw_ptr"] + text_sec["raw_size"]])
 
+    rodata_sec_offsets: Dict[int, int] = {}
+    for s_info in sections:
+        if (
+            s_info["index_1based"] != text_sec["index_1based"]
+            and s_info["name"].startswith((".rdata", ".rodata", ".data"))
+            and s_info["raw_size"] > 0
+        ):
+            pad = (16 - (len(mod.text_bytes) % 16)) % 16
+            if pad:
+                mod.text_bytes.extend(b"\x00" * pad)
+            rodata_sec_offsets[s_info["index_1based"]] = len(mod.text_bytes)
+            mod.text_bytes.extend(
+                obj_bytes[s_info["raw_ptr"] : s_info["raw_ptr"] + s_info["raw_size"]]
+            )
+
     # Parse COFF Symbol Table (18 bytes per entry, skipping auxiliary records)
     sym_by_idx: Dict[int, Tuple[str, int, int, int]] = {}
     idx = 0
@@ -184,8 +199,17 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
                 name=sname,
                 section=".text",
                 offset=val,
-                size=max(1, len(mod.text_bytes) - val),
+                size=max(1, text_sec["raw_size"] - val),
                 is_exported=is_exp,
+                source_repo=repo_name,
+            )
+        elif sec_num in rodata_sec_offsets and sname:
+            mod.symbols[sname] = SymbolDef(
+                name=sname,
+                section=".rodata",
+                offset=rodata_sec_offsets[sec_num] + val,
+                size=8,
+                is_exported=False,
                 source_repo=repo_name,
             )
         idx += 1 + num_aux
@@ -223,12 +247,29 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
         raise LinkerError("ELF object contains no .text section")
 
     mod = ObjectModule(repo_name=repo_name)
+    text_raw_len = len(text_sec.data())
     mod.text_bytes.extend(text_sec.data())
     text_shndx = None
+    rodata_sec_offsets: Dict[int, int] = {}
     for i, s in enumerate(elf.iter_sections()):
         if s.name == ".text":
             text_shndx = i
-            break
+        elif s.name.startswith((".rodata", ".rdata", ".data")) and s.data_size > 0:
+            pad = (16 - (len(mod.text_bytes) % 16)) % 16
+            if pad:
+                mod.text_bytes.extend(b"\x00" * pad)
+            rodata_sec_offsets[i] = len(mod.text_bytes)
+            s_data = s.data()
+            mod.text_bytes.extend(s_data)
+            sec_sym = f"__elf_sec_{i}__"
+            mod.symbols[sec_sym] = SymbolDef(
+                name=sec_sym,
+                section=".rodata",
+                offset=rodata_sec_offsets[i],
+                size=max(1, len(s_data)),
+                is_exported=False,
+                source_repo=repo_name,
+            )
 
     symtab = elf.get_section_by_name(".symtab")
     if symtab is not None:
@@ -239,8 +280,17 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                     name=sym.name,
                     section=".text",
                     offset=int(sym["st_value"]),
-                    size=max(1, int(sym["st_size"]) or (len(mod.text_bytes) - int(sym["st_value"]))),
+                    size=max(1, int(sym["st_size"]) or (text_raw_len - int(sym["st_value"]))),
                     is_exported=is_exp,
+                    source_repo=repo_name,
+                )
+            elif sym.name and sym["st_shndx"] in rodata_sec_offsets:
+                mod.symbols[sym.name] = SymbolDef(
+                    name=sym.name,
+                    section=".rodata",
+                    offset=rodata_sec_offsets[sym["st_shndx"]] + int(sym["st_value"]),
+                    size=max(1, int(sym["st_size"]) or 8),
+                    is_exported=False,
                     source_repo=repo_name,
                 )
 
@@ -248,18 +298,23 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
     if rela_text is not None and symtab is not None:
         for rel in rela_text.iter_relocations():
             sym = symtab.get_symbol(rel["r_info_sym"])
-            if not sym or not sym.name:
+            if not sym:
+                continue
+            target_sym_name = sym.name
+            if not target_sym_name and sym["st_shndx"] in rodata_sec_offsets:
+                target_sym_name = f"__elf_sec_{sym['st_shndx']}__"
+            if not target_sym_name:
                 continue
             rtype = rel["r_info_type"]
             r_off = int(rel["r_offset"])
             r_addend = int(rel["r_addend"]) if rel.is_RELA() else 0
             # x86-64: R_X86_64_PC32=2, R_X86_64_PLT32=4 (addend typically -4, which cancels +4 in E8 disp32!)
             if rtype in (2, 4):
-                mod.relocations.append(RelocationEntry(".text", r_off, sym.name, "REL32", addend=r_addend + 4))
+                mod.relocations.append(RelocationEntry(".text", r_off, target_sym_name, "REL32", addend=r_addend + 4))
             elif rtype == 1:  # R_X86_64_64
-                mod.relocations.append(RelocationEntry(".text", r_off, sym.name, "ADDR64", addend=r_addend))
+                mod.relocations.append(RelocationEntry(".text", r_off, target_sym_name, "ADDR64", addend=r_addend))
             elif rtype in (282, 283):  # R_AARCH64_JUMP26 / R_AARCH64_CALL26
-                mod.relocations.append(RelocationEntry(".text", r_off, sym.name, "ARM64_CALL26", addend=r_addend))
+                mod.relocations.append(RelocationEntry(".text", r_off, target_sym_name, "ARM64_CALL26", addend=r_addend))
 
     return mod
 
@@ -361,10 +416,10 @@ class NativeObjectLinker:
             combined_text.extend(mod.text_bytes)
 
             for sym_name, sym in mod.symbols.items():
-                if sym.section == ".text":
+                if sym.section in (".text", ".rodata"):
                     global_offset = mod_offset + sym.offset
                     global_symbol_table[sym_name] = global_offset
-                    if sym.is_exported:
+                    if sym.section == ".text" and sym.is_exported:
                         exported_symbols[sym_name] = global_offset
 
         # 2. Relocation Resolution
@@ -375,11 +430,13 @@ class NativeObjectLinker:
             mod_offset = module_text_offsets[idx]
             for reloc in mod.relocations:
                 target_sym = reloc.symbol_name
-                if target_sym not in global_symbol_table:
+                if target_sym in mod.symbols:
+                    target_offset = mod_offset + mod.symbols[target_sym].offset
+                elif target_sym in global_symbol_table:
+                    target_offset = global_symbol_table[target_sym]
+                else:
                     unresolved_symbols.append((mod.repo_name, target_sym))
                     continue
-
-                target_offset = global_symbol_table[target_sym]
                 if reloc.offset < 0:
                     raise RelocationOutOfBoundsError(
                         f"Negative relocation offset {reloc.offset} in module {mod.repo_name}"

@@ -2528,11 +2528,13 @@ class VerifiedPassRunner:
         enable_memory_theory: bool = False,
         max_loop_unroll: int = 0,
         enable_inductive_loops: bool = False,
+        enable_float_theory: bool = False,
     ):
         self.validator = SSATranslationValidator(
             enable_memory_theory=enable_memory_theory,
             max_loop_unroll=max_loop_unroll,
             enable_inductive_loops=enable_inductive_loops,
+            enable_float_theory=enable_float_theory,
         )
         self.timeout_ms = timeout_ms
 

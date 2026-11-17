@@ -44,6 +44,9 @@ LICM_SAFE_PURE_OPCODES = frozenset({
     "and", "or", "xor", "neg", "not",
     "cmp_eq", "cmp_ne", "cmp_lt", "cmp_le", "cmp_gt", "cmp_ge",
     "const", "mov",
+    "fconst", "fneg", "fadd", "fsub", "fmul", "fdiv",
+    "fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge",
+    "sitofp", "fptosi",
 })
 
 
@@ -176,7 +179,7 @@ class LICMPass:
                         # Check if all operands are invariant (constant or defined outside loop or invariant)
                         all_inv = True
                         for op in inst.operands:
-                            if isinstance(op, (int, bool, str)):
+                            if isinstance(op, (int, float, bool, str)):
                                 continue
                             if isinstance(op, SSAVar):
                                 db = def_block.get(op)

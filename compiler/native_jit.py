@@ -295,8 +295,12 @@ class NativeJitCompiler:
         mem = NativeJitMemory(size=max(4096, len(raw_code)))
         mem.write_code(bytes(raw_code))
 
-        arg_ctypes = [ctypes.c_int64] * len(ssa_fn.params)
-        fn_type = ctypes.CFUNCTYPE(ctypes.c_int64, *arg_ctypes)
+        arg_ctypes = [
+            ctypes.c_double if ssa_fn.param_types.get(p) == "f64" else ctypes.c_int64
+            for p in ssa_fn.params
+        ]
+        ret_ctype = ctypes.c_double if getattr(ssa_fn, "return_type", "i64") == "f64" else ctypes.c_int64
+        fn_type = ctypes.CFUNCTYPE(ret_ctype, *arg_ctypes)
         callable_fn = fn_type(mem.ptr)
         callable_fn._jit_mem = mem
         callable_fn._artifact = artifact
@@ -325,6 +329,25 @@ class NativeJitCompiler:
           fn(ptr_a: uint64, ptr_b: uint64, ptr_out: uint64, count: int64) -> int64
         """
         raw_code = self.codegen.emit_avx2_vector_add_i64()
+        mem = NativeJitMemory(size=max(4096, len(raw_code)))
+        mem.write_code(raw_code)
+        fn_type = ctypes.CFUNCTYPE(
+            ctypes.c_int64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_int64,
+        )
+        callable_fn = fn_type(mem.ptr)
+        callable_fn._jit_mem = mem
+        return callable_fn, mem, raw_code.hex()
+
+    def compile_avx2_vector_add_f64(self) -> Tuple[Any, NativeJitMemory, str]:
+        """
+        Compiles a hardware 256-bit AVX2 YMM SIMD `vaddpd` IEEE-754 double vector addition kernel:
+          fn(ptr_a: uint64, ptr_b: uint64, ptr_out: uint64, count: int64) -> int64
+        """
+        raw_code = self.codegen.emit_avx2_vector_add_f64()
         mem = NativeJitMemory(size=max(4096, len(raw_code)))
         mem.write_code(raw_code)
         fn_type = ctypes.CFUNCTYPE(
