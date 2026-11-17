@@ -16,7 +16,7 @@ import hashlib
 import os
 import struct
 import sys
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 class MiniAssembler:
@@ -1217,6 +1217,256 @@ class StandaloneBinaryEmitter:
 
         self._write_file(output_path, data)
         return output_path
+
+    def build_pe64_multi_import_exe(
+        self,
+        imports: Dict[str, List[str]],
+        code_builder: Any,
+    ) -> Tuple[bytes, Dict[Tuple[str, str], int]]:
+        """
+        Builds a Windows PE32+ executable with a dynamically constructed multi-DLL `.idata`
+        (Import Directory, ILT, IAT, Hint/Name table) and returns `(pe_bytes, iat_rva_map)`.
+        `code_builder(iat_rva_map, text_rva) -> bytes` generates the `.text` payload.
+        """
+        file_align = self.FILE_ALIGN
+        sec_align = self.SEC_ALIGN
+        image_base = self.IMAGE_BASE_PE
+        text_rva = 0x1000
+
+        dll_items = [(dll, list(syms)) for dll, syms in imports.items() if syms]
+        n_dlls = len(dll_items)
+        desc_table_bytes = (n_dlls + 1) * 20
+
+        # Precompute relative offsets inside .idata independently of rva_idata
+        ilt_offsets: Dict[str, int] = {}
+        cur = desc_table_bytes
+        for dll, syms in dll_items:
+            ilt_offsets[dll] = cur
+            cur += (len(syms) + 1) * 8
+
+        iat_start_off = cur
+        iat_offsets: Dict[str, int] = {}
+        for dll, syms in dll_items:
+            iat_offsets[dll] = cur
+            cur += (len(syms) + 1) * 8
+        iat_total_bytes = cur - iat_start_off
+
+        dll_name_offs: Dict[str, int] = {}
+        str_blob = bytearray()
+        for dll, _ in dll_items:
+            dll_name_offs[dll] = cur + len(str_blob)
+            enc = dll.encode("ascii") + b"\x00"
+            if len(enc) % 2:
+                enc += b"\x00"
+            str_blob.extend(enc)
+
+        hint_offs: Dict[Tuple[str, str], int] = {}
+        for dll, syms in dll_items:
+            for sym in syms:
+                hint_offs[(dll, sym)] = cur + len(str_blob)
+                enc = b"\x00\x00" + sym.encode("ascii") + b"\x00"
+                if len(enc) % 2:
+                    enc += b"\x00"
+                str_blob.extend(enc)
+
+        idata_vsize = cur + len(str_blob)
+
+        # Pass 1: measure text size with placeholder RVAs
+        dummy_map = {
+            (dll, sym): 0x2000 + iat_offsets[dll] + idx * 8
+            for dll, syms in dll_items
+            for idx, sym in enumerate(syms)
+        }
+        probe_text = bytes(code_builder(dummy_map, text_rva))
+        rva_idata = text_rva + self._align_up(max(1, len(probe_text)), sec_align)
+
+        # Pass 2: real IAT RVAs
+        iat_rva_map: Dict[Tuple[str, str], int] = {
+            (dll, sym): rva_idata + iat_offsets[dll] + idx * 8
+            for dll, syms in dll_items
+            for idx, sym in enumerate(syms)
+        }
+        raw_text = bytes(code_builder(iat_rva_map, text_rva))
+        raw_text_len = len(raw_text)
+        aligned_text_len = self._align_up(max(1, raw_text_len), file_align)
+        text_code = raw_text.ljust(aligned_text_len, b"\x90")
+
+        # Materialize .idata
+        aligned_idata_len = self._align_up(max(1, idata_vsize), file_align)
+        idata = bytearray(aligned_idata_len)
+        for d_idx, (dll, syms) in enumerate(dll_items):
+            d_off = d_idx * 20
+            struct.pack_into(
+                "<IIIII",
+                idata,
+                d_off,
+                rva_idata + ilt_offsets[dll],
+                0,
+                0,
+                rva_idata + dll_name_offs[dll],
+                rva_idata + iat_offsets[dll],
+            )
+            for s_idx, sym in enumerate(syms):
+                hint_rva = rva_idata + hint_offs[(dll, sym)]
+                struct.pack_into("<Q", idata, ilt_offsets[dll] + s_idx * 8, hint_rva)
+                struct.pack_into("<Q", idata, iat_offsets[dll] + s_idx * 8, hint_rva)
+        idata[cur:cur + len(str_blob)] = str_blob
+
+        iat_rva = rva_idata + iat_start_off
+        size_of_image = rva_idata + self._align_up(len(idata), sec_align)
+
+        dos_header = bytearray(64)
+        dos_header[0:2] = b"MZ"
+        struct.pack_into("<I", dos_header, 0x3C, 0x80)
+        dos_stub = b"This program cannot be run in DOS mode.\r\r\n$\0\0\0\0\0\0\0".ljust(64, b"\0")
+        pe_sig = b"PE\0\0"
+        coff = struct.pack("<HHIIIHH", 0x8664, 2, 0, 0, 0, 240, 0x0022)
+        opt = struct.pack(
+            "<HBBIIIIIQIIHHHHHHIIIIHHQQQQII",
+            0x020B, 14, 0,
+            len(text_code), len(idata), 0,
+            text_rva, text_rva,
+            image_base,
+            sec_align, file_align,
+            6, 0, 0, 0, 6, 0, 0,
+            size_of_image, 0x200, 0,
+            3, 0x8160,
+            0x100000, 0x1000, 0x100000, 0x1000,
+            0, 16,
+        )
+        data_dirs = bytearray(16 * 8)
+        if n_dlls > 0:
+            struct.pack_into("<II", data_dirs, 1 * 8, rva_idata, desc_table_bytes)
+            struct.pack_into("<II", data_dirs, 12 * 8, iat_rva, iat_total_bytes)
+
+        sec_text = struct.pack(
+            "<8sIIIIIIHHI",
+            b".text\0\0\0",
+            raw_text_len, text_rva, len(text_code), 0x200,
+            0, 0, 0, 0,
+            0x60000020,
+        )
+        sec_idata = struct.pack(
+            "<8sIIIIIIHHI",
+            b".idata\0\0",
+            idata_vsize, rva_idata, len(idata), 0x200 + len(text_code),
+            0, 0, 0, 0,
+            0xC0000040,
+        )
+        headers = (dos_header + dos_stub + pe_sig + coff + opt + data_dirs + sec_text + sec_idata).ljust(file_align, b"\0")
+        return bytes(headers + text_code + idata), iat_rva_map
+
+    def build_elf64_dynamic_exe(
+        self,
+        needed_libs: List[str],
+        imported_funcs: List[str],
+        custom_code: Optional[bytes] = None,
+        exit_code: int = 0,
+    ) -> Tuple[bytes, Dict[str, int]]:
+        """
+        Builds a dynamic Linux ELF64 executable (`ET_EXEC`) with `PT_INTERP`,
+        `PT_DYNAMIC` (`DT_NEEDED`, `DT_JMPREL`, `DT_PLTGOT`), `.dynsym`, `.rela.plt`
+        (`R_X86_64_JUMP_SLOT`), and `.got.plt` slots for external OS shared library calls.
+        """
+        vaddr = self.VADDR_ELF
+        n_ph = 4
+        hdrs_end = 64 + n_ph * 56  # 288
+        interp_bytes = b"/lib64/ld-linux-x86-64.so.2\x00"
+        interp_off = self._align_up(hdrs_end, 8)
+        code_off = self._align_up(interp_off + len(interp_bytes), 16)
+        entry_vaddr = vaddr + code_off
+
+        if custom_code is not None:
+            code = bytearray(custom_code)
+        else:
+            code = bytearray(
+                b"\xbf" + struct.pack("<I", exit_code & 0xFFFFFFFF) + b"\xb8\x3c\x00\x00\x00\x0f\x05"
+            )
+
+        # .dynstr
+        dynstr = bytearray(b"\x00")
+        lib_str_offs = []
+        for lib in needed_libs:
+            lib_str_offs.append(len(dynstr))
+            dynstr.extend(lib.encode("ascii") + b"\x00")
+        sym_str_offs = []
+        for fn in imported_funcs:
+            sym_str_offs.append(len(dynstr))
+            dynstr.extend(fn.encode("ascii") + b"\x00")
+
+        # .dynsym (SHN_UNDEF external functions)
+        dynsym = bytearray(b"\x00" * 24)
+        for s_off in sym_str_offs:
+            dynsym.extend(struct.pack("<IBBHQQ", s_off, 0x12, 0, 0, 0, 0))
+
+        # SysV DT_HASH
+        nbucket = max(1, len(imported_funcs))
+        nchain = 1 + len(imported_funcs)
+        hash_bytes = struct.pack(f"<II{nbucket}I{nchain}I", nbucket, nchain, *([0] * nbucket), *([0] * nchain))
+
+        dynstr_off = self._align_up(code_off + len(code), 8)
+        dynsym_off = self._align_up(dynstr_off + len(dynstr), 8)
+        hash_off = self._align_up(dynsym_off + len(dynsym), 8)
+        got_plt_off = self._align_up(hash_off + len(hash_bytes), 8)
+        got_plt_len = (3 + len(imported_funcs)) * 8
+        rela_plt_off = self._align_up(got_plt_off + got_plt_len, 8)
+        rela_plt = bytearray()
+        got_slot_vaddrs: Dict[str, int] = {}
+        for idx, fn in enumerate(imported_funcs):
+            slot_vaddr = vaddr + got_plt_off + (3 + idx) * 8
+            got_slot_vaddrs[fn] = slot_vaddr
+            r_info = ((idx + 1) << 32) | 7  # R_X86_64_JUMP_SLOT
+            rela_plt.extend(struct.pack("<QQq", slot_vaddr, r_info, 0))
+
+        dynamic_off = self._align_up(rela_plt_off + len(rela_plt), 8)
+        dyn_table = bytearray()
+        for l_off in lib_str_offs:
+            dyn_table.extend(struct.pack("<QQ", 1, l_off))  # DT_NEEDED
+        dyn_table.extend(struct.pack("<QQ", 4, vaddr + hash_off))         # DT_HASH
+        dyn_table.extend(struct.pack("<QQ", 5, vaddr + dynstr_off))       # DT_STRTAB
+        dyn_table.extend(struct.pack("<QQ", 6, vaddr + dynsym_off))       # DT_SYMTAB
+        dyn_table.extend(struct.pack("<QQ", 10, len(dynstr)))             # DT_STRSZ
+        dyn_table.extend(struct.pack("<QQ", 11, 24))                      # DT_SYMENT
+        dyn_table.extend(struct.pack("<QQ", 3, vaddr + got_plt_off))      # DT_PLTGOT
+        dyn_table.extend(struct.pack("<QQ", 20, 7))                       # DT_PLTREL = DT_RELA
+        dyn_table.extend(struct.pack("<QQ", 2, len(rela_plt)))            # DT_PLTRELSZ
+        dyn_table.extend(struct.pack("<QQ", 23, vaddr + rela_plt_off))    # DT_JMPREL
+        dyn_table.extend(struct.pack("<QQ", 0, 0))                        # DT_NULL
+
+        total_size = dynamic_off + len(dyn_table)
+        elf_ident = b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 8)
+        elf_header = struct.pack(
+            "<16sHHIQQQIHHHHHH",
+            elf_ident, 2, 0x3E, 1, entry_vaddr, 64, 0, 0,
+            64, 56, n_ph, 64, 0, 0,
+        )
+        ph_interp = struct.pack(
+            "<IIQQQQQQ", 3, 4, interp_off, vaddr + interp_off, vaddr + interp_off,
+            len(interp_bytes), len(interp_bytes), 1,
+        )
+        ph_load = struct.pack(
+            "<IIQQQQQQ", 1, 7, 0, vaddr, vaddr, total_size, total_size, 0x1000,
+        )
+        ph_dynamic = struct.pack(
+            "<IIQQQQQQ", 2, 6, dynamic_off, vaddr + dynamic_off, vaddr + dynamic_off,
+            len(dyn_table), len(dyn_table), 8,
+        )
+        ph_gnu_stack = struct.pack("<IIQQQQQQ", 0x6474E551, 6, 0, 0, 0, 0, 0, 16)
+
+        buf = bytearray(total_size)
+        buf[0:64] = elf_header
+        buf[64:120] = ph_interp
+        buf[120:176] = ph_load
+        buf[176:232] = ph_dynamic
+        buf[232:288] = ph_gnu_stack
+        buf[interp_off:interp_off + len(interp_bytes)] = interp_bytes
+        buf[code_off:code_off + len(code)] = code
+        buf[dynstr_off:dynstr_off + len(dynstr)] = dynstr
+        buf[dynsym_off:dynsym_off + len(dynsym)] = dynsym
+        buf[hash_off:hash_off + len(hash_bytes)] = hash_bytes
+        buf[rela_plt_off:rela_plt_off + len(rela_plt)] = rela_plt
+        buf[dynamic_off:dynamic_off + len(dyn_table)] = dyn_table
+        return bytes(buf), got_slot_vaddrs
 
     def _write_file(self, path: str, data: bytes):
         dir_path = os.path.dirname(path)

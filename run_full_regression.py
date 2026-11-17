@@ -32,6 +32,7 @@ test_modules = [
     "tests.test_alpha_c38_cli_and_top100_ceiling_audit",
     "tests.test_alpha_c40_stress_metacognition",
     "tests.test_alpha_c42_c43_disk_salsa_and_cpp",
+    "tests.test_alpha_c44_c45_os_imports_and_11langs",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]

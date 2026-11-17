@@ -30,11 +30,17 @@ SUPPORTED_POLYGLOT_EXTENSIONS: Dict[str, str] = {
     ".cc": "cpp",
     ".cpp": "cpp",
     ".hpp": "cpp",
+    ".zig": "zig",
+    ".java": "java",
+    ".cs": "csharp",
+    ".kt": "kotlin",
 }
 
 _C_SCALAR_MAP: Dict[str, str] = {
     "int8_t": "i8",
     "uint8_t": "u8",
+    "sbyte": "i8",
+    "byte": "i8",
     "char": "i8",
     "int16_t": "i16",
     "uint16_t": "u16",
@@ -42,15 +48,30 @@ _C_SCALAR_MAP: Dict[str, str] = {
     "int32_t": "i32",
     "uint32_t": "u32",
     "int": "i32",
+    "Int": "i32",
+    "uint": "u32",
     "int64_t": "i64",
     "uint64_t": "u64",
     "long": "i64",
+    "Long": "i64",
+    "ulong": "u64",
+    "i64": "i64",
+    "i32": "i32",
+    "u32": "u32",
+    "u64": "u64",
     "size_t": "u64",
     "ssize_t": "i64",
     "float": "f32",
+    "Float": "f32",
+    "f32": "f32",
     "double": "f64",
+    "Double": "f64",
+    "f64": "f64",
     "bool": "i64",
+    "boolean": "i64",
+    "Boolean": "i64",
     "void": "i64",
+    "Unit": "i64",
 }
 
 
@@ -415,7 +436,13 @@ class _PolyglotParser:
                 self._recover_top_level_item()
                 continue
 
-            # Skip non-function top-level declarations (package, import, type, struct, interface, etc.)
+            # Unwrap outer class / namespace containers in Java, C#, and Kotlin
+            if self.language in ("java", "csharp", "kotlin"):
+                if self._at("PUNCT", "}"):
+                    self._advance()
+                    continue
+                if self._try_enter_oop_container():
+                    continue
             self._skip_top_level_non_function()
 
         mod = ast.Module(body=list(structs) + list(luts) + list(funcs), type_ignores=[])
@@ -644,9 +671,33 @@ class _PolyglotParser:
             lineno=self._peek().line,
         )
 
+    def _try_enter_oop_container(self) -> bool:
+        """Consumes `namespace / class / object Name ... {` headers so nested static methods lower cleanly."""
+        save = self.pos
+        while self._at("ID") and self._peek().val in (
+            "public", "private", "protected", "internal", "static", "final", "abstract", "sealed", "open", "data",
+        ):
+            self._advance()
+        if not (self._at("ID") and self._peek().val in ("class", "namespace", "object", "interface")):
+            self.pos = save
+            return False
+        while not self._at("PUNCT", "{") and not self._at("EOF"):
+            if self._at("PUNCT", ";"):
+                self.pos = save
+                return False
+            self._advance()
+        if self._at("PUNCT", "{"):
+            self._advance()
+            return True
+        self.pos = save
+        return False
+
     def _parse_c_function(self) -> Optional[ast.FunctionDef]:
         save = self.pos
-        while self._at("ID") and self._peek().val in ("static", "inline", "extern", "constexpr", "virtual"):
+        while self._at("ID") and self._peek().val in (
+            "static", "inline", "extern", "constexpr", "virtual",
+            "public", "private", "protected", "internal", "final", "override", "unsafe",
+        ):
             self._advance()
             if self._at("STR"):
                 self._advance()
@@ -718,7 +769,7 @@ class _PolyglotParser:
         t = self._peek()
         if t.kind != "ID":
             return None
-        if self.language in ("c", "cpp"):
+        if self.language in ("c", "cpp", "java", "csharp"):
             return self._parse_c_struct_def()
         if self.language == "rust":
             if t.val == "pub":
@@ -975,10 +1026,53 @@ class _PolyglotParser:
                 return None
             return self._parse_go_function()
 
-        if self.language in ("c", "cpp"):
+        if self.language in ("c", "cpp", "java", "csharp"):
             return self._parse_c_function()
 
+        if self.language == "zig":
+            while self._at("ID") and self._peek().val in ("pub", "export", "inline", "extern"):
+                self._advance()
+                if self._at("STR"):
+                    self._advance()
+            if not self._at("ID", "fn"):
+                self.pos = save
+                return None
+            return self._parse_zig_function()
+
+        if self.language == "kotlin":
+            while self._at("ID") and self._peek().val in ("public", "private", "internal", "inline", "override"):
+                self._advance()
+            if not self._at("ID", "fun"):
+                self.pos = save
+                return None
+            return self._parse_kotlin_function()
+
         return None
+
+    def _parse_zig_function(self) -> ast.FunctionDef:
+        fn_tok = self._expect("ID", "fn")
+        name_tok = self._expect("ID")
+        params, param_types = self._parse_js_ts_param_list()
+        ret_type: Optional[str] = None
+        if not self._at("PUNCT", "{"):
+            ret_type = self._skip_type_annotation(stop_tokens={"{"})
+        body = self._parse_block()
+        return self._make_function_def(
+            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type
+        )
+
+    def _parse_kotlin_function(self) -> ast.FunctionDef:
+        fn_tok = self._expect("ID", "fun")
+        name_tok = self._expect("ID")
+        params, param_types = self._parse_js_ts_param_list()
+        ret_type: Optional[str] = None
+        if self._at("OP", ":"):
+            self._advance()
+            ret_type = self._skip_type_annotation(stop_tokens={"{"})
+        body = self._parse_block()
+        return self._make_function_def(
+            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type
+        )
 
     # ------------------------------------------------------------------
     # Signatures
@@ -1218,18 +1312,23 @@ class _PolyglotParser:
                 angle += 1
             elif t.kind == "OP" and t.val == ">":
                 angle = max(0, angle - 1)
-        if captured in (["f64"], ["float64"], ["double"]):
+        if captured in (["f64"], ["float64"], ["double"], ["Double"]):
             return "float"
+        if captured in (["Long"], ["Int"], ["Boolean"], ["Short"], ["Byte"]):
+            return None
         if (
             captured == ["Float64Array"]
             or (
-                any(t in ("f64", "float64", "double") for t in captured)
+                any(t in ("f64", "float64", "double", "Double") for t in captured)
                 and any(t in ("[", "&", "*", "Array", "Slice") for t in captured)
             )
         ):
             return "ptr_f64"
         for tok in reversed(captured):
-            if tok in self.declared_structs or (tok[:1].isupper() and tok not in ("Array", "Slice", "Vec", "Box")):
+            if tok in self.declared_structs or (
+                tok[:1].isupper()
+                and tok not in ("Array", "Slice", "Vec", "Box", "Long", "Int", "Double", "Float", "Boolean", "Short", "Byte", "Unit")
+            ):
                 return tok
         return None
 
@@ -1381,7 +1480,7 @@ class _PolyglotParser:
             semi = self._consume_optional_semi()
             return [ast.Return(value=expr, lineno=line)], semi
 
-        if t.kind == "ID" and t.val in ("let", "const", "var"):
+        if t.kind == "ID" and t.val in ("let", "const", "var", "val"):
             stmts = [self._parse_var_decl()]
             if self.language in ("javascript", "typescript"):
                 while self._at("PUNCT", ","):
@@ -1390,7 +1489,7 @@ class _PolyglotParser:
             semi = self._consume_optional_semi()
             return stmts, semi
 
-        if self.language in ("c", "cpp"):
+        if self.language in ("c", "cpp", "java", "csharp"):
             save_cvar = self.pos
             tspec = self._parse_c_type_spec()
             if tspec is not None and self._at("ID"):
@@ -1948,7 +2047,7 @@ class _PolyglotParser:
         if not self._at("PUNCT", ";"):
             if self._at("ID") and self._peek().val in ("let", "var", "const"):
                 init_stmts.append(self._parse_var_decl())
-            elif self.language in ("c", "cpp"):
+            elif self.language in ("c", "cpp", "java", "csharp"):
                 save_f = self.pos
                 tspec = self._parse_c_type_spec()
                 if tspec is not None and self._at("ID") and self._peek(1).val == "=":
@@ -2296,10 +2395,10 @@ def lower_polyglot_source_to_ast(
     `ast.FunctionDef` nodes compatible with Omni-SSA.
     """
     lang = language.lower().strip()
-    if lang not in ("javascript", "typescript", "rust", "go", "c", "cpp"):
+    if lang not in ("javascript", "typescript", "rust", "go", "c", "cpp", "zig", "java", "csharp", "kotlin"):
         raise PolyglotLoweringError(f"Unsupported polyglot language: {language!r}")
 
-    effective_floats = bool(allow_floats or _FLOAT_ANN_RE.search(source) or lang in ("c", "cpp"))
+    effective_floats = bool(allow_floats or _FLOAT_ANN_RE.search(source) or lang in ("c", "cpp", "zig", "java", "csharp", "kotlin"))
     parser = _PolyglotParser(source, lang, allow_floats=effective_floats)
     mod, funcs, errors = parser.parse_module()
     if strict and errors:

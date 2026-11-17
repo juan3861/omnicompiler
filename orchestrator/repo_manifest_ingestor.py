@@ -133,7 +133,7 @@ class RepoManifestIngestor:
                     imports.extend(imp)
                     all_bytes.extend(b)
 
-                elif f.endswith((".h", ".hpp", ".c", ".cpp")):
+                elif f.endswith((".h", ".hpp")):
                     exp, imp, b = self._parse_c_header_file(full_path, rel_path)
                     exports.extend(exp)
                     imports.extend(imp)
@@ -145,8 +145,10 @@ class RepoManifestIngestor:
                     imports.extend(imp)
                     all_bytes.extend(b)
 
-                elif f.endswith((".js", ".mjs", ".ts", ".go")):
+                elif f.endswith((".js", ".mjs", ".ts", ".go", ".c", ".cc", ".cpp", ".zig", ".java", ".cs", ".kt")):
                     exp, imp, b = self._parse_polyglot_file(full_path, rel_path)
+                    if not exp and f.endswith((".c", ".cpp")):
+                        exp, imp, b = self._parse_c_header_file(full_path, rel_path)
                     exports.extend(exp)
                     imports.extend(imp)
                     all_bytes.extend(b)
