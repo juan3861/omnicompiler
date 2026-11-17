@@ -8,7 +8,7 @@ Inspects synthesized machine code bytes to formally verify low-level CPU invaria
 """
 
 import struct
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
 
@@ -77,6 +77,38 @@ class AssemblyInvariantAuditor:
         branch_safe = True
         n = len(code_bytes)
 
+        # Scan leading prologue push r64 instructions (0x50..0x57 or 0x41 0x50..0x57), allowing mov rbp, rsp (48 89 E5)
+        prologue_push_bytes = 0
+        pi = 0
+        while pi < n:
+            b = code_bytes[pi]
+            if 0x50 <= b <= 0x57:
+                prologue_push_bytes += 8
+                pi += 1
+            elif b == 0x41 and pi + 1 < n and 0x50 <= code_bytes[pi + 1] <= 0x57:
+                prologue_push_bytes += 8
+                pi += 2
+            elif code_bytes[pi:pi+3] == b"\x48\x89\xe5":
+                pi += 3
+            else:
+                break
+
+        def _scan_epilogue_pops(pos: int) -> Tuple[int, int]:
+            """Counts consecutive pop r64 instructions immediately following add rsp, imm."""
+            pop_b = 0
+            cur = pos
+            while cur < n:
+                pb = code_bytes[cur]
+                if 0x58 <= pb <= 0x5F:
+                    pop_b += 8
+                    cur += 1
+                elif pb == 0x41 and cur + 1 < n and 0x58 <= code_bytes[cur + 1] <= 0x5F:
+                    pop_b += 8
+                    cur += 2
+                else:
+                    break
+            return pop_b, cur
+
         while i < n:
             # Check 48 83 EC <imm8> (sub rsp, imm8)
             if code_bytes[i:i+3] == b"\x48\x83\xec":
@@ -104,9 +136,11 @@ class AssemblyInvariantAuditor:
             elif code_bytes[i:i+3] == b"\x48\x83\xc4":
                 if i + 3 < n:
                     imm = code_bytes[i+3]
-                    stack_free += imm
-                    free_sizes.append(imm)
-                    i += 4
+                    pop_b, next_i = _scan_epilogue_pops(i + 4)
+                    epi_free = imm + min(prologue_push_bytes, pop_b)
+                    stack_free += epi_free
+                    free_sizes.append(epi_free)
+                    i = next_i
                     continue
                 else:
                     errors.append(f"Truncated add rsp, imm8 instruction at offset {i}")
@@ -116,9 +150,11 @@ class AssemblyInvariantAuditor:
             elif code_bytes[i:i+3] == b"\x48\x81\xc4":
                 if i + 6 < n:
                     imm = struct.unpack("<I", code_bytes[i+3:i+7])[0]
-                    stack_free += imm
-                    free_sizes.append(imm)
-                    i += 7
+                    pop_b, next_i = _scan_epilogue_pops(i + 7)
+                    epi_free = imm + min(prologue_push_bytes, pop_b)
+                    stack_free += epi_free
+                    free_sizes.append(epi_free)
+                    i = next_i
                     continue
                 else:
                     errors.append(f"Truncated add rsp, imm32 instruction at offset {i}")
@@ -140,11 +176,33 @@ class AssemblyInvariantAuditor:
 
             i += 1
 
-        stack_balanced = (stack_alloc == stack_free) or (
-            stack_alloc > 0 and len(free_sizes) >= 1 and all(f == stack_alloc for f in free_sizes)
+        # Handle pure-push functions without add rsp (e.g. leaf callee-saved pushes popped right before ret/jmp)
+        if prologue_push_bytes > 0 and stack_alloc == 0 and stack_free == 0:
+            term_start = n - (1 if last_byte == 0xC3 else (5 if len(code_bytes) >= 5 and code_bytes[-5] == 0xE9 else (2 if len(code_bytes) >= 2 and code_bytes[-2] == 0xEB else 0)))
+            tail_pops = 0
+            cur_t = term_start - 1
+            while cur_t >= pi:
+                tb = code_bytes[cur_t]
+                if 0x58 <= tb <= 0x5F:
+                    if cur_t - 1 >= pi and code_bytes[cur_t - 1] == 0x41:
+                        tail_pops += 8
+                        cur_t -= 2
+                    else:
+                        tail_pops += 8
+                        cur_t -= 1
+                else:
+                    break
+            if tail_pops > 0:
+                matched = min(prologue_push_bytes, tail_pops)
+                stack_free += matched
+                free_sizes.append(matched)
+
+        total_alloc = stack_alloc + prologue_push_bytes if (stack_free > 0 or stack_alloc > 0) else 0
+        stack_balanced = (total_alloc == stack_free) or (
+            total_alloc > 0 and len(free_sizes) >= 1 and all(f == total_alloc for f in free_sizes)
         )
         if not stack_balanced:
-            errors.append(f"Stack frame imbalance in {symbol_name}: allocated {stack_alloc} bytes but freed {stack_free} bytes")
+            errors.append(f"Stack frame imbalance in {symbol_name}: allocated {total_alloc} bytes but freed {stack_free} bytes")
 
         # Check 16-byte alignment when calls are present
         if stack_alloc % 8 != 0:

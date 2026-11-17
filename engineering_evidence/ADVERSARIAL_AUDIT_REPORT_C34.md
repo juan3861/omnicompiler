@@ -34,6 +34,10 @@
    - *Finding:* When Rust `hdr.rs` defined `Header` while taking `(f: &mut Frame)` where `Frame` was declared in Go `frame.go` (a separate file/repository), `_skip_rust_or_ts_type` and `_skip_go_type` checked only `if tok in self.declared_structs`, discarding `"Frame"` to `None` before `OmniRepoCompiler` merged `global_struct_layouts`. Inside `rs_bump_hdr`, `f.hdr.flags += delta_flags;` failed `_resolve_struct_field` silently, leaving `pkt.hdr.flags == -10` instead of `-7`.
    - *Fix:* Updated `_skip_rust_or_ts_type`, `_skip_go_type`, and `_make_function_def` to preserve PascalCase custom struct type names across file boundaries so `AstToSsaLowering` binds them against `global_struct_layouts`.
 
+2. **System V AMD64 `push rax` Alignment Prologue vs `add rsp, 8` Epilogue in `AssemblyInvariantAuditor` (`validation/assembly_invariant_auditor.py`):**
+   - *Finding:* On Linux (`x86_64-unknown-linux-gnu`), LLVM O3 emits `push r14; push rbx; push rax` (using 1-byte `push rax` for 8-byte RSP alignment instead of `sub rsp, 8`) followed by `add rsp, 8; pop rbx; pop r14; jmp ...` before a tail call in `ts_step_frame`. Scanning only `sub rsp`/`add rsp` misreported `allocated 0 bytes but freed 8 bytes`.
+   - *Fix:* Extended `AssemblyInvariantAuditor.audit_function_code` to account for leading prologue `push r64` instructions (`0x50..0x57`, `0x41 0x50..0x57`) and epilogue `pop r64` sequences immediately following `add rsp, imm` or preceding `ret`/`jmp`, verified against live SysV ELF objects while preserving mutant stack-imbalance detection.
+
 ---
 
 ## 3. Verification Evidence
@@ -45,4 +49,4 @@
   - W^X x86_64 JIT heap struct serialization via `omni_alloc` + `store_*` compared against `CPacketFrame` via real host C `libc`/`msvcrt` `memcmp` (`0` when identical, `!= 0` on 1-byte mutation).
 - `AetherMind_Strict_Auditor.py run_c34_tests.py`: **APROVADO**
 - `AetherMind_Strict_Auditor.py run_full_regression.py`: **APROVADO** (`C13`–`C34`)
-- `python -W default -m unittest discover -s tests -t F:\repository-compiler`: **218/218 PASS**, 0 warnings (`31.025s`)
+- `python -W default -m unittest discover -s tests -t F:\repository-compiler`: **218/218 PASS**, 0 warnings (`27.344s`)
