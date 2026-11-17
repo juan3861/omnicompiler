@@ -49,11 +49,14 @@ class AssemblyInvariantAuditor:
             )
 
         # 1. Termination Check
-        # Function must end with RET (0xC3) or tail JMP (0xE9 / 0xEB)
+        # Function must end with RET (0xC3) or tail JMP (EB rel8 / E9 rel32 / FF /4)
         last_byte = code_bytes[-1]
         termination_valid = (last_byte == 0xC3)
         if not termination_valid:
-            if len(code_bytes) >= 2 and code_bytes[-2] in (0xEB, 0xE9):
+            is_short_jmp = len(code_bytes) >= 2 and code_bytes[-2] == 0xEB
+            is_near_jmp = len(code_bytes) >= 5 and code_bytes[-5] == 0xE9
+            is_indir_jmp = len(code_bytes) >= 2 and code_bytes[-2] == 0xFF and (code_bytes[-1] & 0x38) == 0x20
+            if is_short_jmp or is_near_jmp or is_indir_jmp:
                 warnings.append(f"{symbol_name} terminates with JMP rather than RET.")
                 termination_valid = True
             else:

@@ -16,7 +16,7 @@ import ast
 
 
 TERMINATOR_OPCODES = frozenset({"ret", "br", "br_cond"})
-SIDE_EFFECT_OPCODES = frozenset({"ret", "br", "br_cond", "store", "call", "param"})
+SIDE_EFFECT_OPCODES = frozenset({"ret", "br", "br_cond", "store", "store_off", "call", "param"})
 
 
 class SSAVar:
@@ -257,7 +257,7 @@ class AstToSsaLowering:
         ast.GtE: "fcmp_ge",
     }
 
-    def __init__(self):
+    def __init__(self, struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None):
         self.var_versions: Dict[str, int] = {}
         self._block_counter: int = 0
         # Braun SSA bookkeeping
@@ -270,6 +270,56 @@ class AstToSsaLowering:
         self._loop_depth: int = 0
         self._fn: Optional[SSAFunction] = None
         self._cur_block: Optional[BasicBlock] = None
+        self.struct_layouts: Dict[str, Dict[str, Tuple[int, str]]] = dict(struct_layouts or {})
+        self._var_struct_types: Dict[str, str] = {}
+
+    @staticmethod
+    def _normalize_cabi_type(ann: Optional[ast.AST]) -> Optional[str]:
+        if isinstance(ann, ast.Name):
+            mp = {
+                "i8": "i8", "u8": "u8", "i16": "i16", "u16": "u16",
+                "i32": "i32", "u32": "u32", "int32": "i32",
+                "f32": "f32", "float32": "f32",
+                "i64": "i64", "u64": "u64", "int64": "i64", "int": "i64",
+                "f64": "f64", "float64": "f64", "double": "f64", "float": "f64",
+                "ptr": "ptr", "pointer": "ptr",
+            }
+            return mp.get(ann.id)
+        return None
+
+    def register_struct_from_classdef(self, cls_node: ast.ClassDef) -> Optional[Dict[str, Tuple[int, str]]]:
+        fields: List[Tuple[str, str]] = []
+        for stmt in cls_node.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                ft = self._normalize_cabi_type(stmt.annotation)
+                if ft is None:
+                    return None
+                fields.append((stmt.target.id, ft))
+        if not fields:
+            return None
+        size_align = {
+            "i8": (1, 1), "u8": (1, 1),
+            "i16": (2, 2), "u16": (2, 2),
+            "i32": (4, 4), "u32": (4, 4), "f32": (4, 4),
+            "i64": (8, 8), "u64": (8, 8), "f64": (8, 8), "ptr": (8, 8),
+        }
+        cur_off = 0
+        layout: Dict[str, Tuple[int, str]] = {}
+        for fname, ft in fields:
+            sz, al = size_align.get(ft, (8, 8))
+            pad = (al - (cur_off % al)) % al
+            cur_off += pad
+            layout[fname] = (cur_off, ft)
+            cur_off += sz
+        self.struct_layouts[cls_node.name] = layout
+        return layout
+
+    def _resolve_struct_field(self, base_node: ast.AST, attr_name: str) -> Optional[Tuple[int, str]]:
+        if isinstance(base_node, ast.Name):
+            sname = self._var_struct_types.get(base_node.id)
+            if sname and sname in self.struct_layouts:
+                return self.struct_layouts[sname].get(attr_name)
+        return None
 
     def _next_var(self, name: str, var_type: str = "i64") -> SSAVar:
         v = self.var_versions.get(name, 0) + 1
@@ -673,9 +723,22 @@ class AstToSsaLowering:
             isinstance(n, ast.Constant) and isinstance(n.value, float)
             for n in ast.walk(func_def)
         )
+        has_struct_or_width = bool(self.struct_layouts) or any(
+            isinstance(n, ast.Attribute) or (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id in (
+                    "load_i32", "store_i32", "load_f32", "store_f32",
+                    "load_i64", "store_i64", "load_f64", "store_f64",
+                    "omni_ffi_call0_f64", "omni_ffi_call1_f64", "omni_ffi_call2_f64",
+                )
+            )
+            for n in ast.walk(func_def)
+        )
         if (
             not has_float_ann
             and not has_float_const
+            and not has_struct_or_width
             and len(body_stmts) == 1
             and isinstance(body_stmts[0], ast.Return)
             and body_stmts[0].value is not None
@@ -683,10 +746,17 @@ class AstToSsaLowering:
         ):
             return self.lower_expression_function(func_def.name, params, body_stmts[0].value)
 
+        self._var_struct_types.clear()
         param_types: Dict[str, str] = {}
         for arg in func_def.args.args:
             ann = arg.annotation
-            if self._is_float_ptr_annotation(ann):
+            if isinstance(ann, ast.Name) and ann.id in self.struct_layouts:
+                param_types[arg.arg] = "ptr"
+                self._var_struct_types[arg.arg] = ann.id
+            elif isinstance(ann, ast.Name) and ann.id.startswith("ptr_") and ann.id[4:] in self.struct_layouts:
+                param_types[arg.arg] = "ptr"
+                self._var_struct_types[arg.arg] = ann.id[4:]
+            elif self._is_float_ptr_annotation(ann):
                 param_types[arg.arg] = "ptr_f64"
             elif isinstance(ann, ast.Name) and ann.id in ("ptr", "pointer", "bytes", "list"):
                 param_types[arg.arg] = "ptr"
@@ -799,6 +869,26 @@ class AstToSsaLowering:
                     res = self._next_var(stmt.target.id)
                     self._emit(res, opcode, [cur_val, rhs_val], line=line)
                 self._write_variable(stmt.target.id, self._cur_block, res)
+            elif isinstance(stmt.target, ast.Attribute):
+                finfo = self._resolve_struct_field(stmt.target.value, stmt.target.attr)
+                if finfo is not None:
+                    f_off, f_wt = finfo
+                    base_var = self._lower_expr(stmt.target.value)
+                    off_v = self._emit_const(f_off, line=line)
+                    loaded = self._next_var("fld", var_type="f64" if f_wt in ("f32", "f64") else "i64")
+                    self._emit(loaded, "load_off", [base_var, off_v, f_wt], line=line)
+                    rhs_val = self._lower_expr(stmt.value)
+                    if loaded.var_type == "f64" or rhs_val.var_type == "f64":
+                        lf = self._promote_to_f64(loaded, line=line)
+                        rf = self._promote_to_f64(rhs_val, line=line)
+                        fop = self.FLOAT_BINOP_MAP.get(type(stmt.op), "fadd")
+                        res = self._next_var("fst_val", var_type="f64")
+                        self._emit(res, fop, [lf, rf], line=line)
+                    else:
+                        opcode = self.BINOP_MAP.get(type(stmt.op), "add")
+                        res = self._next_var("fst_val")
+                        self._emit(res, opcode, [loaded, rhs_val], line=line)
+                    self._emit(None, "store_off", [base_var, off_v, res, f_wt], line=line)
             elif isinstance(stmt.target, ast.Subscript):
                 base_var = self._lower_expr(stmt.target.value)
                 idx_var = self._lower_expr(stmt.target.slice)
@@ -1094,6 +1184,15 @@ class AstToSsaLowering:
         assert self._cur_block is not None
         if isinstance(target, ast.Name):
             self._write_variable(target.id, self._cur_block, val)
+        elif isinstance(target, ast.Attribute):
+            finfo = self._resolve_struct_field(target.value, target.attr)
+            if finfo is not None:
+                f_off, f_wt = finfo
+                base_var = self._lower_expr(target.value)
+                off_v = self._emit_const(f_off, line=line)
+                if f_wt in ("f32", "f64") and val.var_type != "f64":
+                    val = self._promote_to_f64(val, line=line)
+                self._emit(None, "store_off", [base_var, off_v, val, f_wt], line=line)
         elif isinstance(target, ast.Subscript):
             base_var = self._lower_expr(target.value)
             idx_var = self._lower_expr(target.slice)
@@ -1281,6 +1380,16 @@ class AstToSsaLowering:
                 self._emit(res, "call", ["omni_item_get", base_var, idx_var], line=line)
             return res
 
+        elif isinstance(node, ast.Attribute):
+            finfo = self._resolve_struct_field(node.value, node.attr)
+            if finfo is not None:
+                f_off, f_wt = finfo
+                base_var = self._lower_expr(node.value)
+                off_v = self._emit_const(f_off, line=line)
+                res = self._next_var("fld", var_type="f64" if f_wt in ("f32", "f64") else "i64")
+                self._emit(res, "load_off", [base_var, off_v, f_wt], line=line)
+                return res
+
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 fname = node.func.id
@@ -1350,6 +1459,30 @@ class AstToSsaLowering:
                 elif fname == "float" and len(node.args) == 1:
                     av = self._lower_expr(node.args[0])
                     return self._promote_to_f64(av, line=line)
+                elif fname in ("load_i32", "load_f32", "load_i64", "load_f64") and len(node.args) == 2:
+                    wt = fname.split("_", 1)[1]
+                    bp = self._lower_expr(node.args[0])
+                    bo = self._lower_expr(node.args[1])
+                    res = self._next_var("ldw", var_type="f64" if wt in ("f32", "f64") else "i64")
+                    self._emit(res, "load_off", [bp, bo, wt], line=line)
+                    return res
+                elif fname in ("store_i32", "store_f32", "store_i64", "store_f64") and len(node.args) == 3:
+                    wt = fname.split("_", 1)[1]
+                    bp = self._lower_expr(node.args[0])
+                    bo = self._lower_expr(node.args[1])
+                    vv = self._lower_expr(node.args[2])
+                    if wt in ("f32", "f64") and vv.var_type != "f64":
+                        vv = self._promote_to_f64(vv, line=line)
+                    self._emit(None, "store_off", [bp, bo, vv, wt], line=line)
+                    return vv
+                elif fname in ("omni_ffi_call0_f64", "omni_ffi_call1_f64", "omni_ffi_call2_f64"):
+                    arg_vars = [self._lower_expr(a) for a in node.args]
+                    for idx_a in range(1, len(arg_vars)):
+                        if arg_vars[idx_a].var_type != "f64":
+                            arg_vars[idx_a] = self._promote_to_f64(arg_vars[idx_a], line=line)
+                    res = self._next_var("fficall_f64", var_type="f64")
+                    self._emit(res, "call", [fname] + arg_vars, line=line)
+                    return res
                 elif fname == "sum" and len(node.args) == 1:
                     arg_v = self._lower_expr(node.args[0])
                     res = self._next_var("sum")
@@ -1681,10 +1814,14 @@ def lower_ast_to_ssa(
     fn_name: str = "func",
     param_names: Optional[List[str]] = None,
     optimize: bool = False,
+    struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None,
 ) -> SSAFunction:
     """Lowers an AST FunctionDef, Module (first FunctionDef), or expression into Omni-SSA."""
-    lowering = AstToSsaLowering()
+    lowering = AstToSsaLowering(struct_layouts=struct_layouts)
     if isinstance(node, ast.Module):
+        for stmt in node.body:
+            if isinstance(stmt, ast.ClassDef):
+                lowering.register_struct_from_classdef(stmt)
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef):
                 fn = lowering.lower_function_def(stmt)
@@ -1696,10 +1833,18 @@ def lower_ast_to_ssa(
     return optimize_ssa(fn) if optimize else fn
 
 
-def lower_source_to_ssa(source_code: str, fn_name: Optional[str] = None, optimize: bool = True) -> SSAFunction:
+def lower_source_to_ssa(
+    source_code: str,
+    fn_name: Optional[str] = None,
+    optimize: bool = True,
+    struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None,
+) -> SSAFunction:
     """Parses Python source code and lowers the target function (or expression) into Omni-SSA."""
     tree = ast.parse(source_code)
-    lowering = AstToSsaLowering()
+    lowering = AstToSsaLowering(struct_layouts=struct_layouts)
+    for stmt in tree.body:
+        if isinstance(stmt, ast.ClassDef):
+            lowering.register_struct_from_classdef(stmt)
     for stmt in tree.body:
         if isinstance(stmt, ast.FunctionDef):
             if fn_name is None or stmt.name == fn_name:

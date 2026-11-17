@@ -41,7 +41,7 @@ SUPPORTED_Z3_OPCODES = frozenset({
     "br", "br_cond", "ret",
 })
 
-SUPPORTED_Z3_MEMORY_OPCODES = frozenset({"alloca", "load", "store"})
+SUPPORTED_Z3_MEMORY_OPCODES = frozenset({"alloca", "load", "store", "load_off", "store_off"})
 SUPPORTED_Z3_METADATA_OPCODES = frozenset({"unroll_meta", "unroll_factor"})
 SUPPORTED_Z3_FLOAT_OPCODES = frozenset({
     "fconst", "fneg", "fadd", "fsub", "fmul", "fdiv",
@@ -140,6 +140,24 @@ class SSATranslationValidator:
         if self.enable_float_theory:
             ops |= SUPPORTED_Z3_FLOAT_OPCODES
         return frozenset(ops)
+
+    @staticmethod
+    def _load_off_z3(raw_bv: z3.BitVecRef, width: str) -> z3.BitVecRef:
+        if width == "i32":
+            return z3.SignExt(32, z3.Extract(31, 0, raw_bv))
+        if width == "f32":
+            f32_val = z3.fpBVToFP(z3.Extract(31, 0, raw_bv), z3.Float32())
+            return z3.fpToIEEEBV(z3.fpToFP(z3.RNE(), f32_val, z3.Float64()))
+        return raw_bv
+
+    @staticmethod
+    def _store_off_z3(val_bv: z3.BitVecRef, width: str) -> z3.BitVecRef:
+        if width == "i32":
+            return z3.ZeroExt(32, z3.Extract(31, 0, val_bv))
+        if width == "f32":
+            f64_val = z3.fpBVToFP(val_bv, z3.Float64())
+            return z3.ZeroExt(32, z3.fpToIEEEBV(z3.fpToFP(z3.RNE(), f64_val, z3.Float32())))
+        return val_bv
 
     @staticmethod
     def _float_to_bv(val: float) -> z3.BitVecRef:
@@ -428,6 +446,39 @@ class SSATranslationValidator:
                             cur_loc_mem = z3.Store(cur_loc_mem, addr, val_v)
                         else:
                             cur_ext_mem = z3.Store(cur_ext_mem, addr, val_v)
+
+                    elif op == "load_off":
+                        if inst.result is None or len(inst.operands) < 2:
+                            return {"error": "INVALID_LOAD_OFF"}
+                        ptr_op = inst.operands[0]
+                        ptr_v = eval_op(ptr_op)
+                        off_v = eval_op(inst.operands[1])
+                        width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
+                        if ptr_v is None or off_v is None:
+                            return {"error": "UNRESOLVED_LOAD_OFF"}
+                        addr = ptr_v + off_v
+                        raw_v = z3.Select(cur_loc_mem if is_alloca_var(ptr_op) else cur_ext_mem, addr)
+                        env_levels[lvl][inst.result] = self._load_off_z3(raw_v, width)
+
+                    elif op == "store_off":
+                        if len(inst.operands) < 3:
+                            return {"error": "INVALID_STORE_OFF"}
+                        ptr_op = inst.operands[0]
+                        ptr_v = eval_op(ptr_op)
+                        off_v = eval_op(inst.operands[1])
+                        val_op = inst.operands[2]
+                        width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                        val_v = eval_op(val_op)
+                        if ptr_v is None or off_v is None or val_v is None:
+                            return {"error": "UNRESOLVED_STORE_OFF"}
+                        if is_alloca_var(val_op) and not is_alloca_var(ptr_op):
+                            return {"error": "ESCAPED_ALLOCA_UNSUPPORTED"}
+                        addr = ptr_v + off_v
+                        w_val = self._store_off_z3(val_v, width)
+                        if is_alloca_var(ptr_op):
+                            cur_loc_mem = z3.Store(cur_loc_mem, addr, w_val)
+                        else:
+                            cur_ext_mem = z3.Store(cur_ext_mem, addr, w_val)
 
                     elif op in ("neg", "not"):
                         if len(inst.operands) != 1 or inst.result is None:
@@ -837,6 +888,40 @@ class SSATranslationValidator:
                         cur_loc_mem = z3.Store(cur_loc_mem, addr, val_v)
                     else:
                         cur_ext_mem = z3.Store(cur_ext_mem, addr, val_v)
+                        wrote_ext_mem = True
+
+                elif op == "load_off":
+                    if inst.result is None or len(inst.operands) < 2:
+                        return {"error": "INVALID_LOAD_OFF"}
+                    ptr_op = inst.operands[0]
+                    ptr_v = eval_op(ptr_op)
+                    off_v = eval_op(inst.operands[1])
+                    width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
+                    if ptr_v is None or off_v is None:
+                        return {"error": "UNRESOLVED_LOAD_OFF"}
+                    addr = ptr_v + off_v
+                    raw_v = z3.Select(cur_loc_mem if is_alloca_var(ptr_op) else cur_ext_mem, addr)
+                    local_env[inst.result] = self._load_off_z3(raw_v, width)
+
+                elif op == "store_off":
+                    if len(inst.operands) < 3:
+                        return {"error": "INVALID_STORE_OFF"}
+                    ptr_op = inst.operands[0]
+                    ptr_v = eval_op(ptr_op)
+                    off_v = eval_op(inst.operands[1])
+                    val_op = inst.operands[2]
+                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    val_v = eval_op(val_op)
+                    if ptr_v is None or off_v is None or val_v is None:
+                        return {"error": "UNRESOLVED_STORE_OFF"}
+                    if is_alloca_var(val_op) and not is_alloca_var(ptr_op):
+                        return {"error": "ESCAPED_ALLOCA_UNSUPPORTED"}
+                    addr = ptr_v + off_v
+                    w_val = self._store_off_z3(val_v, width)
+                    if is_alloca_var(ptr_op):
+                        cur_loc_mem = z3.Store(cur_loc_mem, addr, w_val)
+                    else:
+                        cur_ext_mem = z3.Store(cur_ext_mem, addr, w_val)
                         wrote_ext_mem = True
 
                 elif op in ("neg", "not"):
@@ -2432,7 +2517,7 @@ class SSATranslationValidator:
             for fn_cand in (ssa_before, ssa_after):
                 for blk in fn_cand.blocks:
                     for ins in blk.instructions:
-                        if ins.opcode in ("load", "store") and ins.operands:
+                        if ins.opcode in ("load", "store", "load_off", "store_off") and ins.operands:
                             b_op = ins.operands[0]
                             if isinstance(b_op, SSAVar) and b_op.version == 0 and b_op.name in ssa_before.params:
                                 ptr_params.add(b_op.name)
@@ -2444,7 +2529,11 @@ class SSATranslationValidator:
                 (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
                 (-2.0, 4.0, -0.25, 0.75, 1.25, -1.5),
             ]
-            probe_addrs = [z3.BitVecVal(0x10000 + i * 0x1000 + k * 8, 64) for i in range(len(sym_params)) for k in (0, 1)]
+            probe_addrs = [
+                z3.BitVecVal(0x10000 + i * 0x1000 + off, 64)
+                for i in range(len(sym_params))
+                for off in (0, 4, 8, 16)
+            ]
             mem_probe_disj = [z3.Select(mem_b, pa) != z3.Select(mem_a, pa) for pa in probe_addrs]
             if is_bounded:
                 conc_mismatch = z3.Or(

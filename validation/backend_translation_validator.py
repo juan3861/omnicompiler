@@ -141,9 +141,13 @@ class LLVMIRToSSALifter:
         blocks: Dict[str, BasicBlock] = {}
         block_order: List[str] = []
         cur_bb: Optional[BasicBlock] = None
-        alias_ptr: Dict[str, Tuple[Any, Any]] = {}  # %ptr/%gep -> (base_op, idx_op)
+        alias_ptr: Dict[str, Tuple[Any, Any, bool]] = {}  # %ptr/%gep -> (base_op, idx_or_off, is_byte_off)
         alloca_ptrs: Dict[str, SSAVar] = {}
         ext_zext_map: Dict[str, SSAVar] = {}  # %i1_var -> aliased i64 SSAVar
+        trunc_i32_map: Dict[str, Any] = {}
+        fptrunc_f32_map: Dict[str, Any] = {}
+        load_i32_map: Dict[str, Tuple[Any, Any, bool]] = {}
+        load_f32_map: Dict[str, Tuple[Any, Any, bool]] = {}
 
         def ensure_block(label: str) -> BasicBlock:
             if label not in blocks:
@@ -203,15 +207,40 @@ class LLVMIRToSSALifter:
                 cur_bb.add_instruction(SSAInstruction(None, "ret", [parse_val(m_ret.group(2), as_float=is_f)]))
                 continue
 
-            if ln.startswith("store i64 ") or ln.startswith("store double "):
-                m_st = re.match(r"^store\s+(i64|double)\s+([^,]+),\s*ptr\s+(%[A-Za-z0-9_.$]+)", ln)
+            if (
+                ln.startswith("store i64 ")
+                or ln.startswith("store double ")
+                or ln.startswith("store i32 ")
+                or ln.startswith("store float ")
+            ):
+                m_st = re.match(r"^store\s+(i64|double|i32|float)\s+([^,]+),\s*ptr\s+(%[A-Za-z0-9_.$]+)", ln)
                 if not m_st:
                     return None, f"UNSUPPORTED_LLVM_STORE_{ln}"
-                is_f_st = m_st.group(1) == "double"
-                val_op = parse_val(m_st.group(2), as_float=is_f_st)
+                st_ty = m_st.group(1)
+                val_tok = m_st.group(2).strip()
                 p_name = m_st.group(3)[1:]
-                base_op, idx_op = alias_ptr.get(p_name, (get_or_create_var(m_st.group(3)), 0))
-                cur_bb.add_instruction(SSAInstruction(None, "store", [base_op, idx_op, val_op]))
+                pt_entry = alias_ptr.get(p_name)
+                if pt_entry is None:
+                    base_op, idx_op, is_byte_off = get_or_create_var(m_st.group(3)), 0, False
+                else:
+                    base_op, idx_op, is_byte_off = pt_entry
+                if st_ty == "i32":
+                    raw_n = val_tok[1:] if val_tok.startswith("%") else val_tok
+                    val_op = trunc_i32_map.get(raw_n, parse_val(val_tok))
+                    cur_bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "i32"]))
+                elif st_ty == "float":
+                    raw_n = val_tok[1:] if val_tok.startswith("%") else val_tok
+                    val_op = fptrunc_f32_map.get(raw_n, parse_val(val_tok, as_float=True))
+                    cur_bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "f32"]))
+                else:
+                    is_f_st = st_ty == "double"
+                    val_op = parse_val(val_tok, as_float=is_f_st)
+                    if is_byte_off:
+                        cur_bb.add_instruction(
+                            SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "f64" if is_f_st else "i64"])
+                        )
+                    else:
+                        cur_bb.add_instruction(SSAInstruction(None, "store", [base_op, idx_op, val_op]))
                 continue
 
             # Assignment instructions: %lhs = ...
@@ -261,24 +290,69 @@ class LLVMIRToSSALifter:
 
             m_itop = re.match(r"^inttoptr\s+i64\s+([^ ]+)\s+to\s+ptr$", rhs)
             if m_itop:
-                alias_ptr[lhs_name] = (parse_val(m_itop.group(1)), 0)
+                alias_ptr[lhs_name] = (parse_val(m_itop.group(1)), 0, False)
                 continue
 
-            m_gep = re.match(r"^getelementptr\s+(?:i64|double),\s*ptr\s+(%[A-Za-z0-9_.$]+),\s*i64\s+(.+)$", rhs)
+            m_gep = re.match(r"^getelementptr\s+(i64|double|i8),\s*ptr\s+(%[A-Za-z0-9_.$]+),\s*i64\s+(.+)$", rhs)
             if m_gep:
-                src_p = m_gep.group(1)[1:]
-                idx_op = parse_val(m_gep.group(2))
-                base_op = alias_ptr[src_p][0] if src_p in alias_ptr else get_or_create_var(m_gep.group(1))
-                alias_ptr[lhs_name] = (base_op, idx_op)
+                elem_t = m_gep.group(1)
+                src_p = m_gep.group(2)[1:]
+                idx_op = parse_val(m_gep.group(3))
+                base_op = alias_ptr[src_p][0] if src_p in alias_ptr else get_or_create_var(m_gep.group(2))
+                alias_ptr[lhs_name] = (base_op, idx_op, elem_t == "i8")
                 continue
 
-            m_load = re.match(r"^load\s+(i64|double),\s*ptr\s+(%[A-Za-z0-9_.$]+)", rhs)
+            m_load = re.match(r"^load\s+(i64|double|i32|float),\s*ptr\s+(%[A-Za-z0-9_.$]+)", rhs)
             if m_load:
-                is_f_ld = m_load.group(1) == "double"
+                ld_ty = m_load.group(1)
                 p_name = m_load.group(2)[1:]
-                base_op, idx_op = alias_ptr.get(p_name, (get_or_create_var(m_load.group(2)), 0))
+                pt_entry = alias_ptr.get(p_name)
+                if pt_entry is None:
+                    base_op, idx_op, is_byte_off = get_or_create_var(m_load.group(2)), 0, False
+                else:
+                    base_op, idx_op, is_byte_off = pt_entry
+                if ld_ty == "i32":
+                    load_i32_map[lhs_name] = (base_op, idx_op, is_byte_off)
+                    continue
+                if ld_ty == "float":
+                    load_f32_map[lhs_name] = (base_op, idx_op, is_byte_off)
+                    continue
+                is_f_ld = ld_ty == "double"
                 res_v = get_or_create_var(lhs_tok, var_type="f64" if is_f_ld else "i64")
-                cur_bb.add_instruction(SSAInstruction(res_v, "load", [base_op, idx_op]))
+                if is_byte_off:
+                    cur_bb.add_instruction(
+                        SSAInstruction(res_v, "load_off", [base_op, idx_op, "f64" if is_f_ld else "i64"])
+                    )
+                else:
+                    cur_bb.add_instruction(SSAInstruction(res_v, "load", [base_op, idx_op]))
+                continue
+
+            m_sext = re.match(r"^sext\s+i32\s+(%[A-Za-z0-9_.$]+)\s+to\s+i64$", rhs)
+            if m_sext:
+                src_n = m_sext.group(1)[1:]
+                if src_n in load_i32_map:
+                    base_op, off_op, _ = load_i32_map[src_n]
+                    res_v = get_or_create_var(lhs_tok, var_type="i64")
+                    cur_bb.add_instruction(SSAInstruction(res_v, "load_off", [base_op, off_op, "i32"]))
+                    continue
+
+            m_fpext = re.match(r"^fpext\s+float\s+(%[A-Za-z0-9_.$]+)\s+to\s+double$", rhs)
+            if m_fpext:
+                src_n = m_fpext.group(1)[1:]
+                if src_n in load_f32_map:
+                    base_op, off_op, _ = load_f32_map[src_n]
+                    res_v = get_or_create_var(lhs_tok, var_type="f64")
+                    cur_bb.add_instruction(SSAInstruction(res_v, "load_off", [base_op, off_op, "f32"]))
+                    continue
+
+            m_trunc = re.match(r"^trunc\s+i64\s+(.+)\s+to\s+i32$", rhs)
+            if m_trunc:
+                trunc_i32_map[lhs_name] = parse_val(m_trunc.group(1))
+                continue
+
+            m_fptrunc = re.match(r"^fptrunc\s+double\s+(.+)\s+to\s+float$", rhs)
+            if m_fptrunc:
+                fptrunc_f32_map[lhs_name] = parse_val(m_fptrunc.group(1), as_float=True)
                 continue
 
             m_icmp = re.match(r"^icmp\s+(eq|ne|slt|sle|sgt|sge)\s+i64\s+([^,]+),\s*(.+)$", rhs)
@@ -939,31 +1013,61 @@ class WATToSSALifter:
                 base_op = bb.instructions[-1].operands[0]
                 idx_op = bb.instructions[-2].operands[0]
                 stack.append(("__wat_ptr__", base_op, idx_op))
+            elif (
+                len(bb.instructions) >= 1
+                and bb.instructions[-1].opcode == "add"
+                and bb.instructions[-1].result == addr_val
+                and len(bb.instructions[-1].operands) == 2
+            ):
+                stack.append(("__wat_ptr_byte__", bb.instructions[-1].operands[0], bb.instructions[-1].operands[1]))
             else:
                 stack.append(("__wat_ptr__", addr_val, 0))
             return None
-        if ln in ("i64.load", "f64.load"):
+        if ln in ("i64.load", "f64.load", "i64.load32_s", "f32.load"):
             if not stack:
                 return "WAT_STACK_UNDERFLOW_load"
             addr_tok = stack.pop()
-            if isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr__":
-                base_op, idx_op = addr_tok[1], addr_tok[2]
+            if isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr_byte__":
+                base_op, idx_op, is_byte = addr_tok[1], addr_tok[2], True
+            elif isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr__":
+                base_op, idx_op, is_byte = addr_tok[1], addr_tok[2], False
             else:
-                base_op, idx_op = addr_tok, 0
-            rv = next_var("wld", var_type="f64" if ln == "f64.load" else "i64")
-            bb.add_instruction(SSAInstruction(rv, "load", [base_op, idx_op]))
+                base_op, idx_op, is_byte = addr_tok, 0, (ln in ("i64.load32_s", "f32.load"))
+            if ln == "i64.load32_s":
+                rv = next_var("wld32", var_type="i64")
+                bb.add_instruction(SSAInstruction(rv, "load_off", [base_op, idx_op, "i32"]))
+            elif ln == "f32.load":
+                rv = next_var("wldf32", var_type="f64")
+                bb.add_instruction(SSAInstruction(rv, "load_off", [base_op, idx_op, "f32"]))
+            elif is_byte:
+                rv = next_var("wldo", var_type="f64" if ln == "f64.load" else "i64")
+                bb.add_instruction(SSAInstruction(rv, "load_off", [base_op, idx_op, "f64" if ln == "f64.load" else "i64"]))
+            else:
+                rv = next_var("wld", var_type="f64" if ln == "f64.load" else "i64")
+                bb.add_instruction(SSAInstruction(rv, "load", [base_op, idx_op]))
             stack.append(rv)
             return None
-        if ln in ("i64.store", "f64.store"):
+        if ln in ("f64.promote_f32", "f32.demote_f64"):
+            return None
+        if ln in ("i64.store", "f64.store", "i64.store32", "f32.store"):
             if len(stack) < 2:
                 return "WAT_STACK_UNDERFLOW_store"
             val_op = stack.pop()
             addr_tok = stack.pop()
-            if isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr__":
-                base_op, idx_op = addr_tok[1], addr_tok[2]
+            if isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr_byte__":
+                base_op, idx_op, is_byte = addr_tok[1], addr_tok[2], True
+            elif isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr__":
+                base_op, idx_op, is_byte = addr_tok[1], addr_tok[2], False
             else:
-                base_op, idx_op = addr_tok, 0
-            bb.add_instruction(SSAInstruction(None, "store", [base_op, idx_op, val_op]))
+                base_op, idx_op, is_byte = addr_tok, 0, (ln in ("i64.store32", "f32.store"))
+            if ln == "i64.store32":
+                bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "i32"]))
+            elif ln == "f32.store":
+                bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "f32"]))
+            elif is_byte:
+                bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "f64" if ln == "f64.store" else "i64"]))
+            else:
+                bb.add_instruction(SSAInstruction(None, "store", [base_op, idx_op, val_op]))
             return None
         if ln.startswith("call $"):
             callee = ln[len("call $") :].strip()
@@ -1218,12 +1322,14 @@ class BackendTranslationValidator:
         def elem_bits(v: Any, is_f: bool) -> int:
             return struct.unpack("<Q", struct.pack("<d", float(v)))[0] if is_f else _to_s64(int(v))
 
-        def cmp_key(ret_v: Any, mem_snap: Dict[str, List[Any]]) -> Tuple[Any, ...]:
+        def cmp_key(ret_v: Any, mem_snap: Dict[str, Any]) -> Tuple[Any, ...]:
             r_bits = elem_bits(ret_v, is_fp_ret)
             m_bits = tuple(
                 (
                     k,
-                    tuple(
+                    vals
+                    if isinstance(vals, (bytes, bytearray))
+                    else tuple(
                         elem_bits(
                             el,
                             ssa_fn.param_types.get(k) == "ptr_f64" or isinstance(el, float),
@@ -1235,28 +1341,36 @@ class BackendTranslationValidator:
             )
             return (r_bits, m_bits)
 
-        def run_ctypes_callable(cfunc, vec: Sequence[Any]) -> Tuple[Any, Dict[str, List[Any]]]:
+        def run_ctypes_callable(cfunc, vec: Sequence[Any]) -> Tuple[Any, Dict[str, Any]]:
             call_args: List[Any] = []
-            live_bufs: List[Tuple[str, Any, bool, int]] = []
+            live_bufs: List[Tuple[str, Any, str, int]] = []
             for p, x in zip(ssa_fn.params, vec):
                 pty = ssa_fn.param_types.get(p, "i64")
-                if isinstance(x, list):
+                if isinstance(x, (bytes, bytearray)):
+                    n_b = len(x)
+                    cbuf = (ctypes.c_ubyte * max(1, n_b)).from_buffer_copy(bytearray(x) if n_b > 0 else bytearray(1))
+                    live_bufs.append((p, cbuf, "bytes", n_b))
+                    call_args.append(ctypes.addressof(cbuf))
+                elif isinstance(x, list):
                     is_f_buf = pty == "ptr_f64" or any(isinstance(el, float) for el in x)
                     n_el = len(x)
                     if is_f_buf:
                         cbuf = (ctypes.c_double * max(1, n_el))(*[float(el) for el in x])
                     else:
                         cbuf = (ctypes.c_int64 * max(1, n_el))(*[int(el) for el in x])
-                    live_bufs.append((p, cbuf, is_f_buf, n_el))
+                    live_bufs.append((p, cbuf, "f64" if is_f_buf else "i64", n_el))
                     call_args.append(ctypes.addressof(cbuf))
                 elif pty == "f64":
                     call_args.append(float(x))
                 else:
                     call_args.append(int(x))
             rv = fmt_out(cfunc(*call_args))
-            mem_out: Dict[str, List[Any]] = {}
-            for p, cbuf, is_f_buf, n_el in live_bufs:
-                mem_out[p] = [float(cbuf[i]) if is_f_buf else _to_s64(int(cbuf[i])) for i in range(n_el)]
+            mem_out: Dict[str, Any] = {}
+            for p, cbuf, kind, n_el in live_bufs:
+                if kind == "bytes":
+                    mem_out[p] = bytes(cbuf)[:n_el]
+                else:
+                    mem_out[p] = [float(cbuf[i]) if kind == "f64" else _to_s64(int(cbuf[i])) for i in range(n_el)]
             return rv, mem_out
 
         if "native" in backends:
@@ -1307,11 +1421,19 @@ class BackendTranslationValidator:
                 w_outs, w_mems = [], []
                 for vec in test_vectors:
                     w_args: List[Any] = []
-                    w_bufs: List[Tuple[str, int, int, bool]] = []
+                    w_bufs: List[Tuple[str, int, int, str]] = []
                     cur_off = 1024
                     for p, x in zip(ssa_fn.params, vec):
                         pty = ssa_fn.param_types.get(p, "i64")
-                        if isinstance(x, list) and wasm_mem is not None:
+                        if isinstance(x, (bytes, bytearray)) and wasm_mem is not None:
+                            raw_b = bytes(x)
+                            n_b = len(raw_b)
+                            if raw_b:
+                                wasm_mem.write(store, raw_b, cur_off)
+                            w_bufs.append((p, cur_off, n_b, "bytes"))
+                            w_args.append(cur_off)
+                            cur_off += max(64, ((n_b + 63) // 64) * 64)
+                        elif isinstance(x, list) and wasm_mem is not None:
                             is_f_buf = pty == "ptr_f64" or any(isinstance(el, float) for el in x)
                             n_el = len(x)
                             if is_f_buf:
@@ -1320,7 +1442,7 @@ class BackendTranslationValidator:
                                 raw_b = struct.pack(f"<{n_el}q", *[_to_s64(int(el)) for el in x]) if n_el > 0 else b""
                             if raw_b:
                                 wasm_mem.write(store, raw_b, cur_off)
-                            w_bufs.append((p, cur_off, n_el, is_f_buf))
+                            w_bufs.append((p, cur_off, n_el, "f64" if is_f_buf else "i64"))
                             w_args.append(cur_off)
                             cur_off += max(64, ((len(raw_b) + 63) // 64) * 64)
                         elif pty == "f64":
@@ -1328,14 +1450,16 @@ class BackendTranslationValidator:
                         else:
                             w_args.append(int(x))
                     rv = fmt_out(exp_fn(store, *w_args))
-                    mo: Dict[str, List[Any]] = {}
+                    mo: Dict[str, Any] = {}
                     if wasm_mem is not None:
-                        for p, off, n_el, is_f_buf in w_bufs:
-                            if n_el == 0:
+                        for p, off, n_el, kind in w_bufs:
+                            if kind == "bytes":
+                                mo[p] = bytes(wasm_mem.read(store, off, off + n_el)) if n_el > 0 else b""
+                            elif n_el == 0:
                                 mo[p] = []
                             else:
                                 raw_out = bytes(wasm_mem.read(store, off, off + n_el * 8))
-                                if is_f_buf:
+                                if kind == "f64":
                                     mo[p] = list(struct.unpack(f"<{n_el}d", raw_out))
                                 else:
                                     mo[p] = [_to_s64(v) for v in struct.unpack(f"<{n_el}q", raw_out)]

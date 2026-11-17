@@ -686,6 +686,35 @@ class X64CodeGenerator:
                     # REX.W=1, R=0(rax), X=0(rcx), B=1(r11) -> 0x49; SIB: scale=8(0xC0), idx=rcx(1<<3), base=r11(3) -> 0xCB
                     buf.emit(b"\x49\x89\x04\xcb")                    # mov [r11 + rcx*8], rax
 
+                elif op == "load_off":
+                    resolve_operand_to_reg(inst.operands[0], "r11")  # base ptr
+                    resolve_operand_to_reg(inst.operands[1], "rcx")  # byte offset
+                    width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
+                    buf.emit(b"\x49\x01\xcb")                        # add r11, rcx
+                    if width == "i32":
+                        buf.emit(b"\x49\x63\x03")                    # movsxd rax, dword ptr [r11]
+                    elif width == "f32":
+                        buf.emit(b"\xf3\x41\x0f\x5a\x03")            # cvtss2sd xmm0, dword ptr [r11]
+                        buf.emit(_x64_movq_r64_xmm("rax", 0))
+                    else:
+                        buf.emit(b"\x49\x8b\x03")                    # mov rax, qword ptr [r11]
+                    write_result_from_reg(inst.result, "rax")
+
+                elif op == "store_off":
+                    resolve_operand_to_reg(inst.operands[0], "r11")  # base ptr
+                    resolve_operand_to_reg(inst.operands[1], "rcx")  # byte offset
+                    resolve_operand_to_reg(inst.operands[2], "rax")  # value
+                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    buf.emit(b"\x49\x01\xcb")                        # add r11, rcx
+                    if width == "i32":
+                        buf.emit(b"\x41\x89\x03")                    # mov dword ptr [r11], eax
+                    elif width == "f32":
+                        buf.emit(_x64_movq_xmm_r64(0, "rax"))
+                        buf.emit(b"\xf2\x0f\x5a\xc0")                # cvtsd2ss xmm0, xmm0
+                        buf.emit(b"\xf3\x41\x0f\x11\x03")            # movss dword ptr [r11], xmm0
+                    else:
+                        buf.emit(b"\x49\x89\x03")                    # mov qword ptr [r11], rax
+
                 elif op == "alloca":
                     disp = alloca_map.get(inst.result, 16)
                     if disp <= 127:
@@ -1300,6 +1329,34 @@ class Arm64CodeGenerator:
                     load_op(inst.operands[2], 11)  # value in X11
                     # STR X11, [X9, X10, LSL #3] -> 0xF8207800 | (10 << 16) | (9 << 5) | 11
                     code.extend(_a64_u32(0xF8207800 | (10 << 16) | (9 << 5) | 11))
+                elif op == "load_off":
+                    load_op(inst.operands[0], 9)   # base ptr in X9
+                    load_op(inst.operands[1], 10)  # byte offset in X10
+                    width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
+                    code.extend(_a64_u32(0x8B0A0129))  # ADD X9, X9, X10
+                    if width == "i32":
+                        code.extend(_a64_u32(0xB980012B))  # LDRSW X11, [X9]
+                    elif width == "f32":
+                        code.extend(_a64_u32(0xBD400120))  # LDR S0, [X9]
+                        code.extend(_a64_u32(0x1E22C000))  # FCVT D0, S0
+                        code.extend(_a64_u32(0x9E66000B))  # FMOV X11, D0
+                    else:
+                        code.extend(_a64_u32(0xF940012B))  # LDR X11, [X9]
+                    store_res(inst.result, 11)
+                elif op == "store_off":
+                    load_op(inst.operands[0], 9)   # base ptr in X9
+                    load_op(inst.operands[1], 10)  # byte offset in X10
+                    load_op(inst.operands[2], 11)  # value in X11
+                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    code.extend(_a64_u32(0x8B0A0129))  # ADD X9, X9, X10
+                    if width == "i32":
+                        code.extend(_a64_u32(0xB900012B))  # STR W11, [X9]
+                    elif width == "f32":
+                        code.extend(_a64_u32(0x9E670160))  # FMOV D0, X11
+                        code.extend(_a64_u32(0x1E624000))  # FCVT S0, D0
+                        code.extend(_a64_u32(0xBD000120))  # STR S0, [X9]
+                    else:
+                        code.extend(_a64_u32(0xF900012B))  # STR X11, [X9]
                 elif op == "alloca":
                     disp = alloca_map.get(inst.result, 16)
                     # SUB X9, X29, #disp -> 0xD1000000 | ((disp & 0xFFF) << 10) | (29 << 5) | 9

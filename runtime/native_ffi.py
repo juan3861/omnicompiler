@@ -10,8 +10,6 @@ import os
 import ctypes
 from typing import Dict, Tuple, Any, List, Optional, Union
 
-from runtime.native_heap import omni_list_len, omni_list_get
-
 
 _IS_WIN32 = sys.platform == "win32"
 
@@ -77,7 +75,7 @@ def omni_ffi_load_lib(lib_name_ptr: Union[int, str]) -> int:
     lib_obj = None
     if _IS_WIN32:
         try:
-            if not lib_name or lib_name.lower() in ("msvcrt", "libc"):
+            if not lib_name or lib_name.lower() in ("msvcrt", "libc", "libm", "m"):
                 lib_obj = ctypes.cdll.msvcrt
             elif lib_name.lower() in ("kernel32", "kernel32.dll"):
                 lib_obj = ctypes.windll.kernel32
@@ -90,8 +88,13 @@ def omni_ffi_load_lib(lib_name_ptr: Union[int, str]) -> int:
                 return 0
     else:
         try:
-            if not lib_name or lib_name.lower() in ("libc", "c"):
+            if not lib_name or lib_name.lower() in ("libc", "c", "msvcrt"):
                 lib_obj = ctypes.CDLL(None)
+            elif lib_name.lower() in ("libm", "m"):
+                try:
+                    lib_obj = ctypes.CDLL("libm.so.6")
+                except Exception:
+                    lib_obj = ctypes.CDLL(None)
             else:
                 lib_obj = ctypes.CDLL(lib_name)
         except Exception:
@@ -190,6 +193,30 @@ def omni_ffi_call4(fn_ptr: int, a0: int, a1: int, a2: int, a3: int) -> int:
     return int(callable_fn(a0, a1, a2, a3))
 
 
+def omni_ffi_call0_f64(fn_ptr: int) -> float:
+    """Calls fn_ptr() -> double."""
+    if fn_ptr == 0:
+        return 0.0
+    fn_type = ctypes.CFUNCTYPE(ctypes.c_double)
+    return float(fn_type(fn_ptr)())
+
+
+def omni_ffi_call1_f64(fn_ptr: int, a0: float) -> float:
+    """Calls fn_ptr(double) -> double."""
+    if fn_ptr == 0:
+        return 0.0
+    fn_type = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_double)
+    return float(fn_type(fn_ptr)(float(a0)))
+
+
+def omni_ffi_call2_f64(fn_ptr: int, a0: float, a1: float) -> float:
+    """Calls fn_ptr(double, double) -> double."""
+    if fn_ptr == 0:
+        return 0.0
+    fn_type = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_double, ctypes.c_double)
+    return float(fn_type(fn_ptr)(float(a0), float(a1)))
+
+
 def omni_ffi_call(fn_ptr: int, args_list_ptr: int) -> int:
     """
     Calls fn_ptr(*args) -> int64 dynamically unpacking arguments from an OmniList.
@@ -200,6 +227,7 @@ def omni_ffi_call(fn_ptr: int, args_list_ptr: int) -> int:
     if args_list_ptr == 0:
         return omni_ffi_call0(fn_ptr)
 
+    from runtime.native_heap import omni_list_len, omni_list_get
     n_args = min(8, max(0, omni_list_len(args_list_ptr)))
     args = [omni_list_get(args_list_ptr, i) for i in range(n_args)]
 
@@ -251,6 +279,18 @@ class OmniFFI:
             fn_type = ctypes.CFUNCTYPE(ctypes.c_int64, *arg_types)
             return int(fn_type(fn_ptr)(*args))
 
+    @staticmethod
+    def call_f64(fn_ptr: int, *args: float) -> float:
+        if len(args) == 0:
+            return omni_ffi_call0_f64(fn_ptr)
+        elif len(args) == 1:
+            return omni_ffi_call1_f64(fn_ptr, args[0])
+        elif len(args) == 2:
+            return omni_ffi_call2_f64(fn_ptr, args[0], args[1])
+        arg_types = [ctypes.c_double] * len(args)
+        fn_type = ctypes.CFUNCTYPE(ctypes.c_double, *arg_types)
+        return float(fn_type(fn_ptr)(*[float(a) for a in args]))
+
 
 # Exported symbols for runtime/native_heap.py integration
 NATIVE_FFI_SYMBOLS: Dict[str, Tuple[Any, List[Any], Any]] = {
@@ -262,4 +302,7 @@ NATIVE_FFI_SYMBOLS: Dict[str, Tuple[Any, List[Any], Any]] = {
     "omni_ffi_call3": (omni_ffi_call3, [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64], ctypes.c_int64),
     "omni_ffi_call4": (omni_ffi_call4, [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64], ctypes.c_int64),
     "omni_ffi_call": (omni_ffi_call, [ctypes.c_int64, ctypes.c_int64], ctypes.c_int64),
+    "omni_ffi_call0_f64": (omni_ffi_call0_f64, [ctypes.c_int64], ctypes.c_double),
+    "omni_ffi_call1_f64": (omni_ffi_call1_f64, [ctypes.c_int64, ctypes.c_double], ctypes.c_double),
+    "omni_ffi_call2_f64": (omni_ffi_call2_f64, [ctypes.c_int64, ctypes.c_double, ctypes.c_double], ctypes.c_double),
 }

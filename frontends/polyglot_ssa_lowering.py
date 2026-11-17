@@ -83,7 +83,7 @@ _MULTI_CHAR_OPS = (
 _SINGLE_OPS = set("+-*/%&|^~!<>?=:.")
 _PUNCT = set("(){}[],;")
 _FLOAT_ANN_RE = re.compile(
-    r"(?::\s*(?:f64|float64|double|Float64Array)\b|->\s*(?:f64|float64|double)\b|\b(?:f64|float64|Float64Array)\b)"
+    r"(?::\s*(?:f32|f64|float32|float64|double|Float64Array)\b|->\s*(?:f32|f64|float32|float64|double)\b|\b(?:f32|f64|float32|float64|Float64Array)\b)"
 )
 
 
@@ -272,6 +272,7 @@ class _PolyglotParser:
         self.allow_floats = allow_floats
         self.toks = _tokenize(source, allow_floats=allow_floats)
         self.pos = 0
+        self.declared_structs: Dict[str, ast.ClassDef] = {}
 
     def _peek(self, offset: int = 0) -> _Tok:
         idx = self.pos + offset
@@ -334,6 +335,7 @@ class _PolyglotParser:
     # ------------------------------------------------------------------
     def parse_module(self) -> Tuple[ast.Module, List[ast.FunctionDef], List[str]]:
         funcs: List[ast.FunctionDef] = []
+        structs: List[ast.ClassDef] = []
         errors: List[str] = []
 
         while not self._at("EOF"):
@@ -353,6 +355,12 @@ class _PolyglotParser:
                         self._skip_balanced("(", ")")
                 continue
 
+            st_cls = self._try_parse_top_level_struct()
+            if st_cls is not None:
+                self.declared_structs[st_cls.name] = st_cls
+                structs.append(st_cls)
+                continue
+
             fn_start = self.pos
             try:
                 fn = self._try_parse_top_level_function()
@@ -369,9 +377,152 @@ class _PolyglotParser:
             # Skip non-function top-level declarations (package, import, type, struct, interface, etc.)
             self._skip_top_level_non_function()
 
-        mod = ast.Module(body=list(funcs), type_ignores=[])
+        mod = ast.Module(body=list(structs) + list(funcs), type_ignores=[])
         ast.fix_missing_locations(mod)
         return mod, funcs, errors
+
+    def _try_parse_top_level_struct(self) -> Optional[ast.ClassDef]:
+        save = self.pos
+        t = self._peek()
+        if t.kind != "ID":
+            return None
+        if self.language == "rust":
+            if t.val == "pub":
+                self._advance()
+            if not self._at("ID", "struct"):
+                self.pos = save
+                return None
+            self._advance()
+            if not self._at("ID"):
+                self.pos = save
+                return None
+            sname = self._advance()
+            if not self._at("PUNCT", "{"):
+                self.pos = save
+                return None
+            self._advance()
+            body: List[ast.stmt] = []
+            while not self._at("PUNCT", "}") and not self._at("EOF"):
+                if self._at("ID", "pub"):
+                    self._advance()
+                if not self._at("ID"):
+                    self.pos = save
+                    return None
+                fname = self._advance()
+                self._expect("OP", ":")
+                ftype_toks: List[str] = []
+                while not self._at("PUNCT", ",") and not self._at("PUNCT", "}") and not self._at("EOF"):
+                    ftype_toks.append(self._advance().val)
+                ft_id = ftype_toks[-1] if ftype_toks else "i64"
+                body.append(
+                    ast.AnnAssign(
+                        target=ast.Name(id=fname.val, ctx=ast.Store(), lineno=fname.line),
+                        annotation=ast.Name(id=ft_id, ctx=ast.Load(), lineno=fname.line),
+                        value=None,
+                        simple=1,
+                        lineno=fname.line,
+                    )
+                )
+                if self._at("PUNCT", ","):
+                    self._advance()
+            self._expect("PUNCT", "}")
+            return ast.ClassDef(
+                name=sname.val, bases=[], keywords=[], body=body or [ast.Pass(lineno=sname.line)], decorator_list=[], lineno=sname.line
+            )
+        if self.language == "go":
+            if t.val != "type":
+                return None
+            self._advance()
+            if not self._at("ID"):
+                self.pos = save
+                return None
+            sname = self._advance()
+            if not self._at("ID", "struct"):
+                self.pos = save
+                return None
+            self._advance()
+            if not self._at("PUNCT", "{"):
+                self.pos = save
+                return None
+            self._advance()
+            body_g: List[ast.stmt] = []
+            while not self._at("PUNCT", "}") and not self._at("EOF"):
+                if self._at("PUNCT", ";"):
+                    self._advance()
+                    continue
+                if not self._at("ID"):
+                    self.pos = save
+                    return None
+                fname = self._advance()
+                if not self._at("ID"):
+                    self.pos = save
+                    return None
+                ftype = self._advance().val
+                body_g.append(
+                    ast.AnnAssign(
+                        target=ast.Name(id=fname.val, ctx=ast.Store(), lineno=fname.line),
+                        annotation=ast.Name(id=ftype, ctx=ast.Load(), lineno=fname.line),
+                        value=None,
+                        simple=1,
+                        lineno=fname.line,
+                    )
+                )
+                if self._at("PUNCT", ";"):
+                    self._advance()
+            self._expect("PUNCT", "}")
+            return ast.ClassDef(
+                name=sname.val, bases=[], keywords=[], body=body_g or [ast.Pass(lineno=sname.line)], decorator_list=[], lineno=sname.line
+            )
+        if self.language == "typescript":
+            if t.val == "export":
+                self._advance()
+            if not self._at("ID", "interface"):
+                self.pos = save
+                return None
+            self._advance()
+            if not self._at("ID"):
+                self.pos = save
+                return None
+            sname = self._advance()
+            if not self._at("PUNCT", "{"):
+                self.pos = save
+                return None
+            self._advance()
+            body_t: List[ast.stmt] = []
+            while not self._at("PUNCT", "}") and not self._at("EOF"):
+                if self._at("PUNCT", ";") or self._at("PUNCT", ","):
+                    self._advance()
+                    continue
+                if not self._at("ID"):
+                    self.pos = save
+                    return None
+                fname = self._advance()
+                self._expect("OP", ":")
+                ftype_toks_t: List[str] = []
+                while (
+                    not self._at("PUNCT", ";")
+                    and not self._at("PUNCT", ",")
+                    and not self._at("PUNCT", "}")
+                    and not self._at("EOF")
+                ):
+                    ftype_toks_t.append(self._advance().val)
+                ft_id_t = ftype_toks_t[-1] if ftype_toks_t else "i64"
+                body_t.append(
+                    ast.AnnAssign(
+                        target=ast.Name(id=fname.val, ctx=ast.Store(), lineno=fname.line),
+                        annotation=ast.Name(id=ft_id_t, ctx=ast.Load(), lineno=fname.line),
+                        value=None,
+                        simple=1,
+                        lineno=fname.line,
+                    )
+                )
+                if self._at("PUNCT", ";") or self._at("PUNCT", ","):
+                    self._advance()
+            self._expect("PUNCT", "}")
+            return ast.ClassDef(
+                name=sname.val, bases=[], keywords=[], body=body_t or [ast.Pass(lineno=sname.line)], decorator_list=[], lineno=sname.line
+            )
+        return None
 
     def _recover_top_level_item(self) -> None:
         while not self._at("EOF"):
@@ -713,6 +864,9 @@ class _PolyglotParser:
             )
         ):
             return "ptr_f64"
+        for tok in reversed(captured):
+            if tok in self.declared_structs:
+                return tok
         return None
 
     def _skip_go_type(self, stop_tokens: set) -> Optional[str]:
@@ -739,6 +893,9 @@ class _PolyglotParser:
             "[" in captured or "*" in captured
         ):
             return "ptr_f64"
+        for tok in reversed(captured):
+            if tok in self.declared_structs:
+                return tok
         return None
 
     def _make_function_def(
@@ -759,7 +916,7 @@ class _PolyglotParser:
                 arg=p,
                 annotation=(
                     ast.Name(id=pt_map[p], ctx=ast.Load(), lineno=line)
-                    if pt_map.get(p) in ("float", "ptr_f64")
+                    if (pt_map.get(p) in ("float", "ptr_f64") or pt_map.get(p) in self.declared_structs)
                     else None
                 ),
             )
@@ -973,9 +1130,44 @@ class _PolyglotParser:
                     )
             self.pos = save
 
-        # Lookahead for assignment / := / ++ / -- / += ...
+        # Lookahead for assignment / := / ++ / -- / += / ident.field = ...
         if t.kind == "ID":
             nxt = self._peek(1)
+            aug_map = {
+                "+=": ast.Add(),
+                "-=": ast.Sub(),
+                "*=": ast.Mult(),
+                "/=": ast.FloorDiv(),
+                "%=": ast.Mod(),
+                "&=": ast.BitAnd(),
+                "|=": ast.BitOr(),
+                "^=": ast.BitXor(),
+                "<<=": ast.LShift(),
+                ">>=": ast.RShift(),
+            }
+            if (
+                nxt.kind == "OP"
+                and nxt.val == "."
+                and self._peek(2).kind == "ID"
+                and self._peek(3).kind == "OP"
+                and (self._peek(3).val in ("=", ":=") or self._peek(3).val in aug_map)
+            ):
+                ident = self._advance()
+                self._advance()
+                attr_tok = self._advance()
+                op_tok = self._advance()
+                val = self._parse_expr()
+                semi = self._consume_optional_semi() if consume_semi else False
+                target_attr = ast.Attribute(
+                    value=ast.Name(id=ident.val, ctx=ast.Load(), lineno=line),
+                    attr=attr_tok.val,
+                    ctx=ast.Store(),
+                    lineno=line,
+                )
+                if op_tok.val in ("=", ":="):
+                    return ast.Assign(targets=[target_attr], value=val, lineno=line), semi
+                return ast.AugAssign(target=target_attr, op=aug_map[op_tok.val], value=val, lineno=line), semi
+
             if nxt.kind == "OP" and nxt.val in (":=", "="):
                 ident = self._advance()
                 self._advance()
@@ -990,18 +1182,6 @@ class _PolyglotParser:
                     semi,
                 )
 
-            aug_map = {
-                "+=": ast.Add(),
-                "-=": ast.Sub(),
-                "*=": ast.Mult(),
-                "/=": ast.FloorDiv(),
-                "%=": ast.Mod(),
-                "&=": ast.BitAnd(),
-                "|=": ast.BitOr(),
-                "^=": ast.BitXor(),
-                "<<=": ast.LShift(),
-                ">>=": ast.RShift(),
-            }
             if nxt.kind == "OP" and nxt.val in aug_map:
                 ident = self._advance()
                 op_tok = self._advance()

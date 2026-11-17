@@ -39,11 +39,16 @@ from compiler.audit_ledger import create_compilation_audit_ledger, save_audit_le
 
 NATIVE_BUILTIN_CALLS = frozenset({
     "abs", "min", "max", "int", "float", "range", "len",
+    "load_i32", "store_i32", "load_f32", "store_f32",
+    "load_i64", "store_i64", "load_f64", "store_f64",
     "omni_alloc", "omni_list_new", "omni_list_len", "omni_list_get", "omni_list_set", "omni_list_append",
     "omni_dict_new", "omni_dict_set", "omni_dict_get", "omni_dict_len",
     "omni_item_get", "omni_item_set", "omni_item_len",
     "omni_list_vec_add", "omni_list_vec_dot", "omni_list_sum",
     "omni_list_vec_add_f64", "omni_list_vec_dot_f64", "omni_list_sum_f64",
+    "omni_ffi_load_lib", "omni_ffi_get_symbol",
+    "omni_ffi_call0", "omni_ffi_call1", "omni_ffi_call2", "omni_ffi_call3", "omni_ffi_call4", "omni_ffi_call",
+    "omni_ffi_call0_f64", "omni_ffi_call1_f64", "omni_ffi_call2_f64",
 })
 
 
@@ -248,6 +253,16 @@ class OmniRepoCompiler:
         repo_modules_map: Dict[str, List[Tuple[str, ast.Module]]] = {}
         repo_funcs_map: Dict[str, Dict[str, Tuple[str, ast.FunctionDef]]] = {}
         all_ast_funcs: Dict[str, ast.FunctionDef] = {}
+        global_struct_layouts: Dict[str, Dict[str, Tuple[int, str]]] = {}
+
+        from compiler.ssa_ir import AstToSsaLowering
+        struct_extractor = AstToSsaLowering()
+        for m, (mods, f_map, alias_map) in zip(manifests, scanned):
+            for _fpath, mod_ast in mods:
+                for node in getattr(mod_ast, "body", []):
+                    if isinstance(node, ast.ClassDef):
+                        struct_extractor.register_struct_from_classdef(node)
+        global_struct_layouts.update(struct_extractor.struct_layouts)
 
         for m, (mods, f_map, alias_map) in zip(manifests, scanned):
             # Resolve top-level function aliases (e.g., `colossus_entrypoint = omnicompiler_entrypoint`)
@@ -430,7 +445,7 @@ class OmniRepoCompiler:
             for r_name, r_funcs in repo_funcs_map.items():
                 for f_name, (f_src, f_ast) in r_funcs.items():
                     try:
-                        s_fn = lower_ast_to_ssa(f_ast, optimize=True)
+                        s_fn = lower_ast_to_ssa(f_ast, optimize=True, struct_layouts=global_struct_layouts)
                         summary = thin_lto_opt.build_function_summary(f_name, r_name, f_ast, s_fn)
                         thin_lto_opt.index.add_function(summary)
                     except Exception:
@@ -483,7 +498,7 @@ class OmniRepoCompiler:
                         except Exception:
                             active_fn_def = orig_fn_def
 
-                    ssa_fn = lower_ast_to_ssa(active_fn_def, optimize=True)
+                    ssa_fn = lower_ast_to_ssa(active_fn_def, optimize=True, struct_layouts=global_struct_layouts)
                     ssa_fn.source_file = src_file
 
                     # 1. Whole-Program ThinLTO (Cross-Repo Inlining & Constant Folding)
@@ -943,6 +958,19 @@ class OmniRepoCompiler:
         # Stage 5.5a: Pre-Link Assembly Invariant Audit (Halts pipeline BEFORE linking on corrupt machine code!)
         asm_all_valid = True
         if effective_arch == "x86_64":
+            _x86_align_nops = (
+                b"\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00",
+                b"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00",
+                b"\x0f\x1f\x84\x00\x00\x00\x00\x00",
+                b"\x0f\x1f\x80\x00\x00\x00\x00",
+                b"\x66\x0f\x1f\x44\x00\x00",
+                b"\x0f\x1f\x44\x00\x00",
+                b"\x0f\x1f\x40\x00",
+                b"\x0f\x1f\x00",
+                b"\x66\x90",
+                b"\x90",
+                b"\xcc",
+            )
             for mod in self.linker.modules:
                 text_syms = [sd for sd in mod.symbols.values() if getattr(sd, "section", ".text") == ".text"]
                 sorted_syms = sorted(text_syms, key=lambda sd: sd.offset)
@@ -951,9 +979,14 @@ class OmniRepoCompiler:
                     end_off = min(sym_def.offset + sym_def.size, next_off)
                     fn_slice = bytes(mod.text_bytes[sym_def.offset:end_off])
                     if resolved_backend == "llvm":
-                        trimmed = fn_slice.rstrip(b"\xcc\x90")
-                        if trimmed:
-                            fn_slice = trimmed
+                        changed = True
+                        while changed and fn_slice:
+                            changed = False
+                            for nop_pat in _x86_align_nops:
+                                if fn_slice.endswith(nop_pat) and len(fn_slice) > len(nop_pat):
+                                    fn_slice = fn_slice[:-len(nop_pat)]
+                                    changed = True
+                                    break
                     asm_rep = self.asm_auditor.audit_function_code(fn_slice, sym_def.name)
                     if not asm_rep.is_valid:
                         asm_all_valid = False

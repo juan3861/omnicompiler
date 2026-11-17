@@ -341,6 +341,50 @@ class LLVMBackend:
                     lines.append(f"    {gep_v} = getelementptr {elem_ty}, ptr {ptr_v}, i64 {idx_op}")
                     lines.append(f"    store {elem_ty} {val_op}, ptr {gep_v}, align 8")
 
+                elif opcode == "load_off":
+                    base_op = ops[0] if len(ops) > 0 else "0"
+                    off_op = ops[1] if len(ops) > 1 else "0"
+                    width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
+                    ptr_v = next_aux("ptr")
+                    gep_v = next_aux("gepb")
+                    lines.append(f"    {ptr_v} = inttoptr i64 {base_op} to ptr")
+                    lines.append(f"    {gep_v} = getelementptr i8, ptr {ptr_v}, i64 {off_op}")
+                    if width == "i32":
+                        w32 = next_aux("ld32")
+                        lines.append(f"    {w32} = load i32, ptr {gep_v}, align 1")
+                        lines.append(f"    {lhs} = sext i32 {w32} to i64")
+                    elif width == "f32":
+                        f32 = next_aux("ldf32")
+                        lines.append(f"    {f32} = load float, ptr {gep_v}, align 1")
+                        lines.append(f"    {lhs} = fpext float {f32} to double")
+                    elif width == "f64":
+                        lines.append(f"    {lhs} = load double, ptr {gep_v}, align 1")
+                    else:
+                        lines.append(f"    {lhs} = load i64, ptr {gep_v}, align 1")
+                    last_val = lhs
+
+                elif opcode == "store_off":
+                    base_op = ops[0] if len(ops) > 0 else "0"
+                    off_op = ops[1] if len(ops) > 1 else "0"
+                    val_op = ops[2] if len(ops) > 2 else "0"
+                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    ptr_v = next_aux("ptr")
+                    gep_v = next_aux("gepb")
+                    lines.append(f"    {ptr_v} = inttoptr i64 {base_op} to ptr")
+                    lines.append(f"    {gep_v} = getelementptr i8, ptr {ptr_v}, i64 {off_op}")
+                    if width == "i32":
+                        t32 = next_aux("tr32")
+                        lines.append(f"    {t32} = trunc i64 {val_op} to i32")
+                        lines.append(f"    store i32 {t32}, ptr {gep_v}, align 1")
+                    elif width == "f32":
+                        tf32 = next_aux("trf32")
+                        lines.append(f"    {tf32} = fptrunc double {val_op} to float")
+                        lines.append(f"    store float {tf32}, ptr {gep_v}, align 1")
+                    elif width == "f64":
+                        lines.append(f"    store double {val_op}, ptr {gep_v}, align 1")
+                    else:
+                        lines.append(f"    store i64 {val_op}, ptr {gep_v}, align 1")
+
                 elif opcode == "call":
                     callee = str(inst.operands[0])
                     arg_pairs = []

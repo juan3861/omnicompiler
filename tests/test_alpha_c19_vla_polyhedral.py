@@ -14,10 +14,11 @@ Validates:
    - Verification of `polyhedral_tiled_loops` and `unrolled_loops` metrics during AOT compilation.
 """
 
-import unittest
 import ast
 import os
 import shutil
+import tempfile
+import unittest
 
 from compiler.vla_simd_engine import VLASimdEngine
 from compiler.polyhedral_tiler import (
@@ -210,12 +211,8 @@ def loop_kernel(n: int) -> int:
         Validates end-to-end AOT compilation of a repository module with loops,
         verifying that `polyhedral_tiled_loops` and `unrolled_loops` are reported.
         """
-        repo_dir = r"F:\repository-compiler\test_repo_c19_workspace"
-        if os.path.exists(repo_dir):
-            shutil.rmtree(repo_dir, ignore_errors=True)
-        os.makedirs(repo_dir, exist_ok=True)
-
-        module_code = """
+        with tempfile.TemporaryDirectory() as repo_dir:
+            module_code = """
 def compute_vector_product(limit: int) -> int:
     total = 0
     i = 0
@@ -224,8 +221,8 @@ def compute_vector_product(limit: int) -> int:
         i = i + 1
     return total
 """
-        with open(os.path.join(repo_dir, "pyproject.toml"), "w", encoding="utf-8") as f:
-            f.write("""
+            with open(os.path.join(repo_dir, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write("""
 [project]
 name = "repo_c19"
 version = "0.1.0"
@@ -233,10 +230,9 @@ version = "0.1.0"
 compute_vector_product = { file = "vector_math.py", symbol = "compute_vector_product" }
 """)
 
-        with open(os.path.join(repo_dir, "vector_math.py"), "w", encoding="utf-8") as f:
-            f.write(module_code)
+            with open(os.path.join(repo_dir, "vector_math.py"), "w", encoding="utf-8") as f:
+                f.write(module_code)
 
-        try:
             compiler = OmniRepoCompiler()
             res = compiler.compile_repositories(
                 repo_paths=[repo_dir],
@@ -252,8 +248,6 @@ compute_vector_product = { file = "vector_math.py", symbol = "compute_vector_pro
             self.assertIn("unrolled_loops", codegen_stage)
             self.assertGreaterEqual(codegen_stage["polyhedral_tiled_loops"], 1)
             self.assertGreaterEqual(codegen_stage["unrolled_loops"], 1)
-        finally:
-            shutil.rmtree(repo_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

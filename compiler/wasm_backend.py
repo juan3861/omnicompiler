@@ -390,6 +390,43 @@ class WasmBackend:
                     wat_lines.append(f"{indent}i32.wrap_i64")
                     wat_lines.append(f"{indent}{emit_operand(val_op)}")
                     wat_lines.append(f"{indent}{st_op}")
+                elif opcode == "load_off":
+                    base_op = inst.operands[0] if len(inst.operands) > 0 else 0
+                    off_op = inst.operands[1] if len(inst.operands) > 1 else 0
+                    width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
+                    wat_lines.append(f"{indent}{emit_operand(base_op)}")
+                    wat_lines.append(f"{indent}{emit_operand(off_op)}")
+                    wat_lines.append(f"{indent}i64.add")
+                    wat_lines.append(f"{indent}i32.wrap_i64")
+                    if width == "i32":
+                        wat_lines.append(f"{indent}i64.load32_s")
+                    elif width == "f32":
+                        wat_lines.append(f"{indent}f32.load")
+                        wat_lines.append(f"{indent}f64.promote_f32")
+                    elif width == "f64":
+                        wat_lines.append(f"{indent}f64.load")
+                    else:
+                        wat_lines.append(f"{indent}i64.load")
+                    set_result(inst.result, indent)
+                elif opcode == "store_off":
+                    base_op = inst.operands[0] if len(inst.operands) > 0 else 0
+                    off_op = inst.operands[1] if len(inst.operands) > 1 else 0
+                    val_op = inst.operands[2] if len(inst.operands) > 2 else 0
+                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    wat_lines.append(f"{indent}{emit_operand(base_op)}")
+                    wat_lines.append(f"{indent}{emit_operand(off_op)}")
+                    wat_lines.append(f"{indent}i64.add")
+                    wat_lines.append(f"{indent}i32.wrap_i64")
+                    wat_lines.append(f"{indent}{emit_operand(val_op)}")
+                    if width == "i32":
+                        wat_lines.append(f"{indent}i64.store32")
+                    elif width == "f32":
+                        wat_lines.append(f"{indent}f32.demote_f64")
+                        wat_lines.append(f"{indent}f32.store")
+                    elif width == "f64":
+                        wat_lines.append(f"{indent}f64.store")
+                    else:
+                        wat_lines.append(f"{indent}i64.store")
                 elif opcode == "call":
                     callee = str(inst.operands[0])
                     for a in inst.operands[1:]:
