@@ -1,0 +1,1844 @@
+{
+  "total_collected": 100,
+  "collected_at_utc": "2026-11-17T19:06:30Z",
+  "repos": [
+    {
+      "full_name": "vercel/next.js",
+      "stars": 143693,
+      "language": "JavaScript",
+      "topics": [
+        "blog",
+        "browser",
+        "compiler",
+        "components",
+        "hybrid",
+        "nextjs",
+        "node",
+        "react",
+        "server-rendering",
+        "ssg",
+        "static",
+        "static-site-generator",
+        "universal",
+        "vercel"
+      ],
+      "description": "The React Framework"
+    },
+    {
+      "full_name": "rust-lang/rust",
+      "stars": 122322,
+      "language": "Rust",
+      "topics": [
+        "compiler",
+        "language",
+        "rust"
+      ],
+      "description": "Empowering everyone to build reliable and efficient software."
+    },
+    {
+      "full_name": "ruvnet/RuView",
+      "stars": 104522,
+      "language": "Rust",
+      "topics": [
+        "claude",
+        "claude-code",
+        "esp32",
+        "firmware",
+        "home-assistant",
+        "home-automation",
+        "iot",
+        "mcp",
+        "monitoring",
+        "networking",
+        "pose-estimation",
+        "react",
+        "rf",
+        "self-learning",
+        "spatial-intelligence",
+        "typescript",
+        "webassembly",
+        "wifi",
+        "wifi-security"
+      ],
+      "description": "\u03c0 RuView turns commodity WiFi signals into real-time spatial intelligence, vital sign monitoring, and presence detection \u2014 all without a single pixel of video."
+    },
+    {
+      "full_name": "sveltejs/svelte",
+      "stars": 89527,
+      "language": "JavaScript",
+      "topics": [
+        "compiler",
+        "template",
+        "ui"
+      ],
+      "description": "web development for the rest of us"
+    },
+    {
+      "full_name": "webpack/webpack",
+      "stars": 66008,
+      "language": "JavaScript",
+      "topics": [
+        "amd",
+        "build-tool",
+        "commonjs",
+        "compiler",
+        "es2015",
+        "es6",
+        "esm",
+        "javascript",
+        "javascript-compiler",
+        "javascript-modules",
+        "loaders",
+        "module-bundler",
+        "plugins",
+        "web",
+        "web-performance",
+        "webpack"
+      ],
+      "description": "A bundler for javascript and friends. Packs many modules into a few bundled assets. Code Splitting allows for loading parts of the application on demand. Through \"loaders\", modules can be CommonJs, AM"
+    },
+    {
+      "full_name": "FuelLabs/sway",
+      "stars": 61328,
+      "language": "Rust",
+      "topics": [
+        "compiler",
+        "fuel",
+        "language",
+        "sway"
+      ],
+      "description": "\ud83c\udf34 Empowering everyone to build reliable and efficient smart contracts."
+    },
+    {
+      "full_name": "typst/typst",
+      "stars": 57250,
+      "language": "Rust",
+      "topics": [
+        "compiler",
+        "markup",
+        "typesetting",
+        "typst"
+      ],
+      "description": "A markup-based typesetting system that is powerful and easy to learn."
+    },
+    {
+      "full_name": "gatsbyjs/gatsby",
+      "stars": 55914,
+      "language": "JavaScript",
+      "topics": [
+        "blog",
+        "compiler",
+        "gatsby",
+        "graphql",
+        "react",
+        "static-site-generator",
+        "web-app"
+      ],
+      "description": "React-based framework with performance, scalability, and security built in."
+    },
+    {
+      "full_name": "JetBrains/kotlin",
+      "stars": 53590,
+      "language": "Kotlin",
+      "topics": [
+        "compiler",
+        "gradle-plugin",
+        "intellij-plugin",
+        "kotlin",
+        "kotlin-library",
+        "maven-plugin",
+        "programming-language",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "The Kotlin Programming Language. "
+    },
+    {
+      "full_name": "gkd-kit/gkd",
+      "stars": 44939,
+      "language": "Kotlin",
+      "topics": [
+        "accessibility",
+        "android",
+        "auto",
+        "click",
+        "compose",
+        "compose-multiplatform",
+        "jetpack-compose",
+        "kotlin",
+        "kotlin-js",
+        "kotlin-multiplatform",
+        "webassembly"
+      ],
+      "description": "\u57fa\u4e8e\u65e0\u969c\u788d\uff0c\u9ad8\u7ea7\u9009\u62e9\u5668\uff0c\u8ba2\u9605\u89c4\u5219\u7684\u81ea\u5b9a\u4e49\u5c4f\u5e55\u70b9\u51fb\u5b89\u5353\u5e94\u7528 | An Android APP with custom screen tapping based on Accessibility, Advanced Selectors, and Subscription Rules"
+    },
+    {
+      "full_name": "babel/babel",
+      "stars": 44065,
+      "language": "TypeScript",
+      "topics": [
+        "ast",
+        "babel",
+        "compiler",
+        "es2015",
+        "es6",
+        "flavortown",
+        "javascript"
+      ],
+      "description": "\ud83d\udc20 Babel is a compiler for writing next generation JavaScript."
+    },
+    {
+      "full_name": "parcel-bundler/parcel",
+      "stars": 44025,
+      "language": "Rust",
+      "topics": [
+        "assets",
+        "build-tool",
+        "commonjs",
+        "compiler",
+        "css",
+        "es6",
+        "html",
+        "javascript",
+        "module-bundler",
+        "modules",
+        "web"
+      ],
+      "description": "The zero configuration build tool for the web. \ud83d\udce6\ud83d\ude80"
+    },
+    {
+      "full_name": "ziglang/zig",
+      "stars": 43262,
+      "language": "Zig",
+      "topics": [
+        "compiler",
+        "language",
+        "zig"
+      ],
+      "description": "Moved to Codeberg"
+    },
+    {
+      "full_name": "evanw/esbuild",
+      "stars": 40134,
+      "language": "Go",
+      "topics": [
+        "bundler",
+        "commonjs",
+        "compiler",
+        "css",
+        "esm",
+        "javascript",
+        "jsx",
+        "minifier",
+        "react",
+        "tsx",
+        "typescript"
+      ],
+      "description": "An extremely fast bundler for the web"
+    },
+    {
+      "full_name": "naptha/tesseract.js",
+      "stars": 38839,
+      "language": "JavaScript",
+      "topics": [
+        "deep-learning",
+        "javascript",
+        "ocr",
+        "tesseract",
+        "webassembly"
+      ],
+      "description": "Pure Javascript OCR for more than 100 Languages \ud83d\udcd6\ud83c\udf89\ud83d\udda5"
+    },
+    {
+      "full_name": "vlang/v",
+      "stars": 38122,
+      "language": "V",
+      "topics": [
+        "compiler",
+        "language",
+        "programming-language",
+        "v"
+      ],
+      "description": "Simple, fast, safe, compiled language for developing maintainable software. Compiles itself in <1s with zero library dependencies. Supports automatic C => V translation. https://vlang.io"
+    },
+    {
+      "full_name": "markedjs/marked",
+      "stars": 37309,
+      "language": "TypeScript",
+      "topics": [
+        "commonmark",
+        "compiler",
+        "gfm",
+        "hacktoberfest",
+        "markdown",
+        "parser"
+      ],
+      "description": "A markdown parser and compiler. Built for speed."
+    },
+    {
+      "full_name": "raysan5/raylib",
+      "stars": 35714,
+      "language": "C",
+      "topics": [
+        "android",
+        "c",
+        "embedded",
+        "esp32",
+        "game-development",
+        "game-engine",
+        "gamedev",
+        "graphics",
+        "iot",
+        "linux",
+        "macos",
+        "opengl",
+        "programming",
+        "raspberry-pi",
+        "raylib",
+        "riscv",
+        "wasm",
+        "webassembly",
+        "win32"
+      ],
+      "description": "A simple and easy-to-use library to enjoy videogames programming"
+    },
+    {
+      "full_name": "swc-project/swc",
+      "stars": 34220,
+      "language": "Rust",
+      "topics": [
+        "babel",
+        "compiler",
+        "ecmascript",
+        "ecmascript-parser",
+        "javascript",
+        "parser",
+        "rust",
+        "swc",
+        "typescript",
+        "typescript-compiler",
+        "typescript-parser"
+      ],
+      "description": "Rust-based platform for the Web"
+    },
+    {
+      "full_name": "carbon-language/carbon-lang",
+      "stars": 33962,
+      "language": "C++",
+      "topics": [
+        "carbon-lang",
+        "compiler",
+        "cpp",
+        "experimental",
+        "experimental-language",
+        "language",
+        "programming-language"
+      ],
+      "description": "Carbon Language's main repository: documents, design, implementation, and related tools. (NOTE: Carbon Language is experimental; see README)"
+    },
+    {
+      "full_name": "hypit-ai/hypit",
+      "stars": 30413,
+      "language": "TypeScript",
+      "topics": [
+        "agentic-ai",
+        "ai",
+        "ai-agents",
+        "ai-video",
+        "compiler",
+        "dsl",
+        "ffmpeg",
+        "generative-ai",
+        "llm",
+        "markup-language",
+        "monorepo",
+        "plugin-system",
+        "programming-language",
+        "text-to-video",
+        "typescript",
+        "video",
+        "video-automation",
+        "video-clone",
+        "video-editing",
+        "video-generation"
+      ],
+      "description": "Clone any viral video with AI agents. Not just a script, the whole workflow: swap the face, the words, the B-roll, ship 100 variants in one command, and get your 100M views."
+    },
+    {
+      "full_name": "emscripten-core/emscripten",
+      "stars": 27781,
+      "language": "C++",
+      "topics": [
+        "emscripten",
+        "hacktoberfest",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "Emscripten: An LLVM-to-WebAssembly Compiler"
+    },
+    {
+      "full_name": "v8/v8",
+      "stars": 25334,
+      "language": "C++",
+      "topics": [
+        "compiler",
+        "interpreter",
+        "javascript",
+        "javascript-engine",
+        "virtual-machine"
+      ],
+      "description": "The official mirror of the V8 Git repository"
+    },
+    {
+      "full_name": "tursodatabase/turso",
+      "stars": 25282,
+      "language": "Rust",
+      "topics": [
+        "database",
+        "embedded-database",
+        "sql",
+        "sqlite3",
+        "webassembly"
+      ],
+      "description": "A SQL database in Rust: SQLite-compatible, now also speaking Postgres (experimental). The LLVM of databases."
+    },
+    {
+      "full_name": "slint-ui/slint",
+      "stars": 24625,
+      "language": "Rust",
+      "topics": [
+        "cpp",
+        "declarative-ui",
+        "desktop",
+        "embedded-devices",
+        "gui",
+        "javascript",
+        "language",
+        "lsp-server",
+        "native",
+        "rust",
+        "rust-lang",
+        "toolkit",
+        "ui",
+        "user-interface",
+        "wasm",
+        "webassembly",
+        "widgets"
+      ],
+      "description": "Slint is an open-source declarative GUI toolkit to build native user interfaces for Rust, C++, JavaScript, or Python apps."
+    },
+    {
+      "full_name": "vercel/pkg",
+      "stars": 24295,
+      "language": "JavaScript",
+      "topics": [
+        "binaries",
+        "cli",
+        "compiler",
+        "nodejs"
+      ],
+      "description": "Package your Node.js project into an executable"
+    },
+    {
+      "full_name": "ruby/ruby",
+      "stars": 23823,
+      "language": "Ruby",
+      "topics": [
+        "c",
+        "jit",
+        "language",
+        "object-oriented",
+        "programming-language",
+        "ruby",
+        "ruby-language",
+        "rust"
+      ],
+      "description": "The Ruby Programming Language"
+    },
+    {
+      "full_name": "oxc-project/oxc",
+      "stars": 23484,
+      "language": "Rust",
+      "topics": [
+        "compiler",
+        "javascript",
+        "linter",
+        "minifier",
+        "parser",
+        "transpiler",
+        "typescript"
+      ],
+      "description": "\u2693 A collection of high-performance JavaScript tools."
+    },
+    {
+      "full_name": "RustPython/RustPython",
+      "stars": 22490,
+      "language": "Rust",
+      "topics": [
+        "compiler",
+        "hacktoberfest",
+        "interpreter",
+        "jit",
+        "language",
+        "python-language",
+        "python3",
+        "rust",
+        "wasm"
+      ],
+      "description": "A Python Interpreter written in Rust"
+    },
+    {
+      "full_name": "gleam-lang/gleam",
+      "stars": 22071,
+      "language": "Rust",
+      "topics": [
+        "compiler",
+        "erlang",
+        "gleam",
+        "programming-language",
+        "statically-typed"
+      ],
+      "description": "\u2b50\ufe0f A friendly language for building type-safe, scalable systems!"
+    },
+    {
+      "full_name": "oracle/graal",
+      "stars": 21756,
+      "language": "Java",
+      "topics": [
+        "aot",
+        "compiler",
+        "graalvm",
+        "java"
+      ],
+      "description": "GraalVM compiles applications into native executables that start instantly, scale fast, and use fewer compute resources \ud83d\ude80"
+    },
+    {
+      "full_name": "leptos-rs/leptos",
+      "stars": 21541,
+      "language": "Rust",
+      "topics": [
+        "dom",
+        "fine-grained",
+        "isomorphic",
+        "reactive",
+        "rust",
+        "ssr",
+        "web",
+        "webassembly"
+      ],
+      "description": "Build fast web applications with Rust."
+    },
+    {
+      "full_name": "wasmerio/wasmer",
+      "stars": 21252,
+      "language": "Rust",
+      "topics": [
+        "emscripten",
+        "linux",
+        "macos",
+        "rust",
+        "wasi",
+        "wasix",
+        "wasm",
+        "wasmer",
+        "webassembly",
+        "windows"
+      ],
+      "description": "\ud83d\ude80 Fast and lightweight sandboxes for your apps and AI agents"
+    },
+    {
+      "full_name": "crystal-lang/crystal",
+      "stars": 20511,
+      "language": "Crystal",
+      "topics": [
+        "compiler",
+        "crystal",
+        "crystal-language",
+        "hacktoberfest",
+        "programming-language"
+      ],
+      "description": "The Crystal Programming Language"
+    },
+    {
+      "full_name": "RPCS3/rpcs3",
+      "stars": 20454,
+      "language": "C++",
+      "topics": [
+        "assembly-language",
+        "c",
+        "cpp",
+        "emulation",
+        "emulator",
+        "llvm",
+        "multiplatform",
+        "opengl",
+        "ps3",
+        "vulkan"
+      ],
+      "description": "PlayStation 3 emulator and debugger"
+    },
+    {
+      "full_name": "JetBrains/compose-multiplatform",
+      "stars": 19488,
+      "language": "Kotlin",
+      "topics": [
+        "android",
+        "awt",
+        "compose",
+        "declarative-ui",
+        "desktop",
+        "gui",
+        "ios",
+        "javascript",
+        "kotlin",
+        "multiplatform",
+        "reactive",
+        "swing",
+        "ui",
+        "wasm",
+        "web",
+        "webassembly"
+      ],
+      "description": "Compose Multiplatform, a modern UI framework for Kotlin that makes building performant and beautiful user interfaces easy and enjoyable."
+    },
+    {
+      "full_name": "compiler-explorer/compiler-explorer",
+      "stars": 19196,
+      "language": "TypeScript",
+      "topics": [
+        "assembly",
+        "c",
+        "c-plus-plus",
+        "compiler",
+        "cpp",
+        "dlang",
+        "go",
+        "hacktoberfest",
+        "haskell",
+        "haskell-language",
+        "ispc",
+        "python",
+        "rust",
+        "rust-lang",
+        "swift"
+      ],
+      "description": "Run compilers interactively from your web browser and interact with the assembly"
+    },
+    {
+      "full_name": "bytecodealliance/wasmtime",
+      "stars": 18867,
+      "language": "Rust",
+      "topics": [
+        "aot",
+        "cranelift",
+        "jit",
+        "lightweight",
+        "portable",
+        "runtime",
+        "rust",
+        "sandbox",
+        "standalone",
+        "wasi",
+        "wasm",
+        "wasmtime",
+        "webassembly"
+      ],
+      "description": "A lightweight WebAssembly runtime that is fast, secure, and standards-compliant"
+    },
+    {
+      "full_name": "nim-lang/Nim",
+      "stars": 18318,
+      "language": "Nim",
+      "topics": [
+        "compiler",
+        "efficient",
+        "hacktoberfest",
+        "language",
+        "macros",
+        "metaprogramming",
+        "nim",
+        "procedural"
+      ],
+      "description": "Nim is a statically typed compiled systems programming language. It combines successful concepts from mature languages like Python, Ada and Modula. Its design focuses on efficiency, expressiveness, an"
+    },
+    {
+      "full_name": "AssemblyScript/assemblyscript",
+      "stars": 18044,
+      "language": "WebAssembly",
+      "topics": [
+        "assemblyscript",
+        "compiler",
+        "typescript",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "A TypeScript-like language for WebAssembly."
+    },
+    {
+      "full_name": "tinygo-org/tinygo",
+      "stars": 17919,
+      "language": "Go",
+      "topics": [
+        "adafruit",
+        "arduino",
+        "arm",
+        "avr",
+        "esp32",
+        "gpio",
+        "i2c",
+        "llvm",
+        "microbit",
+        "microcontroller",
+        "nrf51",
+        "nrf52",
+        "samd21",
+        "spi",
+        "stm32",
+        "tinygo",
+        "wasi",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "Go compiler for small places. Microcontrollers, WebAssembly (WASM/WASI), and command-line tools. Based on LLVM."
+    },
+    {
+      "full_name": "Automattic/harper",
+      "stars": 17820,
+      "language": "Rust",
+      "topics": [
+        "chrome-extension",
+        "developer-tools",
+        "english-language",
+        "grammar-checker",
+        "nodejs",
+        "react",
+        "rust",
+        "svelte",
+        "webassembly"
+      ],
+      "description": "Offline, privacy-first grammar checker. Fast, open-source, Rust-powered"
+    },
+    {
+      "full_name": "aidenybai/million",
+      "stars": 17663,
+      "language": "TypeScript",
+      "topics": [
+        "best-practices",
+        "blockdom",
+        "compiler",
+        "hacktoberfest",
+        "memo",
+        "million",
+        "millionjs",
+        "optimization",
+        "optimize",
+        "performance",
+        "preact",
+        "react",
+        "react-hooks",
+        "react-optimize",
+        "renderer",
+        "rendering",
+        "virtual-dom"
+      ],
+      "description": "Optimizing compiler for React"
+    },
+    {
+      "full_name": "leaningtech/webvm",
+      "stars": 17471,
+      "language": "Svelte",
+      "topics": [
+        "cheerp",
+        "cheerpx",
+        "cpp",
+        "lwip",
+        "repl",
+        "tailscale",
+        "vm",
+        "wasm",
+        "webassembly",
+        "webvm",
+        "xterm-js"
+      ],
+      "description": "Virtual Machine for the Web"
+    },
+    {
+      "full_name": "tursodatabase/libsql",
+      "stars": 17335,
+      "language": "C",
+      "topics": [
+        "database",
+        "embedded-database",
+        "rust",
+        "sqlite",
+        "webassembly"
+      ],
+      "description": "libSQL is a fork of SQLite that is both Open Source, and Open Contributions."
+    },
+    {
+      "full_name": "pion/webrtc",
+      "stars": 16901,
+      "language": "Go",
+      "topics": [
+        "audio",
+        "go",
+        "golang",
+        "live-video",
+        "ortc",
+        "p2p",
+        "pion",
+        "pion-webrtc",
+        "rtp",
+        "srtp",
+        "streaming",
+        "video",
+        "voip",
+        "wasm",
+        "webassembly",
+        "webcam",
+        "webrtc",
+        "webrtc-api",
+        "webrtc-libraries",
+        "webrtc-server"
+      ],
+      "description": "Pure Go implementation of the WebRTC API"
+    },
+    {
+      "full_name": "exaloop/codon",
+      "stars": 16861,
+      "language": "Python",
+      "topics": [
+        "compiler",
+        "gpu-programming",
+        "high-performance",
+        "llvm",
+        "numpy",
+        "parallel-programming",
+        "python"
+      ],
+      "description": "A high-performance, zero-overhead, extensible Python compiler with built-in NumPy support"
+    },
+    {
+      "full_name": "iamgio/quarkdown",
+      "stars": 16391,
+      "language": "Kotlin",
+      "topics": [
+        "compiler",
+        "documentation",
+        "knowledge-management",
+        "markdown",
+        "markup",
+        "markup-language",
+        "paper",
+        "pdf",
+        "presentations",
+        "scripting-language",
+        "slides",
+        "static-site-generator",
+        "typesetting",
+        "typesetting-system",
+        "wiki"
+      ],
+      "description": "\ud83e\ude90 Markdown with superpowers: from ideas to papers, presentations, websites, books, and knowledge bases."
+    },
+    {
+      "full_name": "Konloch/bytecode-viewer",
+      "stars": 15720,
+      "language": "Java",
+      "topics": [
+        "android",
+        "apk",
+        "baksmali",
+        "bytecode",
+        "bytecode-viewer",
+        "cfr",
+        "compiler",
+        "decompiler",
+        "dex2jar",
+        "fernflower",
+        "hacktoberfest",
+        "java",
+        "java-decompiler",
+        "jsp",
+        "krakatau",
+        "procyon",
+        "recompiler",
+        "smali",
+        "static-analysis",
+        "war"
+      ],
+      "description": "A Java 8+ Jar & Android APK Reverse Engineering Suite (Decompiler, Editor, Debugger & More)"
+    },
+    {
+      "full_name": "Nuitka/Nuitka",
+      "stars": 15241,
+      "language": "Python",
+      "topics": [
+        "compiler",
+        "nuitka",
+        "packaging-tool",
+        "performance",
+        "programming",
+        "python",
+        "python-compiler"
+      ],
+      "description": "Nuitka is a Python compiler written in Python.  It's fully compatible with Python 2.6, 2.7, 3.4-3.14. You feed it your Python app, it does a lot of clever things, and spits out an executable or extens"
+    },
+    {
+      "full_name": "pyodide/pyodide",
+      "stars": 14939,
+      "language": "Python",
+      "topics": [
+        "emscripten",
+        "pyodide",
+        "python",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "Pyodide is a Python distribution for the browser and Node.js based on WebAssembly"
+    },
+    {
+      "full_name": "BuilderIO/mitosis",
+      "stars": 14463,
+      "language": "TypeScript",
+      "topics": [
+        "angular",
+        "builder",
+        "compiler",
+        "declarative",
+        "figma",
+        "jsx",
+        "jsx-lite",
+        "liquid",
+        "no-code",
+        "react",
+        "shopify",
+        "solid",
+        "solidjs",
+        "svelte",
+        "visual",
+        "vue"
+      ],
+      "description": "Write components once, run everywhere. Compiles to React, Vue, Qwik, Solid, Angular, Svelte, and more. "
+    },
+    {
+      "full_name": "apache/tvm",
+      "stars": 13904,
+      "language": "Python",
+      "topics": [
+        "compiler",
+        "deep-learning",
+        "gpu",
+        "javascript",
+        "machine-learning",
+        "metal",
+        "opencl",
+        "performance",
+        "rocm",
+        "spirv",
+        "tensor",
+        "tvm",
+        "vulkan"
+      ],
+      "description": "Open Machine Learning Compiler Framework"
+    },
+    {
+      "full_name": "DoctorWkt/acwj",
+      "stars": 13476,
+      "language": "C",
+      "topics": [
+        "c",
+        "compiler",
+        "lexical-analysis",
+        "parsing"
+      ],
+      "description": "A Compiler Writing Journey"
+    },
+    {
+      "full_name": "gopherjs/gopherjs",
+      "stars": 13199,
+      "language": "Go",
+      "topics": [
+        "compiler",
+        "go",
+        "golang",
+        "hacktoberfest",
+        "javascript"
+      ],
+      "description": "A compiler from Go to JavaScript for running Go code in a browser"
+    },
+    {
+      "full_name": "web-infra-dev/rspack",
+      "stars": 12983,
+      "language": "Rust",
+      "topics": [
+        "build-tool",
+        "bundler",
+        "compiler",
+        "esm",
+        "javascript",
+        "jsx",
+        "loaders",
+        "module-bundler",
+        "rspack",
+        "rstack",
+        "rust",
+        "typescript",
+        "web",
+        "web-performance",
+        "webpack"
+      ],
+      "description": "Fast Rust-based bundler for the web with a modernized webpack API \ud83e\udd80"
+    },
+    {
+      "full_name": "dotnet/coreclr",
+      "stars": 12755,
+      "language": "Unknown",
+      "topics": [
+        "c-sharp",
+        "coreclr",
+        "corefx",
+        "dotnet",
+        "dotnet-core",
+        "dotnetcore",
+        "jit",
+        "runtime"
+      ],
+      "description": "CoreCLR is the runtime for .NET Core. It includes the garbage collector, JIT compiler, primitive data types and low-level classes."
+    },
+    {
+      "full_name": "odin-lang/Odin",
+      "stars": 12357,
+      "language": "Odin",
+      "topics": [
+        "compiler",
+        "language",
+        "odin",
+        "odin-lang",
+        "odin-programming-language",
+        "programming-language",
+        "programming-languages"
+      ],
+      "description": "Odin Programming Language"
+    },
+    {
+      "full_name": "svenstaro/genact",
+      "stars": 12236,
+      "language": "Rust",
+      "topics": [
+        "cli",
+        "fake",
+        "hacktoberfest",
+        "nonsense",
+        "useless",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "\ud83c\udf00 A nonsense activity generator"
+    },
+    {
+      "full_name": "meshery/meshery",
+      "stars": 12229,
+      "language": "Go",
+      "topics": [
+        "cloud-native",
+        "cncf",
+        "control-plane",
+        "gitops",
+        "golang",
+        "gsoc",
+        "hacktoberfest",
+        "infrastructure-as-code",
+        "internal-developer-platform",
+        "kanvas",
+        "kubernetes",
+        "kubernetes-operator",
+        "management-plane",
+        "meshery",
+        "opa",
+        "platform-engineering",
+        "reactjs",
+        "support-official",
+        "visualization",
+        "webassembly"
+      ],
+      "description": "Meshery, the cloud native manager"
+    },
+    {
+      "full_name": "mono/mono",
+      "stars": 11475,
+      "language": "C#",
+      "topics": [
+        "android",
+        "csharp",
+        "dotnet",
+        "garbage-collector",
+        "ios",
+        "jit",
+        "runtime",
+        "xamarin"
+      ],
+      "description": "Mono open source ECMA CLI, C# and .NET implementation."
+    },
+    {
+      "full_name": "perspective-dev/perspective",
+      "stars": 11464,
+      "language": "Rust",
+      "topics": [
+        "analytics",
+        "apache-arrow",
+        "bi",
+        "business-intelligence",
+        "charts",
+        "dashboard",
+        "data-visualization",
+        "datagrid",
+        "duckdb",
+        "javascript",
+        "jupyter",
+        "pivot-table",
+        "python",
+        "react",
+        "real-time",
+        "rust",
+        "streaming",
+        "wasm",
+        "web-components",
+        "webassembly"
+      ],
+      "description": "A data visualization and analytics component, especially well-suited for large and/or streaming datasets."
+    },
+    {
+      "full_name": "numba/numba",
+      "stars": 11215,
+      "language": "Python",
+      "topics": [
+        "compiler",
+        "cuda",
+        "llvm",
+        "numba",
+        "numpy",
+        "parallel",
+        "python"
+      ],
+      "description": "NumPy aware dynamic Python compiler using LLVM"
+    },
+    {
+      "full_name": "munificent/craftinginterpreters",
+      "stars": 11167,
+      "language": "HTML",
+      "topics": [
+        "book",
+        "bytecode",
+        "c",
+        "compiler",
+        "interpreter",
+        "java",
+        "language",
+        "lox",
+        "markdown",
+        "parser",
+        "scripting-language"
+      ],
+      "description": "Repository for the book \"Crafting Interpreters\""
+    },
+    {
+      "full_name": "WasmEdge/WasmEdge",
+      "stars": 10859,
+      "language": "C++",
+      "topics": [
+        "artificial-intelligence",
+        "cloud",
+        "cloud-native",
+        "cncf",
+        "container",
+        "docker",
+        "edge-computing",
+        "ewasm",
+        "hacktoberfest",
+        "hacktoberfest2023",
+        "kubernetes",
+        "rust-lang",
+        "serverless",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "WasmEdge is a lightweight, high-performance, and extensible WebAssembly runtime for cloud native, edge, and decentralized applications. It powers serverless apps, embedded functions, microservices, sm"
+    },
+    {
+      "full_name": "therecipe/qt",
+      "stars": 10801,
+      "language": "Go",
+      "topics": [
+        "android",
+        "asteroidos",
+        "cross-platform-gui",
+        "felgo",
+        "freebsd",
+        "go",
+        "golang",
+        "gui-framework",
+        "ios",
+        "javascript",
+        "linux",
+        "macos",
+        "qt",
+        "raspberry-pi",
+        "sailfish-os",
+        "ubuntu-touch",
+        "webassembly",
+        "windows"
+      ],
+      "description": "Qt binding for Go (Golang) with support for Windows / macOS / Linux / FreeBSD / Android / iOS / Sailfish OS / Raspberry Pi / AsteroidOS / Ubuntu Touch / JavaScript / WebAssembly"
+    },
+    {
+      "full_name": "kanaka/mal",
+      "stars": 10770,
+      "language": "Assembly",
+      "topics": [
+        "bash",
+        "c",
+        "c-plus-plus",
+        "c-sharp",
+        "clojure",
+        "docker",
+        "java",
+        "javascript",
+        "learn-to-code",
+        "lisp",
+        "lisp-interpreter",
+        "makefile",
+        "mal",
+        "php",
+        "python",
+        "r",
+        "ruby",
+        "scala",
+        "swift",
+        "webassembly"
+      ],
+      "description": "mal - Make a Lisp"
+    },
+    {
+      "full_name": "astrid-runtime/astrid",
+      "stars": 10291,
+      "language": "Rust",
+      "topics": [
+        "agent-runtime",
+        "ai-agents",
+        "capability-security",
+        "llm",
+        "mcp",
+        "microkernel",
+        "rust",
+        "sandbox",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "Astrid is a portable, capability-secure operating system for composable software."
+    },
+    {
+      "full_name": "unoplatform/uno",
+      "stars": 10123,
+      "language": "C#",
+      "topics": [
+        "android",
+        "c-sharp",
+        "cross-platform",
+        "csharp",
+        "dotnet",
+        "hacktoberfest",
+        "linux",
+        "macos",
+        "mono",
+        "mvvm",
+        "roslyn",
+        "uno",
+        "uno-platform",
+        "uwp",
+        "wasm",
+        "webassembly",
+        "windows",
+        "winui",
+        "xamarin",
+        "xaml"
+      ],
+      "description": "Open-source platform for building cross-platform native Mobile, Web, Desktop, and Embedded apps from a single C#/XAML codebase. Work from any IDE/CLI with Hot Reload, Visual Designer, MCPs, and Skills"
+    },
+    {
+      "full_name": "mbasso/awesome-wasm",
+      "stars": 9680,
+      "language": "Unknown",
+      "topics": [
+        "awesome",
+        "awesome-list",
+        "awesome-wasm",
+        "awesome-webassembly",
+        "list",
+        "lists",
+        "resources",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "\ud83d\ude0e Curated list of awesome things regarding the WebAssembly (wasm) ecosystem."
+    },
+    {
+      "full_name": "bytedance/sonic",
+      "stars": 9661,
+      "language": "Go",
+      "topics": [
+        "high-performance",
+        "jit",
+        "json",
+        "simd"
+      ],
+      "description": "A blazingly fast JSON serializing & deserializing library"
+    },
+    {
+      "full_name": "AdrienTorris/awesome-blazor",
+      "stars": 9393,
+      "language": "Unknown",
+      "topics": [
+        "asp-net-core",
+        "aspnetcore",
+        "awesome",
+        "awesome-list",
+        "blazor",
+        "blazor-application",
+        "blazor-component",
+        "blazor-crud",
+        "blazor-interop",
+        "blazor-master",
+        "blazor-port",
+        "blazor-sample",
+        "blazor-web",
+        "csharp",
+        "dotnet-core",
+        "microsoft",
+        "microsoft-blazor",
+        "razor",
+        "razor-components",
+        "webassembly"
+      ],
+      "description": "Resources for Blazor, a .NET web framework using C#/Razor and HTML that runs in the browser with WebAssembly."
+    },
+    {
+      "full_name": "capstone-engine/capstone",
+      "stars": 9199,
+      "language": "C",
+      "topics": [
+        "arm",
+        "arm64",
+        "bpf",
+        "disassembler",
+        "ethereum",
+        "framework",
+        "m0s65xx",
+        "m680x",
+        "m68k",
+        "mips",
+        "powerpc",
+        "reverse-engineering",
+        "riscv",
+        "security",
+        "sparc",
+        "systemz",
+        "tms320c64x",
+        "webassembly",
+        "x86",
+        "x86-64"
+      ],
+      "description": "Capstone disassembly/disassembler framework for ARM, ARM64 (ARMv8), Alpha, BPF, Ethereum VM, HPPA, LoongArch, M68K, M680X, Mips, MOS65XX, PPC, RISC-V(rv32G/rv64G), SH, Sparc, SystemZ, TMS320C64X, TriC"
+    },
+    {
+      "full_name": "WebAssembly/binaryen",
+      "stars": 8680,
+      "language": "WebAssembly",
+      "topics": [
+        "c-plus-plus",
+        "compilers",
+        "emscripten",
+        "hacktoberfest",
+        "webassembly"
+      ],
+      "description": "Optimizer and compiler/toolchain library for WebAssembly"
+    },
+    {
+      "full_name": "WebAssembly/wabt",
+      "stars": 8207,
+      "language": "C++",
+      "topics": [
+        "webassembly"
+      ],
+      "description": "The WebAssembly Binary Toolkit"
+    },
+    {
+      "full_name": "wasm3/wasm3",
+      "stars": 8090,
+      "language": "C",
+      "topics": [
+        "containers",
+        "cosmopolitan",
+        "devops",
+        "edge-computing",
+        "embedded",
+        "iot",
+        "sandbox",
+        "scripting",
+        "serverless",
+        "smart-contracts",
+        "virtual-machine",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "\ud83d\ude80 A fast WebAssembly interpreter and the most universal WASM runtime"
+    },
+    {
+      "full_name": "boa-dev/boa",
+      "stars": 7701,
+      "language": "Rust",
+      "topics": [
+        "ecmascript",
+        "hacktoberfest",
+        "interpreter",
+        "javascript",
+        "javascript-engine",
+        "javascript-interpreter",
+        "parser",
+        "runtime",
+        "rust",
+        "rust-crate",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "Boa is an embeddable Javascript engine written in Rust."
+    },
+    {
+      "full_name": "enso-org/enso",
+      "stars": 7442,
+      "language": "Java",
+      "topics": [
+        "compiler",
+        "enso",
+        "functional",
+        "graalvm",
+        "hybrid",
+        "interpreter",
+        "jit",
+        "language",
+        "polyglot",
+        "rts",
+        "textual",
+        "visual"
+      ],
+      "description": "Enso Analytics is a self-service data prep and analysis platform designed for data teams."
+    },
+    {
+      "full_name": "evidence-dev/evidence",
+      "stars": 7122,
+      "language": "TypeScript",
+      "topics": [
+        "analytics",
+        "business-intelligence",
+        "dashboard",
+        "data-engineering",
+        "data-science",
+        "data-visualization",
+        "dbt",
+        "duckdb",
+        "exploratory-data-analysis",
+        "self-hosted",
+        "sql",
+        "svelte",
+        "tailwindcss",
+        "webassembly"
+      ],
+      "description": "Business intelligence as code: build fast, interactive data visualizations in SQL and markdown"
+    },
+    {
+      "full_name": "JetBrains/kotlin-native",
+      "stars": 6968,
+      "language": "Kotlin",
+      "topics": [
+        "c",
+        "compiler",
+        "kotlin",
+        "llvm",
+        "objective-c"
+      ],
+      "description": "Kotlin/Native infrastructure"
+    },
+    {
+      "full_name": "flashinfer-ai/flashinfer",
+      "stars": 6950,
+      "language": "Cuda",
+      "topics": [
+        "attention",
+        "cuda",
+        "distributed-inference",
+        "gpu",
+        "jit",
+        "large-large-models",
+        "llm-inference",
+        "moe",
+        "nvidia",
+        "pytorch"
+      ],
+      "description": "FlashInfer: Kernel Library for LLM Serving"
+    },
+    {
+      "full_name": "spinframework/spin",
+      "stars": 6578,
+      "language": "Rust",
+      "topics": [
+        "serverless",
+        "spin",
+        "webassembly"
+      ],
+      "description": "Spin is the open source developer tool for building and running serverless applications powered by WebAssembly."
+    },
+    {
+      "full_name": "wazero/wazero",
+      "stars": 6469,
+      "language": "Go",
+      "topics": [
+        "ahead-of-time",
+        "compiler",
+        "go",
+        "golang",
+        "runtime",
+        "vm",
+        "wasi",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "wazero: the zero dependency WebAssembly runtime for Go developers"
+    },
+    {
+      "full_name": "wasm-micro-runtime/wasm-micro-runtime",
+      "stars": 6218,
+      "language": "C",
+      "topics": [
+        "aot",
+        "assembly-script",
+        "embedded",
+        "interpreter",
+        "iot",
+        "jit",
+        "pthread",
+        "runtime",
+        "sgx",
+        "wasi-nn",
+        "wasi-threads",
+        "wasm",
+        "wasm-socket",
+        "webassembly"
+      ],
+      "description": "WebAssembly Micro Runtime (WAMR)"
+    },
+    {
+      "full_name": "ant-design-blazor/ant-design-blazor",
+      "stars": 6190,
+      "language": "C#",
+      "topics": [
+        "ant-design",
+        "ant-design-blazor",
+        "antd",
+        "blazor",
+        "blazor-components",
+        "blazor-server",
+        "blazor-webassembly",
+        "dotnet",
+        "hacktoberfest",
+        "wasm",
+        "webassembly"
+      ],
+      "description": "\ud83c\udf08A rich set of enterprise-class UI components based on Ant Design and Blazor."
+    },
+    {
+      "full_name": "qybaihe/bla",
+      "stars": 6047,
+      "language": "TypeScript",
+      "topics": [
+        "adversarial-ai",
+        "ai-security",
+        "android-security",
+        "binary-protection",
+        "claude-code",
+        "codex",
+        "cursor",
+        "electron-security",
+        "gguf",
+        "ghidra",
+        "llm-security",
+        "mcp",
+        "mcp-server",
+        "obfuscation",
+        "python-security",
+        "reverse-engineering",
+        "safetensors",
+        "software-protection",
+        "webassembly"
+      ],
+      "description": "\ud83d\udee1\ufe0f BLA (bla-agents / Blind LLM Agents) \u2014 Open-source Blue Defense MCP server & CLI protecting JS/TS, Electron ASAR, WASM, Python, Native Binaries, SQLite, GGUF/Safetensors & Android DEX against AI rev"
+    },
+    {
+      "full_name": "chai2010/go-ast-book",
+      "stars": 5507,
+      "language": "Go",
+      "topics": [
+        "ast",
+        "bison",
+        "book",
+        "flex",
+        "go",
+        "golang",
+        "goyacc",
+        "lex",
+        "llir",
+        "llvm",
+        "programming-language",
+        "wa",
+        "yacc"
+      ],
+      "description": ":books: \u300aGo\u8bed\u8a00\u5b9a\u5236\u6307\u5357\u300b(\u539f\u540d\uff1aGo\u8bed\u6cd5\u6811\u5165\u95e8/\u5f00\u6e90\u514d\u8d39\u56fe\u4e66/Go\u8bed\u8a00\u8fdb\u9636/\u638c\u63e1\u62bd\u8c61\u8bed\u6cd5\u6811/Go\u8bed\u8a00AST)"
+    },
+    {
+      "full_name": "PerryTS/perry",
+      "stars": 5114,
+      "language": "Rust",
+      "topics": [
+        "android",
+        "compile",
+        "harmonyos",
+        "ios",
+        "llvm",
+        "macos",
+        "native",
+        "smc",
+        "typescript",
+        "watchos",
+        "windows"
+      ],
+      "description": "A native TypeScript/JavaScript compiler written in Rust. Compiles TypeScript/JavaScript directly to executables using SWC and LLVM."
+    },
+    {
+      "full_name": "scala-native/scala-native",
+      "stars": 4706,
+      "language": "Scala",
+      "topics": [
+        "aot",
+        "compiler",
+        "llvm",
+        "native",
+        "scala",
+        "scala-native"
+      ],
+      "description": "Your favorite language gets closer to bare metal."
+    },
+    {
+      "full_name": "andreasfertig/cppinsights",
+      "stars": 4690,
+      "language": "C++",
+      "topics": [
+        "ast",
+        "clang",
+        "cplusplus",
+        "cplusplus-11",
+        "cplusplus-14",
+        "cplusplus-17",
+        "cplusplus-20",
+        "cplusplus-23",
+        "cpp",
+        "cpp11",
+        "cpp14",
+        "cpp17",
+        "cpp20",
+        "cpp23",
+        "cpp26",
+        "llvm"
+      ],
+      "description": "C++ Insights - See your source code with the eyes of a compiler"
+    },
+    {
+      "full_name": "asmjit/asmjit",
+      "stars": 4641,
+      "language": "C++",
+      "topics": [
+        "aarch64",
+        "asmjit",
+        "assembler",
+        "code-generation",
+        "compiler",
+        "cpp",
+        "jit",
+        "jit-compilation",
+        "x86",
+        "x86-64",
+        "x86-x64"
+      ],
+      "description": "Low-latency machine code generation"
+    },
+    {
+      "full_name": "apache/fory",
+      "stars": 4585,
+      "language": "Java",
+      "topics": [
+        "compression",
+        "cpp",
+        "cross-language",
+        "encoding",
+        "fast",
+        "golang",
+        "hacktoberfest",
+        "java",
+        "javascript",
+        "jit",
+        "lightning",
+        "marshalling",
+        "multiple-language",
+        "persistence",
+        "python",
+        "rpc",
+        "rust",
+        "serialization",
+        "transfer",
+        "zero-copy"
+      ],
+      "description": "A blazingly fast multi-language serialization framework for idiomatic domain objects, schema IDL, and cross-language data exchange."
+    },
+    {
+      "full_name": "llvm-mirror/llvm",
+      "stars": 4575,
+      "language": "LLVM",
+      "topics": [
+        "code-generation",
+        "intermediate-representation",
+        "llvm",
+        "optimization",
+        "virtual-machine"
+      ],
+      "description": "Project moved to: https://github.com/llvm/llvm-project"
+    },
+    {
+      "full_name": "root-project/cling",
+      "stars": 4210,
+      "language": "C++",
+      "topics": [
+        "c-plus-plus",
+        "clang",
+        "interpreter",
+        "jupyter",
+        "llvm"
+      ],
+      "description": "The cling C++ interpreter"
+    },
+    {
+      "full_name": "facebookincubator/MetaPython",
+      "stars": 3793,
+      "language": "Python",
+      "topics": [
+        "compiler",
+        "interpreter",
+        "jit",
+        "python",
+        "runtime"
+      ],
+      "description": "This is Meta's fork of the CPython runtime.  The name \"cinder\" here is historical, see https://github.com/facebookincubator/cinderx for the Python extension / JIT compiler."
+    },
+    {
+      "full_name": "p-org/P",
+      "stars": 3739,
+      "language": "C#",
+      "topics": [
+        "asynchronous",
+        "distributed-systems",
+        "event-driven",
+        "formal-methods",
+        "formal-verification",
+        "model-checking",
+        "p",
+        "programming-language",
+        "state-machine",
+        "systematic-testing"
+      ],
+      "description": "The P programming language."
+    },
+    {
+      "full_name": "joernio/joern",
+      "stars": 3648,
+      "language": "Scala",
+      "topics": [
+        "binary",
+        "c",
+        "code-analysis",
+        "code-browser",
+        "code-property-graph",
+        "controlflow",
+        "cpg",
+        "cpp",
+        "dataflow",
+        "fuzzy-parsing",
+        "ghidra",
+        "graph",
+        "java",
+        "javabytecode",
+        "javascript",
+        "llvm",
+        "query-language",
+        "scala",
+        "syntax-tree"
+      ],
+      "description": "Open-source code analysis platform for C/C++/Java/Binary/Javascript/Python/Kotlin based on code property graphs. Discord https://discord.gg/vv4MH284Hc"
+    },
+    {
+      "full_name": "eclipse-openj9/openj9",
+      "stars": 3548,
+      "language": "Java",
+      "topics": [
+        "compiler",
+        "eclipse-openj9",
+        "garbage-collector",
+        "gc",
+        "hacktoberfest",
+        "interpreter",
+        "java",
+        "jit",
+        "jvm",
+        "runtime",
+        "virtual-machine"
+      ],
+      "description": "Eclipse OpenJ9: A Java Virtual Machine for OpenJDK that's optimized for small footprint, fast start-up, and high throughput.   Builds on Eclipse OMR (https://github.com/eclipse/omr) and combines with "
+    },
+    {
+      "full_name": "sdiehl/write-you-a-haskell",
+      "stars": 3494,
+      "language": "Rust",
+      "topics": [
+        "compiler",
+        "haskell",
+        "lambda-calculus",
+        "llvm",
+        "rust",
+        "type-inference"
+      ],
+      "description": "Building a modern functional compiler from first principles."
+    },
+    {
+      "full_name": "banach-space/llvm-tutor",
+      "stars": 3459,
+      "language": "C++",
+      "topics": [
+        "compilers",
+        "llvm",
+        "llvm-ir",
+        "llvm-pass",
+        "llvm-plugins",
+        "llvm-tutor",
+        "llvm-tutorial",
+        "tutorial"
+      ],
+      "description": "A collection of out-of-tree LLVM passes for teaching and learning"
+    }
+  ]
+}
