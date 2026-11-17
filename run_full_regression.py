@@ -26,6 +26,7 @@ test_modules = [
     "tests.test_alpha_c32_f64_autovec_thinlto_and_omnirepo",
     "tests.test_alpha_c33_cabi_structs_narrow_widths_and_f64_ffi",
     "tests.test_alpha_c34_sub32_widths_and_nested_structs",
+    "tests.test_alpha_c35_embedded_arrays_and_cabi_strides",
     "tests.test_native_composite_collections",
     "tests.test_ceiling_engineering_complete",
 ]

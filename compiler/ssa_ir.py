@@ -282,6 +282,13 @@ class AstToSsaLowering:
     }
 
     def _normalize_cabi_type(self, ann: Optional[ast.AST]) -> Optional[str]:
+        if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name) and ann.value.id in ("Array", "FixedArray"):
+            if isinstance(ann.slice, ast.Tuple) and len(ann.slice.elts) == 2:
+                elem_ft = self._normalize_cabi_type(ann.slice.elts[0])
+                cnt_node = ann.slice.elts[1]
+                if elem_ft is not None and isinstance(cnt_node, ast.Constant) and isinstance(cnt_node.value, int) and cnt_node.value > 0:
+                    return f"arr:{elem_ft}:{cnt_node.value}"
+            return None
         if isinstance(ann, ast.Name):
             mp = {
                 "i8": "i8", "u8": "u8", "int8": "i8", "uint8": "u8",
@@ -299,6 +306,11 @@ class AstToSsaLowering:
         return None
 
     def _get_type_size_align(self, ft: str) -> Tuple[int, int]:
+        if ft.startswith("arr:"):
+            parts = ft.split(":", 2)
+            if len(parts) == 3:
+                elem_sz, elem_al = self._get_type_size_align(parts[1])
+                return (elem_sz * int(parts[2]), elem_al)
         if ft in self._CABI_SIZE_ALIGN:
             return self._CABI_SIZE_ALIGN[ft]
         if ft in self.struct_meta:
@@ -355,33 +367,73 @@ class AstToSsaLowering:
             if not changed:
                 break
 
-    def _resolve_struct_field(self, base_node: ast.AST, attr_name: str) -> Optional[Tuple[ast.Name, int, str]]:
-        attrs: List[str] = [attr_name]
-        cur: ast.AST = base_node
-        while isinstance(cur, ast.Attribute):
-            attrs.append(cur.attr)
-            cur = cur.value
-        if not isinstance(cur, ast.Name):
-            return None
-        attrs.reverse()
-        sname = self._var_struct_types.get(cur.id)
-        total_off = 0
-        leaf_wt: Optional[str] = None
-        for idx, a_nm in enumerate(attrs):
-            if not sname or sname not in self.struct_layouts:
-                return None
-            entry = self.struct_layouts[sname].get(a_nm)
-            if entry is None:
-                return None
-            f_off, f_wt = entry
-            total_off += f_off
-            if idx + 1 < len(attrs):
-                sname = f_wt
+    def _resolve_lvalue_address(
+        self, node: ast.AST
+    ) -> Optional[Tuple[ast.Name, int, List[Tuple[ast.AST, int]], str]]:
+        """Resolves chained struct attributes and inline fixed-array subscripts into base root, const byte offset, scaled dynamic terms, and scalar leaf width."""
+        steps: List[Tuple[str, Any]] = []
+        cur: ast.AST = node
+        while isinstance(cur, (ast.Attribute, ast.Subscript)):
+            if isinstance(cur, ast.Attribute):
+                steps.append(("attr", cur.attr))
+                cur = cur.value
             else:
-                leaf_wt = f_wt
-        if leaf_wt is None or leaf_wt in self.struct_layouts:
+                if isinstance(cur.slice, ast.Slice):
+                    return None
+                steps.append(("sub", cur.slice))
+                cur = cur.value
+        if not steps or not isinstance(cur, ast.Name):
             return None
-        return (cur, total_off, leaf_wt)
+        sname = self._var_struct_types.get(cur.id)
+        if not sname:
+            return None
+        steps.reverse()
+        cur_ft: str = sname
+        const_off = 0
+        dyn_terms: List[Tuple[ast.AST, int]] = []
+        for kind, val in steps:
+            if kind == "attr":
+                if cur_ft not in self.struct_layouts:
+                    return None
+                entry = self.struct_layouts[cur_ft].get(val)
+                if entry is None:
+                    return None
+                f_off, cur_ft = entry
+                const_off += f_off
+            else:
+                if not cur_ft.startswith("arr:"):
+                    return None
+                parts = cur_ft.split(":", 2)
+                if len(parts) != 3:
+                    return None
+                elem_ft = parts[1]
+                elem_sz, _ = self._get_type_size_align(elem_ft)
+                dyn_terms.append((val, elem_sz))
+                cur_ft = elem_ft
+        if cur_ft.startswith("arr:") or cur_ft in self.struct_layouts:
+            return None
+        return (cur, const_off, dyn_terms, cur_ft)
+
+    def _emit_lvalue_byte_offset(self, const_off: int, dyn_terms: List[Tuple[ast.AST, int]], line: int) -> SSAVar:
+        rem_terms: List[Tuple[ast.AST, int]] = []
+        for idx_expr, stride in dyn_terms:
+            if isinstance(idx_expr, ast.Constant) and isinstance(idx_expr.value, int) and not isinstance(idx_expr.value, bool):
+                const_off += idx_expr.value * stride
+            else:
+                rem_terms.append((idx_expr, stride))
+        acc = self._emit_const(const_off, line=line)
+        for idx_expr, stride in rem_terms:
+            idx_v = self._lower_expr(idx_expr)
+            if stride != 1:
+                stride_v = self._emit_const(stride, line=line)
+                term_v = self._next_var("off_mul")
+                self._emit(term_v, "mul", [idx_v, stride_v], line=line)
+            else:
+                term_v = idx_v
+            nxt = self._next_var("off_add")
+            self._emit(nxt, "add", [acc, term_v], line=line)
+            acc = nxt
+        return acc
 
     def _next_var(self, name: str, var_type: str = "i64") -> SSAVar:
         v = self.var_versions.get(name, 0) + 1
@@ -525,10 +577,27 @@ class AstToSsaLowering:
             return defs[block.name]
         return self._read_variable_recursive(var_name, block)
 
+    def _infer_var_type_from_preds(self, var_name: str, block: BasicBlock) -> str:
+        visited: Set[str] = set()
+        queue: List[BasicBlock] = list(block.predecessors)
+        while queue:
+            cur = queue.pop(0)
+            if cur.name in visited:
+                continue
+            visited.add(cur.name)
+            cur_def = self._current_def.get(var_name, {}).get(cur.name)
+            if cur_def is not None:
+                if cur_def.var_type == "f64":
+                    return "f64"
+                continue
+            queue.extend(cur.predecessors)
+        return "i64"
+
     def _read_variable_recursive(self, var_name: str, block: BasicBlock) -> SSAVar:
         if block.name not in self._sealed_blocks:
-            # Incomplete CFG (e.g., loop header before back-edge): place operandless Phi
-            phi_res = self._next_var(var_name)
+            # Incomplete CFG (e.g., loop header before back-edge): place operandless Phi with inferred type
+            init_vt = self._infer_var_type_from_preds(var_name, block)
+            phi_res = self._next_var(var_name, var_type=init_vt)
             phi_inst = SSAInstruction(phi_res, "phi", [], phi_incoming=[])
             block.phi_nodes.append(phi_inst)
             self._incomplete_phis.setdefault(block.name, {})[var_name] = phi_inst
@@ -935,26 +1004,24 @@ class AstToSsaLowering:
                     res = self._next_var(stmt.target.id)
                     self._emit(res, opcode, [cur_val, rhs_val], line=line)
                 self._write_variable(stmt.target.id, self._cur_block, res)
-            elif isinstance(stmt.target, ast.Attribute):
-                finfo = self._resolve_struct_field(stmt.target.value, stmt.target.attr)
-                if finfo is not None:
-                    root_node, f_off, f_wt = finfo
-                    base_var = self._lower_expr(root_node)
-                    off_v = self._emit_const(f_off, line=line)
-                    loaded = self._next_var("fld", var_type="f64" if f_wt in ("f32", "f64") else "i64")
-                    self._emit(loaded, "load_off", [base_var, off_v, f_wt], line=line)
-                    rhs_val = self._lower_expr(stmt.value)
-                    if loaded.var_type == "f64" or rhs_val.var_type == "f64":
-                        lf = self._promote_to_f64(loaded, line=line)
-                        rf = self._promote_to_f64(rhs_val, line=line)
-                        fop = self.FLOAT_BINOP_MAP.get(type(stmt.op), "fadd")
-                        res = self._next_var("fst_val", var_type="f64")
-                        self._emit(res, fop, [lf, rf], line=line)
-                    else:
-                        opcode = self.BINOP_MAP.get(type(stmt.op), "add")
-                        res = self._next_var("fst_val")
-                        self._emit(res, opcode, [loaded, rhs_val], line=line)
-                    self._emit(None, "store_off", [base_var, off_v, res, f_wt], line=line)
+            elif (addr_info := self._resolve_lvalue_address(stmt.target)) is not None:
+                root_node, const_off, dyn_terms, f_wt = addr_info
+                base_var = self._lower_expr(root_node)
+                off_v = self._emit_lvalue_byte_offset(const_off, dyn_terms, line=line)
+                loaded = self._next_var("fld", var_type="f64" if f_wt in ("f32", "f64") else "i64")
+                self._emit(loaded, "load_off", [base_var, off_v, f_wt], line=line)
+                rhs_val = self._lower_expr(stmt.value)
+                if loaded.var_type == "f64" or rhs_val.var_type == "f64":
+                    lf = self._promote_to_f64(loaded, line=line)
+                    rf = self._promote_to_f64(rhs_val, line=line)
+                    fop = self.FLOAT_BINOP_MAP.get(type(stmt.op), "fadd")
+                    res = self._next_var("fst_val", var_type="f64")
+                    self._emit(res, fop, [lf, rf], line=line)
+                else:
+                    opcode = self.BINOP_MAP.get(type(stmt.op), "add")
+                    res = self._next_var("fst_val")
+                    self._emit(res, opcode, [loaded, rhs_val], line=line)
+                self._emit(None, "store_off", [base_var, off_v, res, f_wt], line=line)
             elif isinstance(stmt.target, ast.Subscript):
                 base_var = self._lower_expr(stmt.target.value)
                 idx_var = self._lower_expr(stmt.target.slice)
@@ -1250,15 +1317,13 @@ class AstToSsaLowering:
         assert self._cur_block is not None
         if isinstance(target, ast.Name):
             self._write_variable(target.id, self._cur_block, val)
-        elif isinstance(target, ast.Attribute):
-            finfo = self._resolve_struct_field(target.value, target.attr)
-            if finfo is not None:
-                root_node, f_off, f_wt = finfo
-                base_var = self._lower_expr(root_node)
-                off_v = self._emit_const(f_off, line=line)
-                if f_wt in ("f32", "f64") and val.var_type != "f64":
-                    val = self._promote_to_f64(val, line=line)
-                self._emit(None, "store_off", [base_var, off_v, val, f_wt], line=line)
+        elif (addr_info := self._resolve_lvalue_address(target)) is not None:
+            root_node, const_off, dyn_terms, f_wt = addr_info
+            base_var = self._lower_expr(root_node)
+            off_v = self._emit_lvalue_byte_offset(const_off, dyn_terms, line=line)
+            if f_wt in ("f32", "f64") and val.var_type != "f64":
+                val = self._promote_to_f64(val, line=line)
+            self._emit(None, "store_off", [base_var, off_v, val, f_wt], line=line)
         elif isinstance(target, ast.Subscript):
             base_var = self._lower_expr(target.value)
             idx_var = self._lower_expr(target.slice)
@@ -1419,6 +1484,14 @@ class AstToSsaLowering:
                     self._emit(None, "call", ["omni_dict_set", dict_ptr, k_v, v_v], line=line)
             return dict_ptr
 
+        elif (addr_info := self._resolve_lvalue_address(node)) is not None:
+            root_node, const_off, dyn_terms, f_wt = addr_info
+            base_var = self._lower_expr(root_node)
+            off_v = self._emit_lvalue_byte_offset(const_off, dyn_terms, line=line)
+            res = self._next_var("fld", var_type="f64" if f_wt in ("f32", "f64") else "i64")
+            self._emit(res, "load_off", [base_var, off_v, f_wt], line=line)
+            return res
+
         elif isinstance(node, ast.Subscript):
             base_var = self._lower_expr(node.value)
             if isinstance(node.slice, ast.Slice):
@@ -1445,16 +1518,6 @@ class AstToSsaLowering:
             else:
                 self._emit(res, "call", ["omni_item_get", base_var, idx_var], line=line)
             return res
-
-        elif isinstance(node, ast.Attribute):
-            finfo = self._resolve_struct_field(node.value, node.attr)
-            if finfo is not None:
-                root_node, f_off, f_wt = finfo
-                base_var = self._lower_expr(root_node)
-                off_v = self._emit_const(f_off, line=line)
-                res = self._next_var("fld", var_type="f64" if f_wt in ("f32", "f64") else "i64")
-                self._emit(res, "load_off", [base_var, off_v, f_wt], line=line)
-                return res
 
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):

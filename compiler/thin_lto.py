@@ -441,6 +441,24 @@ class ThinLtoOptimizer:
                             inst.result.var_type = "f64"
                             type_changed = True
 
+        # Ensure every operand of upgraded float/fcmp instructions is f64 (inserting sitofp if i64)
+        _fp_insts = {"fadd", "fsub", "fmul", "fdiv", "fneg", "fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge"}
+        _lto_fp_counter = 0
+        for b in ssa_fn.blocks:
+            new_insts: List[SSAInstruction] = []
+            for inst in b.instructions:
+                if inst.opcode in _fp_insts:
+                    for idx_o, op in enumerate(list(inst.operands)):
+                        if isinstance(op, int) and not isinstance(op, bool):
+                            inst.operands[idx_o] = float(op)
+                        elif isinstance(op, SSAVar) and op.var_type != "f64":
+                            _lto_fp_counter += 1
+                            fp_v = SSAVar(f"_lto_fp", _lto_fp_counter, var_type="f64")
+                            new_insts.append(SSAInstruction(fp_v, "sitofp", [op], source_line=inst.source_line))
+                            inst.operands[idx_o] = fp_v
+                new_insts.append(inst)
+            b.instructions = new_insts
+
         optimized_fn = optimize_ssa(ssa_fn)
         for b in optimized_fn.blocks:
             for inst in b.instructions:

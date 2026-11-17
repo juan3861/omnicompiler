@@ -381,6 +381,55 @@ class _PolyglotParser:
         ast.fix_missing_locations(mod)
         return mod, funcs, errors
 
+    @staticmethod
+    def _build_cabi_field_annotation(ftype_toks: List[str], line: int) -> ast.expr:
+        # Rust/TS `[T; N]`
+        if len(ftype_toks) >= 5 and ftype_toks[0] == "[" and ftype_toks[-1] == "]" and ";" in ftype_toks:
+            sep_i = ftype_toks.index(";")
+            elem_tok = ftype_toks[sep_i - 1]
+            cnt_tok = ftype_toks[sep_i + 1]
+            if cnt_tok.isdigit():
+                return ast.Subscript(
+                    value=ast.Name(id="Array", ctx=ast.Load(), lineno=line),
+                    slice=ast.Tuple(
+                        elts=[ast.Name(id=elem_tok, ctx=ast.Load(), lineno=line), ast.Constant(value=int(cnt_tok), lineno=line)],
+                        ctx=ast.Load(),
+                        lineno=line,
+                    ),
+                    ctx=ast.Load(),
+                    lineno=line,
+                )
+        # Go `[N]T`
+        if len(ftype_toks) >= 4 and ftype_toks[0] == "[" and "]" in ftype_toks:
+            rb_i = ftype_toks.index("]")
+            if rb_i == 2 and ftype_toks[1].isdigit() and rb_i + 1 < len(ftype_toks):
+                return ast.Subscript(
+                    value=ast.Name(id="Array", ctx=ast.Load(), lineno=line),
+                    slice=ast.Tuple(
+                        elts=[ast.Name(id=ftype_toks[rb_i + 1], ctx=ast.Load(), lineno=line), ast.Constant(value=int(ftype_toks[1]), lineno=line)],
+                        ctx=ast.Load(),
+                        lineno=line,
+                    ),
+                    ctx=ast.Load(),
+                    lineno=line,
+                )
+        # TS `FixedArray<T, N>`
+        if len(ftype_toks) >= 6 and ftype_toks[0] in ("FixedArray", "Array") and "<" in ftype_toks and "," in ftype_toks and ">" in ftype_toks:
+            c_i = ftype_toks.index(",")
+            if c_i >= 2 and c_i + 1 < len(ftype_toks) and ftype_toks[c_i + 1].isdigit():
+                return ast.Subscript(
+                    value=ast.Name(id="Array", ctx=ast.Load(), lineno=line),
+                    slice=ast.Tuple(
+                        elts=[ast.Name(id=ftype_toks[c_i - 1], ctx=ast.Load(), lineno=line), ast.Constant(value=int(ftype_toks[c_i + 1]), lineno=line)],
+                        ctx=ast.Load(),
+                        lineno=line,
+                    ),
+                    ctx=ast.Load(),
+                    lineno=line,
+                )
+        ft_id = ftype_toks[-1] if ftype_toks else "i64"
+        return ast.Name(id=ft_id, ctx=ast.Load(), lineno=line)
+
     def _try_parse_top_level_struct(self) -> Optional[ast.ClassDef]:
         save = self.pos
         t = self._peek()
@@ -411,13 +460,20 @@ class _PolyglotParser:
                 fname = self._advance()
                 self._expect("OP", ":")
                 ftype_toks: List[str] = []
-                while not self._at("PUNCT", ",") and not self._at("PUNCT", "}") and not self._at("EOF"):
+                br_depth = 0
+                while not self._at("EOF"):
+                    pk = self._peek()
+                    if br_depth == 0 and pk.kind == "PUNCT" and pk.val in (",", "}"):
+                        break
+                    if pk.kind == "PUNCT" and pk.val == "[":
+                        br_depth += 1
+                    elif pk.kind == "PUNCT" and pk.val == "]":
+                        br_depth = max(0, br_depth - 1)
                     ftype_toks.append(self._advance().val)
-                ft_id = ftype_toks[-1] if ftype_toks else "i64"
                 body.append(
                     ast.AnnAssign(
                         target=ast.Name(id=fname.val, ctx=ast.Store(), lineno=fname.line),
-                        annotation=ast.Name(id=ft_id, ctx=ast.Load(), lineno=fname.line),
+                        annotation=self._build_cabi_field_annotation(ftype_toks, fname.line),
                         value=None,
                         simple=1,
                         lineno=fname.line,
@@ -454,14 +510,27 @@ class _PolyglotParser:
                     self.pos = save
                     return None
                 fname = self._advance()
-                if not self._at("ID"):
+                if self._at("PUNCT", "["):
+                    go_toks = [self._advance().val]
+                    while not self._at("PUNCT", "]") and not self._at("EOF"):
+                        go_toks.append(self._advance().val)
+                    if self._at("PUNCT", "]"):
+                        go_toks.append(self._advance().val)
+                    if not self._at("ID"):
+                        self.pos = save
+                        return None
+                    go_toks.append(self._advance().val)
+                    go_ann = self._build_cabi_field_annotation(go_toks, fname.line)
+                elif self._at("ID"):
+                    ftype = self._advance().val
+                    go_ann = ast.Name(id=ftype, ctx=ast.Load(), lineno=fname.line)
+                else:
                     self.pos = save
                     return None
-                ftype = self._advance().val
                 body_g.append(
                     ast.AnnAssign(
                         target=ast.Name(id=fname.val, ctx=ast.Store(), lineno=fname.line),
-                        annotation=ast.Name(id=ftype, ctx=ast.Load(), lineno=fname.line),
+                        annotation=go_ann,
                         value=None,
                         simple=1,
                         lineno=fname.line,
@@ -499,18 +568,25 @@ class _PolyglotParser:
                 fname = self._advance()
                 self._expect("OP", ":")
                 ftype_toks_t: List[str] = []
-                while (
-                    not self._at("PUNCT", ";")
-                    and not self._at("PUNCT", ",")
-                    and not self._at("PUNCT", "}")
-                    and not self._at("EOF")
-                ):
+                br_d = 0
+                ang_d = 0
+                while not self._at("EOF"):
+                    pk = self._peek()
+                    if br_d == 0 and ang_d == 0 and pk.kind == "PUNCT" and pk.val in (";", ",", "}"):
+                        break
+                    if pk.val == "[":
+                        br_d += 1
+                    elif pk.val == "]":
+                        br_d = max(0, br_d - 1)
+                    elif pk.val == "<":
+                        ang_d += 1
+                    elif pk.val == ">":
+                        ang_d = max(0, ang_d - 1)
                     ftype_toks_t.append(self._advance().val)
-                ft_id_t = ftype_toks_t[-1] if ftype_toks_t else "i64"
                 body_t.append(
                     ast.AnnAssign(
                         target=ast.Name(id=fname.val, ctx=ast.Store(), lineno=fname.line),
-                        annotation=ast.Name(id=ft_id_t, ctx=ast.Load(), lineno=fname.line),
+                        annotation=self._build_cabi_field_annotation(ftype_toks_t, fname.line),
                         value=None,
                         simple=1,
                         lineno=fname.line,
@@ -1239,7 +1315,7 @@ class _PolyglotParser:
             )
 
         expr = self._parse_expr()
-        if isinstance(expr, ast.Subscript) and self._peek().kind == "OP":
+        if isinstance(expr, (ast.Subscript, ast.Attribute)) and self._peek().kind == "OP":
             nxt_op = self._peek().val
             aug_map = {
                 "+=": ast.Add(),
@@ -1257,51 +1333,20 @@ class _PolyglotParser:
                 self._advance()
                 rhs = self._parse_expr()
                 semi = self._consume_optional_semi() if consume_semi else False
-                return (
-                    ast.Assign(
-                        targets=[
-                            ast.Subscript(
-                                value=expr.value,
-                                slice=expr.slice,
-                                ctx=ast.Store(),
-                                lineno=line,
-                            )
-                        ],
-                        value=rhs,
-                        lineno=line,
-                    ),
-                    semi,
-                )
+                if isinstance(expr, ast.Subscript):
+                    lhs_store: ast.expr = ast.Subscript(value=expr.value, slice=expr.slice, ctx=ast.Store(), lineno=line)
+                else:
+                    lhs_store = ast.Attribute(value=expr.value, attr=expr.attr, ctx=ast.Store(), lineno=line)
+                return (ast.Assign(targets=[lhs_store], value=rhs, lineno=line), semi)
             if nxt_op in aug_map:
                 self._advance()
                 rhs = self._parse_expr()
                 semi = self._consume_optional_semi() if consume_semi else False
-                bin_val = ast.BinOp(
-                    left=ast.Subscript(
-                        value=expr.value,
-                        slice=expr.slice,
-                        ctx=ast.Load(),
-                        lineno=line,
-                    ),
-                    op=aug_map[nxt_op],
-                    right=rhs,
-                    lineno=line,
-                )
-                return (
-                    ast.Assign(
-                        targets=[
-                            ast.Subscript(
-                                value=expr.value,
-                                slice=expr.slice,
-                                ctx=ast.Store(),
-                                lineno=line,
-                            )
-                        ],
-                        value=bin_val,
-                        lineno=line,
-                    ),
-                    semi,
-                )
+                if isinstance(expr, ast.Subscript):
+                    lhs_aug: ast.expr = ast.Subscript(value=expr.value, slice=expr.slice, ctx=ast.Store(), lineno=line)
+                else:
+                    lhs_aug = ast.Attribute(value=expr.value, attr=expr.attr, ctx=ast.Store(), lineno=line)
+                return (ast.AugAssign(target=lhs_aug, op=aug_map[nxt_op], value=rhs, lineno=line), semi)
         semi = self._consume_optional_semi() if consume_semi else False
         return ast.Expr(value=expr, lineno=line), semi
 

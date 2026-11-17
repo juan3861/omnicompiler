@@ -16,7 +16,7 @@ import ctypes
 import platform
 import re
 import struct
-from typing import Dict, List, Tuple, Any, Optional, Sequence
+from typing import Dict, List, Tuple, Any, Optional, Sequence, Set
 
 from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar
 from compiler.native_codegen import NativeCodeGenerator
@@ -29,6 +29,58 @@ from validation.ssa_translation_validator import SSATranslationValidator
 def _to_s64(v: int) -> int:
     v &= 0xFFFFFFFFFFFFFFFF
     return v - (1 << 64) if v >= (1 << 63) else v
+
+
+def _prune_dead_and_trivial_phis(ssa_fn: SSAFunction) -> None:
+    """Eliminates trivial and unreachable/dead PHI nodes across lifted CFGs."""
+    def _replace_var_everywhere(old_v: SSAVar, new_v: Any) -> None:
+        for blk in ssa_fn.blocks:
+            for ph in blk.phi_nodes:
+                ph.operands = [new_v if op == old_v else op for op in ph.operands]
+                ph.phi_incoming = [(pn, new_v if pv == old_v else pv) for pn, pv in ph.phi_incoming]
+            for ins in blk.instructions:
+                ins.operands = [new_v if op == old_v else op for op in ins.operands]
+
+    changed_phi = True
+    while changed_phi:
+        changed_phi = False
+        for blk in ssa_fn.blocks:
+            kept_phis: List[SSAInstruction] = []
+            for ph in blk.phi_nodes:
+                distinct = []
+                for op in ph.operands:
+                    if op != ph.result and op not in distinct:
+                        distinct.append(op)
+                if len(distinct) == 1:
+                    _replace_var_everywhere(ph.result, distinct[0])
+                    changed_phi = True
+                else:
+                    kept_phis.append(ph)
+            blk.phi_nodes = kept_phis
+        phi_by_res: Dict[SSAVar, SSAInstruction] = {
+            ph.result: ph for blk in ssa_fn.blocks for ph in blk.phi_nodes if ph.result is not None
+        }
+        live_phi_vars: Set[SSAVar] = set()
+        work: List[SSAVar] = [
+            op
+            for blk in ssa_fn.blocks
+            for ins in blk.instructions
+            for op in ins.operands
+            if isinstance(op, SSAVar) and op in phi_by_res
+        ]
+        while work:
+            cur_v = work.pop()
+            if cur_v in live_phi_vars:
+                continue
+            live_phi_vars.add(cur_v)
+            for op in phi_by_res[cur_v].operands:
+                if isinstance(op, SSAVar) and op in phi_by_res and op not in live_phi_vars:
+                    work.append(op)
+        for blk in ssa_fn.blocks:
+            new_phis = [ph for ph in blk.phi_nodes if ph.result in live_phi_vars]
+            if len(new_phis) != len(blk.phi_nodes):
+                blk.phi_nodes = new_phis
+                changed_phi = True
 
 
 class LLVMIRToSSALifter:
@@ -478,6 +530,7 @@ class LLVMIRToSSALifter:
                         if t in blocks:
                             bb.connect_to(blocks[t])
 
+        _prune_dead_and_trivial_phis(ssa_fn)
         return ssa_fn, None
 
 
@@ -719,6 +772,7 @@ class WATToSSALifter:
             )
             if err:
                 return None, err
+            _prune_dead_and_trivial_phis(ssa_fn)
             return ssa_fn, None
 
         # Multi-block `$cfg_dispatch` lifter: parse each `i32.const <k> / i32.eq / (if (then ...))` dispatch arm
@@ -863,6 +917,7 @@ class WATToSSALifter:
             ssa_fn.blocks.insert(0, init_bb)
             ssa_fn.entry_block = init_bb
 
+        _prune_dead_and_trivial_phis(ssa_fn)
         return ssa_fn, None
 
     @classmethod

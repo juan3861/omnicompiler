@@ -25,21 +25,30 @@ class StructField:
     def __init__(self, name: str, field_type: str, nested_layouts: Optional[Dict[str, "StructLayout"]] = None):
         self.name = name
         self.field_type = field_type
+        sz, al = self._resolve_size_align(field_type, nested_layouts)
+        self.size = sz
+        self.alignment = al
+        self.offset = 0
+
+    @classmethod
+    def _resolve_size_align(
+        cls, field_type: str, nested_layouts: Optional[Dict[str, "StructLayout"]] = None
+    ) -> Tuple[int, int]:
+        if field_type.startswith("arr:"):
+            parts = field_type.split(":", 2)
+            if len(parts) == 3:
+                elem_sz, elem_al = cls._resolve_size_align(parts[1], nested_layouts)
+                return (elem_sz * int(parts[2]), elem_al)
         if nested_layouts and field_type in nested_layouts:
             sub = nested_layouts[field_type]
-            self.size = sub.total_size
-            self.alignment = sub.struct_alignment
-        else:
-            type_table = {
-                "i8": (1, 1), "u8": (1, 1),
-                "i16": (2, 2), "u16": (2, 2),
-                "i32": (4, 4), "u32": (4, 4), "f32": (4, 4),
-                "i64": (8, 8), "u64": (8, 8), "f64": (8, 8), "ptr": (8, 8)
-            }
-            size, align = type_table.get(field_type, (8, 8))
-            self.size = size
-            self.alignment = align
-        self.offset = 0
+            return (sub.total_size, sub.struct_alignment)
+        type_table = {
+            "i8": (1, 1), "u8": (1, 1),
+            "i16": (2, 2), "u16": (2, 2),
+            "i32": (4, 4), "u32": (4, 4), "f32": (4, 4),
+            "i64": (8, 8), "u64": (8, 8), "f64": (8, 8), "ptr": (8, 8)
+        }
+        return type_table.get(field_type, (8, 8))
 
 
 class StructLayout:
