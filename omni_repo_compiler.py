@@ -8,6 +8,7 @@ relocation linking, Unicorn silicon emulation, and multi-symbol PE/ELF/Mach-O em
 
 import argparse
 import ast
+import hashlib
 import os
 import struct
 import sys
@@ -187,6 +188,13 @@ class OmniRepoCompiler:
         self.salsa = SalsaQueryEngine()
         self._salsa_hits = 0
         self._salsa_misses = 0
+        self._salsa_obj_hits = 0
+        self._salsa_obj_misses = 0
+        self._salsa_obj_cache: Dict[Tuple[Any, ...], CompiledFunctionArtifact] = {}
+        self._salsa_bounds_cache: Dict[Tuple[Any, ...], Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+        self._salsa_preflight_cache: Dict[Tuple[Any, ...], Any] = {}
+        self._cpg_topo_digest: Optional[str] = None
+        self._cpg_last_taint_leak: Optional[Any] = None
         self.salsa.register_query("parsed_module", self._salsa_parse_file)
 
     def _salsa_parse_file(self, norm_path: str) -> Optional[_CachedAstPayload]:
@@ -301,6 +309,8 @@ class OmniRepoCompiler:
         # Stage 1: Parallel Repository Manifest & Salsa Incremental AST Ingestion
         self._salsa_hits = 0
         self._salsa_misses = 0
+        self._salsa_obj_hits = 0
+        self._salsa_obj_misses = 0
         if len(repo_paths) > 1:
             with ThreadPoolExecutor(max_workers=min(8, len(repo_paths))) as pool:
                 manifests = list(pool.map(self.ingestor.ingest_repository, repo_paths))
@@ -403,18 +413,33 @@ class OmniRepoCompiler:
         }
 
         # Stage 3: Batched Persistent CPG Construction & Single-CTE Inter-Repo Taint Security Audit
-        with self.cpg.batch():
-            for m in manifests:
-                for _fp, tree in repo_modules_map.get(m.repo_name, []):
-                    self.cpg.ingest_ast_module(tree, repo_name=m.repo_name)
-            for b in topo["resolved_bindings"]:
-                self.cpg.link_inter_repo_call(
-                    caller_repo=b["consumer_repo"],
-                    callee_repo=b["provider_repo"],
-                    target_fn_name=b["symbol"],
-                )
+        cpg_sig_parts = [
+            (m.repo_name, fp)
+            for m in manifests
+            for fp, _tree in repo_modules_map.get(m.repo_name, [])
+        ]
+        cpg_topo_digest = hashlib.sha256(repr((
+            cpg_sig_parts,
+            self._salsa_misses,
+            [(b["consumer_repo"], b["provider_repo"], b["symbol"]) for b in topo["resolved_bindings"]],
+        )).encode("utf-8")).hexdigest()
+        if self._salsa_misses == 0 and self._cpg_topo_digest == cpg_topo_digest:
+            taint_leak = self._cpg_last_taint_leak
+        else:
+            with self.cpg.batch():
+                for m in manifests:
+                    for _fp, tree in repo_modules_map.get(m.repo_name, []):
+                        self.cpg.ingest_ast_module(tree, repo_name=m.repo_name)
+                for b in topo["resolved_bindings"]:
+                    self.cpg.link_inter_repo_call(
+                        caller_repo=b["consumer_repo"],
+                        callee_repo=b["provider_repo"],
+                        target_fn_name=b["symbol"],
+                    )
+            taint_leak = self.cpg.find_cross_repo_taint_path("PARAM:TENANT", "public_log")
+            self._cpg_topo_digest = cpg_topo_digest
+            self._cpg_last_taint_leak = taint_leak
 
-        taint_leak = self.cpg.find_cross_repo_taint_path("PARAM:TENANT", "public_log")
         results["stages"]["cpg_security"] = {
             "taint_leak_detected": taint_leak is not None,
             "isolation_preserved": taint_leak is None,
@@ -745,10 +770,12 @@ class OmniRepoCompiler:
 
             ssa_program[fn_name] = ssa_fn
 
-        # Stage 5c: Z3 SSA Memory Bounds & Pointer Disjointness Verification
+        # Stage 5c: Z3 SSA Memory Bounds & Pointer Disjointness Verification (Salsa-cached by SSA digest)
+        from validation.ssa_translation_validator import canonical_ssa_digest
         z3_bounds_checks_passed = 0
         z3_bounds_violations: List[Dict[str, Any]] = []
         pointer_disjoint_reports: List[Dict[str, Any]] = []
+        struct_sizes_key = tuple(sorted(global_struct_sizes.items()))
         for fn_name, ssa_fn in ssa_program.items():
             fdef = all_ast_funcs.get(fn_name) or all_ast_funcs.get(fn_name.split("__spec_", 1)[0])
             p_struct_map: Dict[str, str] = {}
@@ -756,14 +783,24 @@ class OmniRepoCompiler:
                 for arg in fdef.args.args:
                     if isinstance(arg.annotation, ast.Name) and arg.annotation.id in global_struct_sizes:
                         p_struct_map[arg.arg] = arg.annotation.id
-            if p_struct_map and global_struct_sizes:
-                b_res = self.biabduction.verify_ssa_memory_bounds(
-                    ssa_fn, struct_sizes=global_struct_sizes, param_struct_map=p_struct_map
-                )
+            ssa_dig = canonical_ssa_digest(ssa_fn)
+            b_cache_key = (ssa_dig, tuple(sorted(p_struct_map.items())), struct_sizes_key)
+            cached_bd = self._salsa_bounds_cache.get(b_cache_key)
+            if cached_bd is not None:
+                b_res, d_res = cached_bd
+            else:
+                b_res = None
+                if p_struct_map and global_struct_sizes:
+                    b_res = self.biabduction.verify_ssa_memory_bounds(
+                        ssa_fn, struct_sizes=global_struct_sizes, param_struct_map=p_struct_map
+                    )
+                d_res = self.biabduction.verify_ssa_pointer_disjointness(ssa_fn)
+                self._salsa_bounds_cache[b_cache_key] = (b_res, d_res)
+
+            if b_res is not None:
                 z3_bounds_checks_passed += b_res.get("checks_passed", 0)
                 for v in b_res.get("violations", []):
                     z3_bounds_violations.append({"function": fn_name, **v})
-            d_res = self.biabduction.verify_ssa_pointer_disjointness(ssa_fn)
             if d_res.get("pointer_params"):
                 pointer_disjoint_reports.append({"function": fn_name, **d_res})
 
@@ -964,19 +1001,26 @@ class OmniRepoCompiler:
             for ssa_fn in repo_ssas:
                 if ssa_fn.name in llvm_handled:
                     continue
-                artifact = codegen.compile_ssa(ssa_fn)
+                obj_key = (canonical_ssa_digest(ssa_fn), effective_arch, effective_os, "native")
+                cached_art = self._salsa_obj_cache.get(obj_key)
+                if cached_art is not None:
+                    self._salsa_obj_hits += 1
+                    artifact = cached_art
+                else:
+                    self._salsa_obj_misses += 1
+                    artifact = codegen.compile_ssa(ssa_fn)
+                    if effective_arch == "x86_64" and not artifact.relocations and not getattr(ssa_fn, "luts", None):
+                        try:
+                            from compiler.tco_and_layout import PeepholeMachineOptimizer
+                            opt_bytes, ph_stats = PeepholeMachineOptimizer().optimize_bytes(
+                                artifact.code_bytes, has_relocations=bool(artifact.relocations)
+                            )
+                            peephole_bytes_saved += ph_stats.get("peephole_bytes_saved", 0)
+                            artifact.code_bytes = opt_bytes
+                        except Exception:
+                            pass
+                    self._salsa_obj_cache[obj_key] = artifact
                 irc_coalesced_moves += getattr(artifact, "coalesced_moves", 0)
-
-                if effective_arch == "x86_64" and not artifact.relocations and not getattr(ssa_fn, "luts", None):
-                    try:
-                        from compiler.tco_and_layout import PeepholeMachineOptimizer
-                        opt_bytes, ph_stats = PeepholeMachineOptimizer().optimize_bytes(
-                            artifact.code_bytes, has_relocations=bool(artifact.relocations)
-                        )
-                        peephole_bytes_saved += ph_stats.get("peephole_bytes_saved", 0)
-                        artifact.code_bytes = opt_bytes
-                    except Exception:
-                        pass
 
                 sym_base_off = len(obj_mod.text_bytes)
                 obj_mod.add_symbol(
@@ -1113,6 +1157,12 @@ class OmniRepoCompiler:
             "exported_symbols": sorted(link_res["exported_symbols"].keys()),
         }
 
+        results["stages"]["ingestion"]["salsa_artifact_hits"] = self._salsa_obj_hits
+        results["stages"]["ingestion"]["salsa_artifact_misses"] = self._salsa_obj_misses
+        results["stages"]["ingestion"]["smt_proof_cache_hits"] = (
+            smt_runner.validator.proof_cache_hits + self.backend_validator.validator.proof_cache_hits
+        )
+
         # Stage 5.5b: Pre-Flight Silicon Safety Sandbox (Real Unicorn Emulation on Linked Image!)
         entry_arity = 1
         if entry_export in all_ast_funcs:
@@ -1128,13 +1178,31 @@ class OmniRepoCompiler:
                     for idx_p, p in enumerate(ent_ssa.params)
                 ]
 
+        pf_key = (
+            hashlib.sha256(bytes(combined_code)).hexdigest(),
+            tuple(sim_args),
+            effective_arch,
+            effective_os,
+            entry_off,
+        )
+        preflight_res = self._salsa_preflight_cache.get(pf_key)
+        if preflight_res is None:
+            if effective_arch == "x86_64":
+                preflight_res = self.sandbox.emulate_x86_64(
+                    combined_code,
+                    args=sim_args,
+                    abi="windows" if effective_os == "windows" else "system_v",
+                    start_offset=entry_off,
+                )
+            else:
+                preflight_res = self.sandbox.emulate_arm64(
+                    combined_code,
+                    args=sim_args,
+                    start_offset=entry_off,
+                )
+            self._salsa_preflight_cache[pf_key] = preflight_res
+
         if effective_arch == "x86_64":
-            preflight_res = self.sandbox.emulate_x86_64(
-                combined_code,
-                args=sim_args,
-                abi="windows" if effective_os == "windows" else "system_v",
-                start_offset=entry_off,
-            )
             results["stages"]["preflight_safety"] = {
                 "is_safe_for_silicon": preflight_res.is_safe_for_silicon,
                 "simulated_return_value": preflight_res.return_value,
@@ -1143,11 +1211,6 @@ class OmniRepoCompiler:
                 "target_arch": "x86_64",
             }
         else:
-            preflight_res = self.sandbox.emulate_arm64(
-                combined_code,
-                args=sim_args,
-                start_offset=entry_off,
-            )
             results["stages"]["preflight_safety"] = {
                 "is_safe_for_silicon": preflight_res.is_safe_for_silicon,
                 "simulated_return_value": preflight_res.return_value,

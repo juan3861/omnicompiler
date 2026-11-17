@@ -43,8 +43,8 @@ class TestAlphaC38CliAndTop100CeilingAudit(unittest.TestCase):
     def test_02_top100_ceiling_audit_16_gears_and_benchmarks(self):
         report = run_top100_ceiling_audit(refresh_github=False)
         self.assertEqual(report["top100_count"], 100)
-        self.assertEqual(report["omnicompiler_gear_score"], 16)
-        self.assertEqual(report["max_gear_score"], 16)
+        self.assertEqual(report["omnicompiler_gear_score"], 18)
+        self.assertEqual(report["max_gear_score"], 18)
         self.assertTrue(all(g["active"] for g in report["gears"]), report["gears"])
 
         bench = report["benchmarks"]

@@ -20,8 +20,8 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 EVIDENCE_DIR = os.path.join(REPO_ROOT, "engineering_evidence")
-DEFAULT_C38_JSON = os.path.join(EVIDENCE_DIR, "GITHUB_TOP_100_FINAL_AUDIT_C38.json")
-FALLBACK_C35_JSON = os.path.join(EVIDENCE_DIR, "GITHUB_TOP_100_BENCHMARK_C35.json")
+DEFAULT_C38_JSON = os.path.join(EVIDENCE_DIR, "GITHUB_TOP_100_SENIOR_AUDIT_C39.json")
+FALLBACK_C35_JSON = os.path.join(EVIDENCE_DIR, "GITHUB_TOP_100_FINAL_AUDIT_C38.json")
 DEFAULT_C38_MD = os.path.join(EVIDENCE_DIR, "TOP100_FINAL_CEILING_AUDIT_C38.md")
 
 
@@ -114,13 +114,14 @@ def probe_omnicompiler_16_gears() -> List[Dict[str, Any]]:
     from compiler.binary_emitter import StandaloneBinaryEmitter
     from compiler.debug_info_emitter import DwarfV5Emitter, emit_win64_pdata_xdata
     from compiler.audit_ledger import verify_audit_ledger
-    from validation.ssa_translation_validator import VerifiedPassRunner
+    from validation.ssa_translation_validator import VerifiedPassRunner, SSATranslationValidator, canonical_ssa_digest
     from validation.backend_translation_validator import BackendTranslationValidator
     from validation.biabduction_verifier import BiAbductionVerifier
     from validation.assembly_invariant_auditor import AssemblyInvariantAuditor
     from validation.silicon_safety_sandbox import SiliconSafetySandbox
     from orchestrator.salsa_query_engine import SalsaQueryEngine
     from frontends.polyglot_ssa_lowering import SUPPORTED_POLYGLOT_EXTENSIONS
+    from omni_repo_compiler import OmniRepoCompiler
 
     llvm_b = LLVMBackend()
     wasm_b = WasmBackend()
@@ -128,6 +129,7 @@ def probe_omnicompiler_16_gears() -> List[Dict[str, Any]]:
     sbx = SiliconSafetySandbox()
     biab = BiAbductionVerifier()
     ncg_arm = NativeCodeGenerator(arch="arm64", target_os="linux")
+    comp_probe = OmniRepoCompiler()
 
     gears = [
         ("G01", "Polyglot Multi-Repo Fusion", set(SUPPORTED_POLYGLOT_EXTENSIONS) >= {".rs", ".go", ".ts"}, "Rust/Go/TS/Python unified AST -> binary"),
@@ -146,6 +148,8 @@ def probe_omnicompiler_16_gears() -> List[Dict[str, Any]]:
         ("G14", "Standalone PE/ELF/Mach-O + OS CDLL", (hasattr(StandaloneBinaryEmitter, "build_pe64_dll") or hasattr(StandaloneBinaryEmitter, "build_pe_dll")) and (hasattr(StandaloneBinaryEmitter, "build_elf64_so") or hasattr(StandaloneBinaryEmitter, "build_elf_so")), "Zero external linker required"),
         ("G15", "DWARF v5, Win64 .pdata & Unicorn", hasattr(DwarfV5Emitter, "emit_debug_line") and callable(emit_win64_pdata_xdata) and hasattr(sbx, "emulate_x86_64"), "Real silicon emulation pre-flight"),
         ("G16", "HMAC Merkle Ledger & Asm Auditor", callable(verify_audit_ledger) and hasattr(AssemblyInvariantAuditor, "audit_function_code"), "Tamper-evident build attestation"),
+        ("G17", "Z3 Proof Cache & Canonical SSA", callable(canonical_ssa_digest) and hasattr(SSATranslationValidator, "_PROOF_CACHE"), "SHA-256 memoized SMT equivalence proofs"),
+        ("G18", "Salsa Full-Stack Artifact Cache", hasattr(comp_probe, "_salsa_obj_cache") and hasattr(comp_probe, "_salsa_bounds_cache") and hasattr(comp_probe, "_salsa_preflight_cache"), "AST + CPG + Z3 + Object + Unicorn incremental cache"),
     ]
     return [
         {"id": gid, "name": gname, "active": bool(ok), "details": desc}

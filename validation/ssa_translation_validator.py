@@ -23,12 +23,33 @@ Alive2-style symbolic equivalence verifier for Omni-SSA IR optimization passes:
      semantic equivalence.
 """
 
+import hashlib
 import struct
+import threading
 from typing import Dict, List, Set, Tuple, Any, Optional, Callable
 import z3
 
 from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar
 from compiler.ip_sccp_gvn import clone_ssa_function
+
+
+def canonical_ssa_digest(fn: SSAFunction) -> str:
+    """Computes a deterministic SHA-256/structural digest of an SSAFunction."""
+    h = hashlib.sha256()
+    h.update(repr((
+        fn.name,
+        tuple(fn.params),
+        tuple(sorted((getattr(fn, "param_types", {}) or {}).items())),
+        getattr(fn, "return_type", "i64"),
+        tuple(sorted((getattr(fn, "luts", {}) or {}).items())),
+    )).encode("utf-8"))
+    for blk in fn.blocks:
+        h.update(blk.name.encode("utf-8"))
+        for phi in blk.phi_nodes:
+            h.update(repr(("phi", str(phi.result), [str(o) for o in phi.operands])).encode("utf-8"))
+        for ins in blk.instructions:
+            h.update(repr((str(ins.result), ins.opcode, [str(o) for o in ins.operands])).encode("utf-8"))
+    return h.hexdigest()
 
 
 SUPPORTED_Z3_OPCODES = frozenset({
@@ -56,6 +77,10 @@ class SSATranslationValidator:
     and proves semantic equivalence before and after optimization passes.
     """
 
+    _PROOF_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    _PROOF_CACHE_LOCK = threading.Lock()
+    _PROOF_CACHE_MAX = 4096
+
     def __init__(
         self,
         enable_memory_theory: bool = False,
@@ -69,6 +94,8 @@ class SSATranslationValidator:
         self.enable_inductive_loops = bool(enable_inductive_loops)
         self.enable_call_congruence = bool(enable_call_congruence)
         self.enable_float_theory = bool(enable_float_theory)
+        self.proof_cache_hits = 0
+        self.proof_cache_misses = 0
 
     def _topological_blocks(self, fn: SSAFunction) -> Optional[List[BasicBlock]]:
         """
@@ -2473,6 +2500,38 @@ class SSATranslationValidator:
         Proves semantic equivalence between `ssa_before` and `ssa_after` via Z3 QF_BV / QF_ABV
         (acyclic, bounded unrolling, or unbounded 1-inductive loop bisimulation).
         """
+        cache_key = (
+            canonical_ssa_digest(ssa_before),
+            canonical_ssa_digest(ssa_after),
+            self.enable_memory_theory,
+            self.max_loop_unroll,
+            self.enable_inductive_loops,
+            self.enable_call_congruence,
+            self.enable_float_theory,
+        )
+        with self._PROOF_CACHE_LOCK:
+            cached = self._PROOF_CACHE.get(cache_key)
+        if cached is not None:
+            self.proof_cache_hits += 1
+            res_copy = dict(cached)
+            res_copy["cached"] = True
+            return res_copy
+
+        self.proof_cache_misses += 1
+        res = self._verify_equivalence_uncached(ssa_before, ssa_after, timeout_ms=timeout_ms)
+        if not str(res.get("status", "")).startswith("UNKNOWN"):
+            with self._PROOF_CACHE_LOCK:
+                if len(self._PROOF_CACHE) >= self._PROOF_CACHE_MAX:
+                    self._PROOF_CACHE.clear()
+                self._PROOF_CACHE[cache_key] = dict(res)
+        return res
+
+    def _verify_equivalence_uncached(
+        self,
+        ssa_before: SSAFunction,
+        ssa_after: SSAFunction,
+        timeout_ms: int = 2000,
+    ) -> Dict[str, Any]:
         if len(ssa_before.params) != len(ssa_after.params):
             return {
                 "proven": False,
