@@ -397,10 +397,10 @@ class BinaryStructureAuditor:
             strsz = None
             syment = 24
             dynamic_offset = None
-            load_vaddr = 0
+            load_vaddr: Optional[int] = None
 
             for seg in elf.iter_segments():
-                if seg["p_type"] == "PT_LOAD" and load_vaddr == 0:
+                if seg["p_type"] == "PT_LOAD" and load_vaddr is None:
                     load_vaddr = seg["p_vaddr"]
                 elif seg["p_type"] == "PT_DYNAMIC":
                     dynamic_offset = seg["p_offset"]
@@ -414,7 +414,7 @@ class BinaryStructureAuditor:
                         elif tag.entry.d_tag == "DT_SYMENT":
                             syment = tag.entry.d_val
 
-            if strtab_vaddr and symtab_vaddr and strsz and load_vaddr:
+            if strtab_vaddr is not None and symtab_vaddr is not None and strsz is not None and load_vaddr is not None:
                 strtab_offset = strtab_vaddr - load_vaddr
                 symtab_offset = symtab_vaddr - load_vaddr
                 strtab = elf_bytes[strtab_offset:strtab_offset + strsz]
