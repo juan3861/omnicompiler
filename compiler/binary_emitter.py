@@ -123,7 +123,7 @@ class StandaloneBinaryEmitter:
     IMAGE_BASE_PE = 0x140000000
     IMAGE_BASE_DLL = 0x180000000
     VADDR_ELF = 0x400000
-    VADDR_SO = 0x100000
+    VADDR_SO = 0
 
     def __init__(self):
         self.host_os = "windows" if sys.platform == "win32" else "linux"

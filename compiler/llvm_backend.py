@@ -59,8 +59,8 @@ class LLVMBackend:
                 llvm.initialize_native_target()
                 llvm.initialize_native_asmprinter()
                 target = llvm.Target.from_default_triple()
-                self._target_machine = target.create_target_machine(opt=self.opt_level)
-                self._obj_target_machine = target.create_target_machine(opt=self.opt_level, codemodel="small")
+                self._target_machine = target.create_target_machine(opt=self.opt_level, reloc="pic")
+                self._obj_target_machine = target.create_target_machine(opt=self.opt_level, reloc="pic", codemodel="small")
                 self._initialized = True
             except Exception:
                 self._initialized = False

@@ -32,8 +32,6 @@ def _unload_cdll(lib: ctypes.CDLL) -> None:
         return
     if sys.platform == "win32":
         _ctypes.FreeLibrary(handle)
-    elif hasattr(_ctypes, "dlclose"):
-        _ctypes.dlclose(handle)
 
 
 def collect_top100_github_repos(output_json: str = DEFAULT_C38_JSON) -> Dict[str, Any]:

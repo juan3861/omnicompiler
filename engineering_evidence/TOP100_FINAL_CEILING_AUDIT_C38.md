@@ -3,8 +3,8 @@
 - **GitHub Top-100 Catalog Audited:** 100 repositories
 - **OmniCompiler Active Gear Score:** **16/16**
 - **Throughput Parity (`n=20000`):** Native=600110000, LLVM=600110000, CPython=600110000 (`parity_ok=True`)
-- **Execution Latency:** CPython `3.7096 ms` | Native `0.3033 ms` (`12.23x`) | LLVM O3 `0.0853 ms` (`43.49x`)
-- **Incremental Salsa Cache:** Cold `99.54 ms` (`misses=1`) -> Warm `99.81 ms` (`hits=1`, `1.0x`)
+- **Execution Latency:** CPython `9.0168 ms` | Native `0.3019 ms` (`29.87x`) | LLVM O3 `0.0879 ms` (`102.58x`)
+- **Incremental Salsa Cache:** Cold `245.15 ms` (`misses=1`) -> Warm `2300.06 ms` (`hits=1`, `0.11x`)
 
 ## 1. OmniCompiler 16-Gear Engineering Verification Matrix
 | ID | Gear | Status | Capability |
