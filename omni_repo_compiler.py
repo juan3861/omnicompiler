@@ -39,8 +39,10 @@ from compiler.audit_ledger import create_compilation_audit_ledger, save_audit_le
 
 NATIVE_BUILTIN_CALLS = frozenset({
     "abs", "min", "max", "int", "float", "range", "len",
-    "load_i32", "store_i32", "load_f32", "store_f32",
-    "load_i64", "store_i64", "load_f64", "store_f64",
+    "load_i8", "store_i8", "load_u8", "store_u8",
+    "load_i16", "store_i16", "load_u16", "store_u16",
+    "load_i32", "store_i32", "load_u32", "store_u32", "load_f32", "store_f32",
+    "load_i64", "store_i64", "load_u64", "store_u64", "load_f64", "store_f64",
     "omni_alloc", "omni_list_new", "omni_list_len", "omni_list_get", "omni_list_set", "omni_list_append",
     "omni_dict_new", "omni_dict_set", "omni_dict_get", "omni_dict_len",
     "omni_item_get", "omni_item_set", "omni_item_len",
@@ -257,11 +259,13 @@ class OmniRepoCompiler:
 
         from compiler.ssa_ir import AstToSsaLowering
         struct_extractor = AstToSsaLowering()
+        all_cls_stmts: List[ast.stmt] = []
         for m, (mods, f_map, alias_map) in zip(manifests, scanned):
             for _fpath, mod_ast in mods:
                 for node in getattr(mod_ast, "body", []):
                     if isinstance(node, ast.ClassDef):
-                        struct_extractor.register_struct_from_classdef(node)
+                        all_cls_stmts.append(node)
+        struct_extractor.register_structs_from_statements(all_cls_stmts)
         global_struct_layouts.update(struct_extractor.struct_layouts)
 
         for m, (mods, f_map, alias_map) in zip(manifests, scanned):

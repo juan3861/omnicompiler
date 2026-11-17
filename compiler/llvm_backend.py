@@ -349,10 +349,21 @@ class LLVMBackend:
                     gep_v = next_aux("gepb")
                     lines.append(f"    {ptr_v} = inttoptr i64 {base_op} to ptr")
                     lines.append(f"    {gep_v} = getelementptr i8, ptr {ptr_v}, i64 {off_op}")
-                    if width == "i32":
+                    if width in ("i8", "u8"):
+                        w8 = next_aux("ld8")
+                        ext_op = "sext" if width == "i8" else "zext"
+                        lines.append(f"    {w8} = load i8, ptr {gep_v}, align 1")
+                        lines.append(f"    {lhs} = {ext_op} i8 {w8} to i64")
+                    elif width in ("i16", "u16"):
+                        w16 = next_aux("ld16")
+                        ext_op = "sext" if width == "i16" else "zext"
+                        lines.append(f"    {w16} = load i16, ptr {gep_v}, align 1")
+                        lines.append(f"    {lhs} = {ext_op} i16 {w16} to i64")
+                    elif width in ("i32", "u32"):
                         w32 = next_aux("ld32")
+                        ext_op = "sext" if width == "i32" else "zext"
                         lines.append(f"    {w32} = load i32, ptr {gep_v}, align 1")
-                        lines.append(f"    {lhs} = sext i32 {w32} to i64")
+                        lines.append(f"    {lhs} = {ext_op} i32 {w32} to i64")
                     elif width == "f32":
                         f32 = next_aux("ldf32")
                         lines.append(f"    {f32} = load float, ptr {gep_v}, align 1")
@@ -372,7 +383,15 @@ class LLVMBackend:
                     gep_v = next_aux("gepb")
                     lines.append(f"    {ptr_v} = inttoptr i64 {base_op} to ptr")
                     lines.append(f"    {gep_v} = getelementptr i8, ptr {ptr_v}, i64 {off_op}")
-                    if width == "i32":
+                    if width in ("i8", "u8"):
+                        t8 = next_aux("tr8")
+                        lines.append(f"    {t8} = trunc i64 {val_op} to i8")
+                        lines.append(f"    store i8 {t8}, ptr {gep_v}, align 1")
+                    elif width in ("i16", "u16"):
+                        t16 = next_aux("tr16")
+                        lines.append(f"    {t16} = trunc i64 {val_op} to i16")
+                        lines.append(f"    store i16 {t16}, ptr {gep_v}, align 1")
+                    elif width in ("i32", "u32"):
                         t32 = next_aux("tr32")
                         lines.append(f"    {t32} = trunc i64 {val_op} to i32")
                         lines.append(f"    store i32 {t32}, ptr {gep_v}, align 1")

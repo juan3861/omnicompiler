@@ -865,7 +865,7 @@ class _PolyglotParser:
         ):
             return "ptr_f64"
         for tok in reversed(captured):
-            if tok in self.declared_structs:
+            if tok in self.declared_structs or (tok[:1].isupper() and tok not in ("Array", "Slice", "Vec", "Box")):
                 return tok
         return None
 
@@ -894,7 +894,7 @@ class _PolyglotParser:
         ):
             return "ptr_f64"
         for tok in reversed(captured):
-            if tok in self.declared_structs:
+            if tok in self.declared_structs or (tok[:1].isupper() and tok not in ("Array", "Slice", "Vec", "Box")):
                 return tok
         return None
 
@@ -916,7 +916,7 @@ class _PolyglotParser:
                 arg=p,
                 annotation=(
                     ast.Name(id=pt_map[p], ctx=ast.Load(), lineno=line)
-                    if (pt_map.get(p) in ("float", "ptr_f64") or pt_map.get(p) in self.declared_structs)
+                    if (pt_map.get(p) in ("float", "ptr_f64") or pt_map.get(p) in self.declared_structs or (isinstance(pt_map.get(p), str) and pt_map[p][:1].isupper()))
                     else None
                 ),
             )
@@ -1145,28 +1145,40 @@ class _PolyglotParser:
                 "<<=": ast.LShift(),
                 ">>=": ast.RShift(),
             }
+            # Dotted struct field chains: ident(.attr)+ (= | := | augop) expr
+            k_la = 1
             if (
-                nxt.kind == "OP"
-                and nxt.val == "."
-                and self._peek(2).kind == "ID"
-                and self._peek(3).kind == "OP"
-                and (self._peek(3).val in ("=", ":=") or self._peek(3).val in aug_map)
+                self._peek(k_la).kind == "OP"
+                and self._peek(k_la).val == "."
+                and self._peek(k_la + 1).kind == "ID"
             ):
-                ident = self._advance()
-                self._advance()
-                attr_tok = self._advance()
-                op_tok = self._advance()
-                val = self._parse_expr()
-                semi = self._consume_optional_semi() if consume_semi else False
-                target_attr = ast.Attribute(
-                    value=ast.Name(id=ident.val, ctx=ast.Load(), lineno=line),
-                    attr=attr_tok.val,
-                    ctx=ast.Store(),
-                    lineno=line,
-                )
-                if op_tok.val in ("=", ":="):
-                    return ast.Assign(targets=[target_attr], value=val, lineno=line), semi
-                return ast.AugAssign(target=target_attr, op=aug_map[op_tok.val], value=val, lineno=line), semi
+                while (
+                    self._peek(k_la).kind == "OP"
+                    and self._peek(k_la).val == "."
+                    and self._peek(k_la + 1).kind == "ID"
+                ):
+                    k_la += 2
+                end_tok = self._peek(k_la)
+                if end_tok.kind == "OP" and (end_tok.val in ("=", ":=") or end_tok.val in aug_map):
+                    ident = self._advance()
+                    target_expr: ast.expr = ast.Name(id=ident.val, ctx=ast.Load(), lineno=line)
+                    while self._at("OP", ".") and self._peek(1).kind == "ID":
+                        self._advance()
+                        attr_tok = self._advance()
+                        target_expr = ast.Attribute(
+                            value=target_expr,
+                            attr=attr_tok.val,
+                            ctx=ast.Load(),
+                            lineno=line,
+                        )
+                    if isinstance(target_expr, ast.Attribute):
+                        target_expr.ctx = ast.Store()
+                    op_tok = self._advance()
+                    val = self._parse_expr()
+                    semi = self._consume_optional_semi() if consume_semi else False
+                    if op_tok.val in ("=", ":="):
+                        return ast.Assign(targets=[target_expr], value=val, lineno=line), semi
+                    return ast.AugAssign(target=target_expr, op=aug_map[op_tok.val], value=val, lineno=line), semi
 
             if nxt.kind == "OP" and nxt.val in (":=", "="):
                 ident = self._advance()

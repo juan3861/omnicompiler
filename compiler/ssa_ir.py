@@ -271,21 +271,50 @@ class AstToSsaLowering:
         self._fn: Optional[SSAFunction] = None
         self._cur_block: Optional[BasicBlock] = None
         self.struct_layouts: Dict[str, Dict[str, Tuple[int, str]]] = dict(struct_layouts or {})
+        self.struct_meta: Dict[str, Tuple[int, int]] = {}
         self._var_struct_types: Dict[str, str] = {}
 
-    @staticmethod
-    def _normalize_cabi_type(ann: Optional[ast.AST]) -> Optional[str]:
+    _CABI_SIZE_ALIGN: Dict[str, Tuple[int, int]] = {
+        "i8": (1, 1), "u8": (1, 1),
+        "i16": (2, 2), "u16": (2, 2),
+        "i32": (4, 4), "u32": (4, 4), "f32": (4, 4),
+        "i64": (8, 8), "u64": (8, 8), "f64": (8, 8), "ptr": (8, 8),
+    }
+
+    def _normalize_cabi_type(self, ann: Optional[ast.AST]) -> Optional[str]:
         if isinstance(ann, ast.Name):
             mp = {
-                "i8": "i8", "u8": "u8", "i16": "i16", "u16": "u16",
-                "i32": "i32", "u32": "u32", "int32": "i32",
+                "i8": "i8", "u8": "u8", "int8": "i8", "uint8": "u8",
+                "i16": "i16", "u16": "u16", "int16": "i16", "uint16": "u16",
+                "i32": "i32", "u32": "u32", "int32": "i32", "uint32": "u32",
                 "f32": "f32", "float32": "f32",
-                "i64": "i64", "u64": "u64", "int64": "i64", "int": "i64",
+                "i64": "i64", "u64": "u64", "int64": "i64", "uint64": "u64", "int": "i64",
                 "f64": "f64", "float64": "f64", "double": "f64", "float": "f64",
                 "ptr": "ptr", "pointer": "ptr",
             }
-            return mp.get(ann.id)
+            if ann.id in mp:
+                return mp[ann.id]
+            if ann.id in self.struct_layouts:
+                return ann.id
         return None
+
+    def _get_type_size_align(self, ft: str) -> Tuple[int, int]:
+        if ft in self._CABI_SIZE_ALIGN:
+            return self._CABI_SIZE_ALIGN[ft]
+        if ft in self.struct_meta:
+            return self.struct_meta[ft]
+        if ft in self.struct_layouts:
+            max_al = 1
+            max_end = 0
+            for _, (off, sub_ft) in self.struct_layouts[ft].items():
+                sz, al = self._get_type_size_align(sub_ft)
+                max_al = max(max_al, al)
+                max_end = max(max_end, off + sz)
+            tail = (max_al - (max_end % max_al)) % max_al if max_end > 0 else 0
+            meta = (max_end + tail, max_al)
+            self.struct_meta[ft] = meta
+            return meta
+        return (8, 8)
 
     def register_struct_from_classdef(self, cls_node: ast.ClassDef) -> Optional[Dict[str, Tuple[int, str]]]:
         fields: List[Tuple[str, str]] = []
@@ -297,29 +326,62 @@ class AstToSsaLowering:
                 fields.append((stmt.target.id, ft))
         if not fields:
             return None
-        size_align = {
-            "i8": (1, 1), "u8": (1, 1),
-            "i16": (2, 2), "u16": (2, 2),
-            "i32": (4, 4), "u32": (4, 4), "f32": (4, 4),
-            "i64": (8, 8), "u64": (8, 8), "f64": (8, 8), "ptr": (8, 8),
-        }
         cur_off = 0
+        max_al = 1
         layout: Dict[str, Tuple[int, str]] = {}
         for fname, ft in fields:
-            sz, al = size_align.get(ft, (8, 8))
+            sz, al = self._get_type_size_align(ft)
+            max_al = max(max_al, al)
             pad = (al - (cur_off % al)) % al
             cur_off += pad
             layout[fname] = (cur_off, ft)
             cur_off += sz
+        tail_pad = (max_al - (cur_off % max_al)) % max_al
         self.struct_layouts[cls_node.name] = layout
+        self.struct_meta[cls_node.name] = (cur_off + tail_pad, max_al)
         return layout
 
-    def _resolve_struct_field(self, base_node: ast.AST, attr_name: str) -> Optional[Tuple[int, str]]:
-        if isinstance(base_node, ast.Name):
-            sname = self._var_struct_types.get(base_node.id)
-            if sname and sname in self.struct_layouts:
-                return self.struct_layouts[sname].get(attr_name)
-        return None
+    def register_structs_from_statements(self, stmts: List[ast.stmt]) -> None:
+        """Fixpoint-registers ClassDef struct layouts so nested and out-of-order definitions resolve cleanly."""
+        cls_nodes = [s for s in stmts if isinstance(s, ast.ClassDef)]
+        if not cls_nodes:
+            return
+        for _ in range(len(cls_nodes) + 1):
+            changed = False
+            for cls_n in cls_nodes:
+                if cls_n.name not in self.struct_layouts:
+                    if self.register_struct_from_classdef(cls_n) is not None:
+                        changed = True
+            if not changed:
+                break
+
+    def _resolve_struct_field(self, base_node: ast.AST, attr_name: str) -> Optional[Tuple[ast.Name, int, str]]:
+        attrs: List[str] = [attr_name]
+        cur: ast.AST = base_node
+        while isinstance(cur, ast.Attribute):
+            attrs.append(cur.attr)
+            cur = cur.value
+        if not isinstance(cur, ast.Name):
+            return None
+        attrs.reverse()
+        sname = self._var_struct_types.get(cur.id)
+        total_off = 0
+        leaf_wt: Optional[str] = None
+        for idx, a_nm in enumerate(attrs):
+            if not sname or sname not in self.struct_layouts:
+                return None
+            entry = self.struct_layouts[sname].get(a_nm)
+            if entry is None:
+                return None
+            f_off, f_wt = entry
+            total_off += f_off
+            if idx + 1 < len(attrs):
+                sname = f_wt
+            else:
+                leaf_wt = f_wt
+        if leaf_wt is None or leaf_wt in self.struct_layouts:
+            return None
+        return (cur, total_off, leaf_wt)
 
     def _next_var(self, name: str, var_type: str = "i64") -> SSAVar:
         v = self.var_versions.get(name, 0) + 1
@@ -728,8 +790,12 @@ class AstToSsaLowering:
                 isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Name)
                 and n.func.id in (
-                    "load_i32", "store_i32", "load_f32", "store_f32",
-                    "load_i64", "store_i64", "load_f64", "store_f64",
+                    "load_i8", "store_i8", "load_u8", "store_u8",
+                    "load_i16", "store_i16", "load_u16", "store_u16",
+                    "load_i32", "store_i32", "load_u32", "store_u32",
+                    "load_f32", "store_f32",
+                    "load_i64", "store_i64", "load_u64", "store_u64",
+                    "load_f64", "store_f64",
                     "omni_ffi_call0_f64", "omni_ffi_call1_f64", "omni_ffi_call2_f64",
                 )
             )
@@ -872,8 +938,8 @@ class AstToSsaLowering:
             elif isinstance(stmt.target, ast.Attribute):
                 finfo = self._resolve_struct_field(stmt.target.value, stmt.target.attr)
                 if finfo is not None:
-                    f_off, f_wt = finfo
-                    base_var = self._lower_expr(stmt.target.value)
+                    root_node, f_off, f_wt = finfo
+                    base_var = self._lower_expr(root_node)
                     off_v = self._emit_const(f_off, line=line)
                     loaded = self._next_var("fld", var_type="f64" if f_wt in ("f32", "f64") else "i64")
                     self._emit(loaded, "load_off", [base_var, off_v, f_wt], line=line)
@@ -1187,8 +1253,8 @@ class AstToSsaLowering:
         elif isinstance(target, ast.Attribute):
             finfo = self._resolve_struct_field(target.value, target.attr)
             if finfo is not None:
-                f_off, f_wt = finfo
-                base_var = self._lower_expr(target.value)
+                root_node, f_off, f_wt = finfo
+                base_var = self._lower_expr(root_node)
                 off_v = self._emit_const(f_off, line=line)
                 if f_wt in ("f32", "f64") and val.var_type != "f64":
                     val = self._promote_to_f64(val, line=line)
@@ -1383,8 +1449,8 @@ class AstToSsaLowering:
         elif isinstance(node, ast.Attribute):
             finfo = self._resolve_struct_field(node.value, node.attr)
             if finfo is not None:
-                f_off, f_wt = finfo
-                base_var = self._lower_expr(node.value)
+                root_node, f_off, f_wt = finfo
+                base_var = self._lower_expr(root_node)
                 off_v = self._emit_const(f_off, line=line)
                 res = self._next_var("fld", var_type="f64" if f_wt in ("f32", "f64") else "i64")
                 self._emit(res, "load_off", [base_var, off_v, f_wt], line=line)
@@ -1459,14 +1525,22 @@ class AstToSsaLowering:
                 elif fname == "float" and len(node.args) == 1:
                     av = self._lower_expr(node.args[0])
                     return self._promote_to_f64(av, line=line)
-                elif fname in ("load_i32", "load_f32", "load_i64", "load_f64") and len(node.args) == 2:
+                elif fname in (
+                    "load_i8", "load_u8", "load_i16", "load_u16",
+                    "load_i32", "load_u32", "load_f32",
+                    "load_i64", "load_u64", "load_f64",
+                ) and len(node.args) == 2:
                     wt = fname.split("_", 1)[1]
                     bp = self._lower_expr(node.args[0])
                     bo = self._lower_expr(node.args[1])
                     res = self._next_var("ldw", var_type="f64" if wt in ("f32", "f64") else "i64")
                     self._emit(res, "load_off", [bp, bo, wt], line=line)
                     return res
-                elif fname in ("store_i32", "store_f32", "store_i64", "store_f64") and len(node.args) == 3:
+                elif fname in (
+                    "store_i8", "store_u8", "store_i16", "store_u16",
+                    "store_i32", "store_u32", "store_f32",
+                    "store_i64", "store_u64", "store_f64",
+                ) and len(node.args) == 3:
                     wt = fname.split("_", 1)[1]
                     bp = self._lower_expr(node.args[0])
                     bo = self._lower_expr(node.args[1])
@@ -1819,9 +1893,7 @@ def lower_ast_to_ssa(
     """Lowers an AST FunctionDef, Module (first FunctionDef), or expression into Omni-SSA."""
     lowering = AstToSsaLowering(struct_layouts=struct_layouts)
     if isinstance(node, ast.Module):
-        for stmt in node.body:
-            if isinstance(stmt, ast.ClassDef):
-                lowering.register_struct_from_classdef(stmt)
+        lowering.register_structs_from_statements(node.body)
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef):
                 fn = lowering.lower_function_def(stmt)
@@ -1842,9 +1914,7 @@ def lower_source_to_ssa(
     """Parses Python source code and lowers the target function (or expression) into Omni-SSA."""
     tree = ast.parse(source_code)
     lowering = AstToSsaLowering(struct_layouts=struct_layouts)
-    for stmt in tree.body:
-        if isinstance(stmt, ast.ClassDef):
-            lowering.register_struct_from_classdef(stmt)
+    lowering.register_structs_from_statements(tree.body)
     for stmt in tree.body:
         if isinstance(stmt, ast.FunctionDef):
             if fn_name is None or stmt.name == fn_name:

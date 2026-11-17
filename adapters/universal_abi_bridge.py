@@ -22,26 +22,31 @@ ABI_REGISTERS = {
 class StructField:
     __slots__ = ("name", "field_type", "size", "alignment", "offset")
 
-    def __init__(self, name: str, field_type: str):
+    def __init__(self, name: str, field_type: str, nested_layouts: Optional[Dict[str, "StructLayout"]] = None):
         self.name = name
         self.field_type = field_type
-        type_table = {
-            "i8": (1, 1), "u8": (1, 1),
-            "i16": (2, 2), "u16": (2, 2),
-            "i32": (4, 4), "u32": (4, 4), "f32": (4, 4),
-            "i64": (8, 8), "u64": (8, 8), "f64": (8, 8), "ptr": (8, 8)
-        }
-        size, align = type_table.get(field_type, (8, 8))
-        self.size = size
-        self.alignment = align
+        if nested_layouts and field_type in nested_layouts:
+            sub = nested_layouts[field_type]
+            self.size = sub.total_size
+            self.alignment = sub.struct_alignment
+        else:
+            type_table = {
+                "i8": (1, 1), "u8": (1, 1),
+                "i16": (2, 2), "u16": (2, 2),
+                "i32": (4, 4), "u32": (4, 4), "f32": (4, 4),
+                "i64": (8, 8), "u64": (8, 8), "f64": (8, 8), "ptr": (8, 8)
+            }
+            size, align = type_table.get(field_type, (8, 8))
+            self.size = size
+            self.alignment = align
         self.offset = 0
 
 
 class StructLayout:
     """Computes exact C-ABI struct layout with padding and natural alignment."""
 
-    def __init__(self, fields: List[Tuple[str, str]]):
-        self.fields: List[StructField] = [StructField(name, ftype) for name, ftype in fields]
+    def __init__(self, fields: List[Tuple[str, str]], nested_layouts: Optional[Dict[str, "StructLayout"]] = None):
+        self.fields: List[StructField] = [StructField(name, ftype, nested_layouts=nested_layouts) for name, ftype in fields]
         self.total_size = 0
         self.struct_alignment = 1
         self._compute_layout()

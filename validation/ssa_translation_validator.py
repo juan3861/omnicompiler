@@ -141,19 +141,29 @@ class SSATranslationValidator:
             ops |= SUPPORTED_Z3_FLOAT_OPCODES
         return frozenset(ops)
 
-    @staticmethod
-    def _load_off_z3(raw_bv: z3.BitVecRef, width: str) -> z3.BitVecRef:
-        if width == "i32":
-            return z3.SignExt(32, z3.Extract(31, 0, raw_bv))
+    _INT_WIDTH_SPEC = {
+        "i8": (8, True), "u8": (8, False),
+        "i16": (16, True), "u16": (16, False),
+        "i32": (32, True), "u32": (32, False),
+    }
+
+    @classmethod
+    def _load_off_z3(cls, raw_bv: z3.BitVecRef, width: str) -> z3.BitVecRef:
+        if width in cls._INT_WIDTH_SPEC:
+            bits, is_signed = cls._INT_WIDTH_SPEC[width]
+            ext = 64 - bits
+            sub = z3.Extract(bits - 1, 0, raw_bv)
+            return z3.SignExt(ext, sub) if is_signed else z3.ZeroExt(ext, sub)
         if width == "f32":
             f32_val = z3.fpBVToFP(z3.Extract(31, 0, raw_bv), z3.Float32())
             return z3.fpToIEEEBV(z3.fpToFP(z3.RNE(), f32_val, z3.Float64()))
         return raw_bv
 
-    @staticmethod
-    def _store_off_z3(val_bv: z3.BitVecRef, width: str) -> z3.BitVecRef:
-        if width == "i32":
-            return z3.ZeroExt(32, z3.Extract(31, 0, val_bv))
+    @classmethod
+    def _store_off_z3(cls, val_bv: z3.BitVecRef, width: str) -> z3.BitVecRef:
+        if width in cls._INT_WIDTH_SPEC:
+            bits, _ = cls._INT_WIDTH_SPEC[width]
+            return z3.ZeroExt(64 - bits, z3.Extract(bits - 1, 0, val_bv))
         if width == "f32":
             f64_val = z3.fpBVToFP(val_bv, z3.Float64())
             return z3.ZeroExt(32, z3.fpToIEEEBV(z3.fpToFP(z3.RNE(), f64_val, z3.Float32())))
@@ -2532,7 +2542,7 @@ class SSATranslationValidator:
             probe_addrs = [
                 z3.BitVecVal(0x10000 + i * 0x1000 + off, 64)
                 for i in range(len(sym_params))
-                for off in (0, 4, 8, 16)
+                for off in (0, 1, 2, 4, 6, 8, 12, 16, 20, 24)
             ]
             mem_probe_disj = [z3.Select(mem_b, pa) != z3.Select(mem_a, pa) for pa in probe_addrs]
             if is_bounded:

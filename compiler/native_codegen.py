@@ -691,8 +691,18 @@ class X64CodeGenerator:
                     resolve_operand_to_reg(inst.operands[1], "rcx")  # byte offset
                     width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
                     buf.emit(b"\x49\x01\xcb")                        # add r11, rcx
-                    if width == "i32":
+                    if width == "i8":
+                        buf.emit(b"\x49\x0f\xbe\x03")                # movsx rax, byte ptr [r11]
+                    elif width == "u8":
+                        buf.emit(b"\x41\x0f\xb6\x03")                # movzx eax, byte ptr [r11]
+                    elif width == "i16":
+                        buf.emit(b"\x49\x0f\xbf\x03")                # movsx rax, word ptr [r11]
+                    elif width == "u16":
+                        buf.emit(b"\x41\x0f\xb7\x03")                # movzx eax, word ptr [r11]
+                    elif width == "i32":
                         buf.emit(b"\x49\x63\x03")                    # movsxd rax, dword ptr [r11]
+                    elif width == "u32":
+                        buf.emit(b"\x41\x8b\x03")                    # mov eax, dword ptr [r11]
                     elif width == "f32":
                         buf.emit(b"\xf3\x41\x0f\x5a\x03")            # cvtss2sd xmm0, dword ptr [r11]
                         buf.emit(_x64_movq_r64_xmm("rax", 0))
@@ -706,7 +716,11 @@ class X64CodeGenerator:
                     resolve_operand_to_reg(inst.operands[2], "rax")  # value
                     width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
                     buf.emit(b"\x49\x01\xcb")                        # add r11, rcx
-                    if width == "i32":
+                    if width in ("i8", "u8"):
+                        buf.emit(b"\x41\x88\x03")                    # mov byte ptr [r11], al
+                    elif width in ("i16", "u16"):
+                        buf.emit(b"\x66\x41\x89\x03")                # mov word ptr [r11], ax
+                    elif width in ("i32", "u32"):
                         buf.emit(b"\x41\x89\x03")                    # mov dword ptr [r11], eax
                     elif width == "f32":
                         buf.emit(_x64_movq_xmm_r64(0, "rax"))
@@ -1334,8 +1348,18 @@ class Arm64CodeGenerator:
                     load_op(inst.operands[1], 10)  # byte offset in X10
                     width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
                     code.extend(_a64_u32(0x8B0A0129))  # ADD X9, X9, X10
-                    if width == "i32":
+                    if width == "i8":
+                        code.extend(_a64_u32(0x3980012B))  # LDRSB X11, [X9]
+                    elif width == "u8":
+                        code.extend(_a64_u32(0x3940012B))  # LDRB W11, [X9]
+                    elif width == "i16":
+                        code.extend(_a64_u32(0x7980012B))  # LDRSH X11, [X9]
+                    elif width == "u16":
+                        code.extend(_a64_u32(0x7940012B))  # LDRH W11, [X9]
+                    elif width == "i32":
                         code.extend(_a64_u32(0xB980012B))  # LDRSW X11, [X9]
+                    elif width == "u32":
+                        code.extend(_a64_u32(0xB940012B))  # LDR W11, [X9]
                     elif width == "f32":
                         code.extend(_a64_u32(0xBD400120))  # LDR S0, [X9]
                         code.extend(_a64_u32(0x1E22C000))  # FCVT D0, S0
@@ -1349,7 +1373,11 @@ class Arm64CodeGenerator:
                     load_op(inst.operands[2], 11)  # value in X11
                     width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
                     code.extend(_a64_u32(0x8B0A0129))  # ADD X9, X9, X10
-                    if width == "i32":
+                    if width in ("i8", "u8"):
+                        code.extend(_a64_u32(0x3900012B))  # STRB W11, [X9]
+                    elif width in ("i16", "u16"):
+                        code.extend(_a64_u32(0x7900012B))  # STRH W11, [X9]
+                    elif width in ("i32", "u32"):
                         code.extend(_a64_u32(0xB900012B))  # STR W11, [X9]
                     elif width == "f32":
                         code.extend(_a64_u32(0x9E670160))  # FMOV D0, X11

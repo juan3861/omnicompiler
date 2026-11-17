@@ -398,8 +398,13 @@ class WasmBackend:
                     wat_lines.append(f"{indent}{emit_operand(off_op)}")
                     wat_lines.append(f"{indent}i64.add")
                     wat_lines.append(f"{indent}i32.wrap_i64")
-                    if width == "i32":
-                        wat_lines.append(f"{indent}i64.load32_s")
+                    _wasm_load_map = {
+                        "i8": "i64.load8_s", "u8": "i64.load8_u",
+                        "i16": "i64.load16_s", "u16": "i64.load16_u",
+                        "i32": "i64.load32_s", "u32": "i64.load32_u",
+                    }
+                    if width in _wasm_load_map:
+                        wat_lines.append(f"{indent}{_wasm_load_map[width]}")
                     elif width == "f32":
                         wat_lines.append(f"{indent}f32.load")
                         wat_lines.append(f"{indent}f64.promote_f32")
@@ -418,8 +423,13 @@ class WasmBackend:
                     wat_lines.append(f"{indent}i64.add")
                     wat_lines.append(f"{indent}i32.wrap_i64")
                     wat_lines.append(f"{indent}{emit_operand(val_op)}")
-                    if width == "i32":
-                        wat_lines.append(f"{indent}i64.store32")
+                    _wasm_store_map = {
+                        "i8": "i64.store8", "u8": "i64.store8",
+                        "i16": "i64.store16", "u16": "i64.store16",
+                        "i32": "i64.store32", "u32": "i64.store32",
+                    }
+                    if width in _wasm_store_map:
+                        wat_lines.append(f"{indent}{_wasm_store_map[width]}")
                     elif width == "f32":
                         wat_lines.append(f"{indent}f32.demote_f64")
                         wat_lines.append(f"{indent}f32.store")

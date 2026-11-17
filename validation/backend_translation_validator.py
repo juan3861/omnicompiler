@@ -144,9 +144,9 @@ class LLVMIRToSSALifter:
         alias_ptr: Dict[str, Tuple[Any, Any, bool]] = {}  # %ptr/%gep -> (base_op, idx_or_off, is_byte_off)
         alloca_ptrs: Dict[str, SSAVar] = {}
         ext_zext_map: Dict[str, SSAVar] = {}  # %i1_var -> aliased i64 SSAVar
-        trunc_i32_map: Dict[str, Any] = {}
+        trunc_narrow_map: Dict[str, Any] = {}
         fptrunc_f32_map: Dict[str, Any] = {}
-        load_i32_map: Dict[str, Tuple[Any, Any, bool]] = {}
+        load_narrow_map: Dict[str, Tuple[Any, Any, str]] = {}
         load_f32_map: Dict[str, Tuple[Any, Any, bool]] = {}
 
         def ensure_block(label: str) -> BasicBlock:
@@ -211,9 +211,11 @@ class LLVMIRToSSALifter:
                 ln.startswith("store i64 ")
                 or ln.startswith("store double ")
                 or ln.startswith("store i32 ")
+                or ln.startswith("store i16 ")
+                or ln.startswith("store i8 ")
                 or ln.startswith("store float ")
             ):
-                m_st = re.match(r"^store\s+(i64|double|i32|float)\s+([^,]+),\s*ptr\s+(%[A-Za-z0-9_.$]+)", ln)
+                m_st = re.match(r"^store\s+(i64|double|i32|i16|i8|float)\s+([^,]+),\s*ptr\s+(%[A-Za-z0-9_.$]+)", ln)
                 if not m_st:
                     return None, f"UNSUPPORTED_LLVM_STORE_{ln}"
                 st_ty = m_st.group(1)
@@ -224,10 +226,10 @@ class LLVMIRToSSALifter:
                     base_op, idx_op, is_byte_off = get_or_create_var(m_st.group(3)), 0, False
                 else:
                     base_op, idx_op, is_byte_off = pt_entry
-                if st_ty == "i32":
+                if st_ty in ("i8", "i16", "i32"):
                     raw_n = val_tok[1:] if val_tok.startswith("%") else val_tok
-                    val_op = trunc_i32_map.get(raw_n, parse_val(val_tok))
-                    cur_bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "i32"]))
+                    val_op = trunc_narrow_map.get(raw_n, parse_val(val_tok))
+                    cur_bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, st_ty]))
                 elif st_ty == "float":
                     raw_n = val_tok[1:] if val_tok.startswith("%") else val_tok
                     val_op = fptrunc_f32_map.get(raw_n, parse_val(val_tok, as_float=True))
@@ -302,7 +304,7 @@ class LLVMIRToSSALifter:
                 alias_ptr[lhs_name] = (base_op, idx_op, elem_t == "i8")
                 continue
 
-            m_load = re.match(r"^load\s+(i64|double|i32|float),\s*ptr\s+(%[A-Za-z0-9_.$]+)", rhs)
+            m_load = re.match(r"^load\s+(i64|double|i32|i16|i8|float),\s*ptr\s+(%[A-Za-z0-9_.$]+)", rhs)
             if m_load:
                 ld_ty = m_load.group(1)
                 p_name = m_load.group(2)[1:]
@@ -311,8 +313,8 @@ class LLVMIRToSSALifter:
                     base_op, idx_op, is_byte_off = get_or_create_var(m_load.group(2)), 0, False
                 else:
                     base_op, idx_op, is_byte_off = pt_entry
-                if ld_ty == "i32":
-                    load_i32_map[lhs_name] = (base_op, idx_op, is_byte_off)
+                if ld_ty in ("i8", "i16", "i32"):
+                    load_narrow_map[lhs_name] = (base_op, idx_op, ld_ty)
                     continue
                 if ld_ty == "float":
                     load_f32_map[lhs_name] = (base_op, idx_op, is_byte_off)
@@ -327,13 +329,14 @@ class LLVMIRToSSALifter:
                     cur_bb.add_instruction(SSAInstruction(res_v, "load", [base_op, idx_op]))
                 continue
 
-            m_sext = re.match(r"^sext\s+i32\s+(%[A-Za-z0-9_.$]+)\s+to\s+i64$", rhs)
-            if m_sext:
-                src_n = m_sext.group(1)[1:]
-                if src_n in load_i32_map:
-                    base_op, off_op, _ = load_i32_map[src_n]
+            m_ext = re.match(r"^(sext|zext)\s+(i8|i16|i32)\s+(%[A-Za-z0-9_.$]+)\s+to\s+i64$", rhs)
+            if m_ext:
+                ext_kind, ext_ty, src_n = m_ext.group(1), m_ext.group(2), m_ext.group(3)[1:]
+                if src_n in load_narrow_map:
+                    base_op, off_op, _ = load_narrow_map[src_n]
+                    width_lbl = ext_ty if ext_kind == "sext" else ("u" + ext_ty[1:])
                     res_v = get_or_create_var(lhs_tok, var_type="i64")
-                    cur_bb.add_instruction(SSAInstruction(res_v, "load_off", [base_op, off_op, "i32"]))
+                    cur_bb.add_instruction(SSAInstruction(res_v, "load_off", [base_op, off_op, width_lbl]))
                     continue
 
             m_fpext = re.match(r"^fpext\s+float\s+(%[A-Za-z0-9_.$]+)\s+to\s+double$", rhs)
@@ -345,9 +348,9 @@ class LLVMIRToSSALifter:
                     cur_bb.add_instruction(SSAInstruction(res_v, "load_off", [base_op, off_op, "f32"]))
                     continue
 
-            m_trunc = re.match(r"^trunc\s+i64\s+(.+)\s+to\s+i32$", rhs)
+            m_trunc = re.match(r"^trunc\s+i64\s+(.+)\s+to\s+(i8|i16|i32)$", rhs)
             if m_trunc:
-                trunc_i32_map[lhs_name] = parse_val(m_trunc.group(1))
+                trunc_narrow_map[lhs_name] = parse_val(m_trunc.group(1))
                 continue
 
             m_fptrunc = re.match(r"^fptrunc\s+double\s+(.+)\s+to\s+float$", rhs)
@@ -1023,7 +1026,12 @@ class WATToSSALifter:
             else:
                 stack.append(("__wat_ptr__", addr_val, 0))
             return None
-        if ln in ("i64.load", "f64.load", "i64.load32_s", "f32.load"):
+        _wat_ld_widths = {
+            "i64.load8_s": "i8", "i64.load8_u": "u8",
+            "i64.load16_s": "i16", "i64.load16_u": "u16",
+            "i64.load32_s": "i32", "i64.load32_u": "u32",
+        }
+        if ln in ("i64.load", "f64.load", "f32.load") or ln in _wat_ld_widths:
             if not stack:
                 return "WAT_STACK_UNDERFLOW_load"
             addr_tok = stack.pop()
@@ -1032,10 +1040,11 @@ class WATToSSALifter:
             elif isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr__":
                 base_op, idx_op, is_byte = addr_tok[1], addr_tok[2], False
             else:
-                base_op, idx_op, is_byte = addr_tok, 0, (ln in ("i64.load32_s", "f32.load"))
-            if ln == "i64.load32_s":
-                rv = next_var("wld32", var_type="i64")
-                bb.add_instruction(SSAInstruction(rv, "load_off", [base_op, idx_op, "i32"]))
+                base_op, idx_op, is_byte = addr_tok, 0, (ln == "f32.load" or ln in _wat_ld_widths)
+            if ln in _wat_ld_widths:
+                w_lbl = _wat_ld_widths[ln]
+                rv = next_var(f"wld_{w_lbl}", var_type="i64")
+                bb.add_instruction(SSAInstruction(rv, "load_off", [base_op, idx_op, w_lbl]))
             elif ln == "f32.load":
                 rv = next_var("wldf32", var_type="f64")
                 bb.add_instruction(SSAInstruction(rv, "load_off", [base_op, idx_op, "f32"]))
@@ -1049,7 +1058,10 @@ class WATToSSALifter:
             return None
         if ln in ("f64.promote_f32", "f32.demote_f64"):
             return None
-        if ln in ("i64.store", "f64.store", "i64.store32", "f32.store"):
+        _wat_st_widths = {
+            "i64.store8": "i8", "i64.store16": "i16", "i64.store32": "i32",
+        }
+        if ln in ("i64.store", "f64.store", "f32.store") or ln in _wat_st_widths:
             if len(stack) < 2:
                 return "WAT_STACK_UNDERFLOW_store"
             val_op = stack.pop()
@@ -1059,9 +1071,9 @@ class WATToSSALifter:
             elif isinstance(addr_tok, tuple) and len(addr_tok) == 3 and addr_tok[0] == "__wat_ptr__":
                 base_op, idx_op, is_byte = addr_tok[1], addr_tok[2], False
             else:
-                base_op, idx_op, is_byte = addr_tok, 0, (ln in ("i64.store32", "f32.store"))
-            if ln == "i64.store32":
-                bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "i32"]))
+                base_op, idx_op, is_byte = addr_tok, 0, (ln == "f32.store" or ln in _wat_st_widths)
+            if ln in _wat_st_widths:
+                bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, _wat_st_widths[ln]]))
             elif ln == "f32.store":
                 bb.add_instruction(SSAInstruction(None, "store_off", [base_op, idx_op, val_op, "f32"]))
             elif is_byte:
