@@ -11,10 +11,12 @@ import ast
 import os
 import struct
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional, Set, Tuple
 
 from orchestrator.repo_manifest_ingestor import RepoManifestIngestor, RepoTopologyResolver, RepoManifest
+from orchestrator.salsa_query_engine import SalsaQueryEngine
 from slicer.persistent_cpg import PersistentCodePropertyGraph
 from adapters.universal_abi_bridge import UniversalAbiBridge
 from compiler.object_linker import NativeObjectLinker, ObjectModule, load_coff_object, load_elf_object
@@ -133,6 +135,27 @@ def _default_entrypoint_bytes(effective_arch: str, effective_os: str) -> bytes:
     return b"\x48\x89\xf8\x48\xc1\xe0\x04\x48\x83\xc0\x0f\xc3"
 
 
+class _CachedAstPayload:
+    """O(1)-digest Salsa cached AST bundle for Python & polyglot source files."""
+
+    __slots__ = ("tree", "funcs", "aliases", "digest")
+
+    def __init__(
+        self,
+        tree: ast.Module,
+        funcs: Dict[str, Tuple[str, ast.FunctionDef]],
+        aliases: Dict[str, str],
+        digest: str,
+    ):
+        self.tree = tree
+        self.funcs = funcs
+        self.aliases = aliases
+        self.digest = digest
+
+    def __str__(self) -> str:
+        return self.digest
+
+
 class OmniRepoCompiler:
     """
     Master Multi-Repository Compiler Engine.
@@ -160,14 +183,55 @@ class OmniRepoCompiler:
             enable_memory_theory=True, max_loop_unroll=4, enable_inductive_loops=True
         )
         self.dwarf_emitter = DwarfV5Emitter()
+        self._salsa_lock = threading.Lock()
+        self.salsa = SalsaQueryEngine()
+        self._salsa_hits = 0
+        self._salsa_misses = 0
+        self.salsa.register_query("parsed_module", self._salsa_parse_file)
+
+    def _salsa_parse_file(self, norm_path: str) -> Optional[_CachedAstPayload]:
+        self._salsa_misses += 1
+        src_node = self.salsa.nodes.get(f"file_src::{norm_path}")
+        q_node = self.salsa.nodes.get(f"parsed_module::{norm_path}")
+        if src_node is None:
+            return None
+        if q_node is not None:
+            q_node.dependencies.add(f"file_src::{norm_path}")
+        raw_src = src_node.value
+        ext = os.path.splitext(norm_path)[1].lower()
+        funcs: Dict[str, Tuple[str, ast.FunctionDef]] = {}
+        aliases: Dict[str, str] = {}
+        if ext == ".py":
+            try:
+                tree = ast.parse(raw_src, filename=norm_path)
+                for node in tree.body:
+                    if isinstance(node, ast.FunctionDef):
+                        funcs[node.name] = (norm_path, node)
+                    elif (
+                        isinstance(node, ast.Assign)
+                        and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                        and isinstance(node.value, ast.Name)
+                    ):
+                        aliases[node.targets[0].id] = node.value.id
+                return _CachedAstPayload(tree, funcs, aliases, src_node.value_blake3 or "")
+            except Exception:
+                return None
+        try:
+            from frontends.polyglot_ssa_lowering import parse_polyglot_file_to_ast
+            parsed = parse_polyglot_file_to_ast(norm_path, strict=False)
+            if parsed.functions:
+                for fn_node in parsed.functions:
+                    funcs[fn_node.name] = (norm_path, fn_node)
+                return _CachedAstPayload(parsed.module, funcs, aliases, src_node.value_blake3 or "")
+        except Exception:
+            return None
+        return None
 
     def _scan_repo_asts(
         self, repo_path: str
     ) -> Tuple[List[Tuple[str, ast.Module]], Dict[str, Tuple[str, ast.FunctionDef]], Dict[str, str]]:
-        from frontends.polyglot_ssa_lowering import (
-            SUPPORTED_POLYGLOT_EXTENSIONS,
-            parse_polyglot_file_to_ast,
-        )
+        from frontends.polyglot_ssa_lowering import SUPPORTED_POLYGLOT_EXTENSIONS
 
         parsed_modules: List[Tuple[str, ast.Module]] = []
         funcs: Dict[str, Tuple[str, ast.FunctionDef]] = {}
@@ -179,31 +243,22 @@ class OmniRepoCompiler:
             for f in sorted(files):
                 full_f = os.path.join(root, f)
                 ext = os.path.splitext(f)[1].lower()
-                if f.endswith(".py"):
+                if f.endswith(".py") or ext in SUPPORTED_POLYGLOT_EXTENSIONS:
                     try:
-                        with open(full_f, "r", encoding="utf-8") as py_f:
-                            src = py_f.read()
-                        tree = ast.parse(src, filename=full_f)
-                        parsed_modules.append((full_f, tree))
-                        for node in tree.body:
-                            if isinstance(node, ast.FunctionDef):
-                                funcs[node.name] = (full_f, node)
-                            elif (
-                                isinstance(node, ast.Assign)
-                                and len(node.targets) == 1
-                                and isinstance(node.targets[0], ast.Name)
-                                and isinstance(node.value, ast.Name)
-                            ):
-                                aliases[node.targets[0].id] = node.value.id
-                    except Exception:
-                        pass
-                elif ext in SUPPORTED_POLYGLOT_EXTENSIONS:
-                    try:
-                        parsed = parse_polyglot_file_to_ast(full_f, strict=False)
-                        if parsed.functions:
-                            parsed_modules.append((full_f, parsed.module))
-                            for fn_node in parsed.functions:
-                                funcs[fn_node.name] = (full_f, fn_node)
+                        with open(full_f, "r", encoding="utf-8") as sf:
+                            raw_src = sf.read()
+                        norm_path = os.path.normpath(os.path.abspath(full_f))
+                        with self._salsa_lock:
+                            self.salsa.set_input("file_src", norm_path, raw_src)
+                            prev_misses = self._salsa_misses
+                            payload = self.salsa.query("parsed_module", norm_path)
+                            if payload is not None and self._salsa_misses == prev_misses:
+                                self._salsa_hits += 1
+                        if payload is not None and (payload.funcs or f.endswith(".py")):
+                            parsed_modules.append((full_f, payload.tree))
+                            for k, (fpath_stored, fnode) in payload.funcs.items():
+                                funcs[k] = (full_f, fnode)
+                            aliases.update(payload.aliases)
                     except Exception:
                         pass
         return parsed_modules, funcs, aliases
@@ -243,7 +298,9 @@ class OmniRepoCompiler:
             "backend": resolved_backend,
         }
 
-        # Stage 1: Parallel Repository Manifest & AST Ingestion
+        # Stage 1: Parallel Repository Manifest & Salsa Incremental AST Ingestion
+        self._salsa_hits = 0
+        self._salsa_misses = 0
         if len(repo_paths) > 1:
             with ThreadPoolExecutor(max_workers=min(8, len(repo_paths))) as pool:
                 manifests = list(pool.map(self.ingestor.ingest_repository, repo_paths))
@@ -271,6 +328,7 @@ class OmniRepoCompiler:
         struct_extractor.register_structs_from_statements(all_cls_stmts)
         struct_extractor.register_luts_from_statements(all_lut_stmts)
         global_struct_layouts.update(struct_extractor.struct_layouts)
+        global_struct_sizes = {k: sz for k, (sz, _al) in struct_extractor.struct_meta.items()}
         global_luts = dict(struct_extractor.global_luts)
 
         for m, (mods, f_map, alias_map) in zip(manifests, scanned):
@@ -296,6 +354,8 @@ class OmniRepoCompiler:
         results["stages"]["ingestion"] = {
             "total_repos": len(manifests),
             "manifests": [m.repo_name for m in manifests],
+            "salsa_ast_hits": self._salsa_hits,
+            "salsa_ast_misses": self._salsa_misses,
         }
 
         # Stage 2: Inter-Repo Topology Resolution
@@ -684,6 +744,33 @@ class OmniRepoCompiler:
                 pass
 
             ssa_program[fn_name] = ssa_fn
+
+        # Stage 5c: Z3 SSA Memory Bounds & Pointer Disjointness Verification
+        z3_bounds_checks_passed = 0
+        z3_bounds_violations: List[Dict[str, Any]] = []
+        pointer_disjoint_reports: List[Dict[str, Any]] = []
+        for fn_name, ssa_fn in ssa_program.items():
+            fdef = all_ast_funcs.get(fn_name) or all_ast_funcs.get(fn_name.split("__spec_", 1)[0])
+            p_struct_map: Dict[str, str] = {}
+            if fdef is not None:
+                for arg in fdef.args.args:
+                    if isinstance(arg.annotation, ast.Name) and arg.annotation.id in global_struct_sizes:
+                        p_struct_map[arg.arg] = arg.annotation.id
+            if p_struct_map and global_struct_sizes:
+                b_res = self.biabduction.verify_ssa_memory_bounds(
+                    ssa_fn, struct_sizes=global_struct_sizes, param_struct_map=p_struct_map
+                )
+                z3_bounds_checks_passed += b_res.get("checks_passed", 0)
+                for v in b_res.get("violations", []):
+                    z3_bounds_violations.append({"function": fn_name, **v})
+            d_res = self.biabduction.verify_ssa_pointer_disjointness(ssa_fn)
+            if d_res.get("pointer_params"):
+                pointer_disjoint_reports.append({"function": fn_name, **d_res})
+
+        results["stages"]["separation_logic"]["z3_bounds_verified"] = len(z3_bounds_violations) == 0
+        results["stages"]["separation_logic"]["z3_bounds_checks_passed"] = z3_bounds_checks_passed
+        results["stages"]["separation_logic"]["z3_bounds_violations"] = z3_bounds_violations
+        results["stages"]["separation_logic"]["pointer_disjointness"] = pointer_disjoint_reports
 
         # WASM Backend Short-Circuit Emission (WASI Preview 2 / Portable .wasm Module)
         if resolved_backend == "wasm":
