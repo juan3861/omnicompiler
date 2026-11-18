@@ -157,6 +157,21 @@ class BiAbductionVerifier:
                 seen += 1
             return op
 
+        def _cmp_bool_of(cond_op: Any) -> Optional[z3.BoolRef]:
+            if isinstance(cond_op, SSAVar) and cond_op in inst_def:
+                cins = inst_def[cond_op]
+                if len(cins.operands) == 2 and cins.opcode in ("cmp_lt", "cmp_le", "cmp_gt", "cmp_ge", "cmp_eq", "cmp_ne"):
+                    ls, rs = _sym_of(cins.operands[0]), _sym_of(cins.operands[1])
+                    return {
+                        "cmp_lt": ls < rs,
+                        "cmp_le": ls <= rs,
+                        "cmp_gt": ls > rs,
+                        "cmp_ge": ls >= rs,
+                        "cmp_eq": ls == rs,
+                        "cmp_ne": ls != rs,
+                    }[cins.opcode]
+            return None
+
         def _sym_of(op: Any) -> z3.BitVecRef:
             c = _const_val(op)
             if c is not None:
@@ -177,6 +192,18 @@ class BiAbductionVerifier:
                         r = _sym_of(ins.operands[0]) * _sym_of(ins.operands[1])
                     elif oc == "shl" and len(ins.operands) == 2:
                         r = _sym_of(ins.operands[0]) << _sym_of(ins.operands[1])
+                    elif oc in ("shr", "sar") and len(ins.operands) == 2:
+                        r = _sym_of(ins.operands[0]) >> _sym_of(ins.operands[1])
+                    elif oc == "lshr" and len(ins.operands) == 2:
+                        r = z3.LShR(_sym_of(ins.operands[0]), _sym_of(ins.operands[1]))
+                    elif oc == "select" and len(ins.operands) == 3:
+                        cond_b = _cmp_bool_of(ins.operands[0])
+                        if cond_b is None:
+                            cond_b = _sym_of(ins.operands[0]) != z3.BitVecVal(0, 64, ctx)
+                        r = z3.If(cond_b, _sym_of(ins.operands[1]), _sym_of(ins.operands[2]))
+                    elif oc in ("cmp_lt", "cmp_le", "cmp_gt", "cmp_ge", "cmp_eq", "cmp_ne") and len(ins.operands) == 2:
+                        cond_b = _cmp_bool_of(op)
+                        r = z3.If(cond_b, z3.BitVecVal(1, 64, ctx), z3.BitVecVal(0, 64, ctx))
                     else:
                         r = z3.BitVec(f"{op.name}_{op.version}", 64, ctx)
                 else:
@@ -185,23 +212,92 @@ class BiAbductionVerifier:
                 return r
             return z3.BitVec(str(op), 64, ctx)
 
-        # Match loop-condition block -> induction PHI bounds
+        def _is_phi_free(v: Any, seen: Optional[Set[Any]] = None) -> bool:
+            if not isinstance(v, SSAVar):
+                return True
+            if v in phi_def:
+                return False
+            seen = seen or set()
+            if v in seen:
+                return False
+            seen.add(v)
+            ins = inst_def.get(v)
+            if ins is None:
+                return True
+            return all(_is_phi_free(op, seen) for op in ins.operands)
+
+        # Build CFG adjacency & iterative dominators for dominating guard facts
+        name_to_blk = {b.name: b for b in ssa_fn.blocks}
+        succ_map: Dict[str, List[str]] = {b.name: [] for b in ssa_fn.blocks}
+        for blk in ssa_fn.blocks:
+            succs: List[str] = []
+            if blk.instructions:
+                last_ins = blk.instructions[-1]
+                if last_ins.opcode == "br" and last_ins.operands:
+                    succs = [str(last_ins.operands[0])]
+                elif last_ins.opcode == "br_cond" and len(last_ins.operands) == 3:
+                    succs = [str(last_ins.operands[1]), str(last_ins.operands[2])]
+            if not succs and getattr(blk, "successors", None):
+                succs = [s.name for s in blk.successors]
+            succ_map[blk.name] = [s for s in succs if s in name_to_blk]
+
+        dom: Dict[str, Set[str]] = {}
+        if ssa_fn.blocks:
+            entry_name = ssa_fn.blocks[0].name
+            reachable: Set[str] = {entry_name}
+            q = [entry_name]
+            while q:
+                cur = q.pop()
+                for s in succ_map.get(cur, []):
+                    if s not in reachable:
+                        reachable.add(s)
+                        q.append(s)
+            preds_r: Dict[str, List[str]] = {n: [] for n in reachable}
+            for u in reachable:
+                for v in succ_map.get(u, []):
+                    if v in reachable:
+                        preds_r[v].append(u)
+            dom[entry_name] = {entry_name}
+            for n in reachable:
+                if n != entry_name:
+                    dom[n] = set(reachable)
+            dom_changed = True
+            while dom_changed:
+                dom_changed = False
+                for b in ssa_fn.blocks:
+                    n = b.name
+                    if n == entry_name or n not in reachable or not preds_r[n]:
+                        continue
+                    new_d = set.intersection(*(dom[p] for p in preds_r[n])) | {n}
+                    if new_d != dom[n]:
+                        dom[n] = new_d
+                        dom_changed = True
+
+        def _is_reachable(src: str, target: str) -> bool:
+            visited: Set[str] = {src}
+            stack = [src]
+            while stack:
+                cur = stack.pop()
+                if cur == target:
+                    return True
+                for s in succ_map.get(cur, []):
+                    if s not in visited:
+                        visited.add(s)
+                        stack.append(s)
+            return False
+
+        # Match loop-condition block -> induction PHI bounds & dominating edge guards
         block_bounds: Dict[str, List[z3.BoolRef]] = {}
         for blk in ssa_fn.blocks:
             for inst in blk.instructions:
                 if inst.opcode == "br_cond" and len(inst.operands) == 3:
-                    cond_v, true_b_name, _false_b_name = inst.operands[0], str(inst.operands[1]), str(inst.operands[2])
-                    if isinstance(cond_v, SSAVar) and cond_v in inst_def:
+                    cond_v, true_b_name, false_b_name = inst.operands[0], str(inst.operands[1]), str(inst.operands[2])
+                    guard_c = _cmp_bool_of(cond_v)
+                    if guard_c is not None and isinstance(cond_v, SSAVar) and cond_v in inst_def:
                         cins = inst_def[cond_v]
-                        if cins.opcode in ("cmp_lt", "cmp_le", "cmp_gt", "cmp_ge") and len(cins.operands) == 2:
-                            lhs_v, rhs_v = cins.operands[0], cins.operands[1]
-                            lhs_s, rhs_s = _sym_of(lhs_v), _sym_of(rhs_v)
-                            guard_c = {
-                                "cmp_lt": lhs_s < rhs_s,
-                                "cmp_le": lhs_s <= rhs_s,
-                                "cmp_gt": lhs_s > rhs_s,
-                                "cmp_ge": lhs_s >= rhs_s,
-                            }[cins.opcode]
+                        if cins.opcode in ("cmp_lt", "cmp_le", "cmp_gt", "cmp_ge"):
+                            lhs_v = cins.operands[0]
+                            lhs_s = _sym_of(lhs_v)
                             conds = [guard_c]
                             # Check monotonic `init >= 0, step >= 0` for phi induction var
                             if isinstance(lhs_v, SSAVar) and lhs_v in phi_def:
@@ -210,7 +306,31 @@ class BiAbductionVerifier:
                                     c_init = _const_val(phi_n.operands[0])
                                     if c_init is not None and c_init >= 0:
                                         conds.append(lhs_s >= z3.BitVecVal(c_init, 64, ctx))
+                                    elif isinstance(phi_n.operands[1], SSAVar) and phi_n.operands[1] in inst_def:
+                                        step_ins = inst_def[phi_n.operands[1]]
+                                        if step_ins.opcode == "add" and len(step_ins.operands) == 2 and lhs_v in step_ins.operands:
+                                            step_other = step_ins.operands[1] if step_ins.operands[0] == lhs_v else step_ins.operands[0]
+                                            c_step = _const_val(step_other)
+                                            if c_step is not None and c_step >= 0:
+                                                init_s = _sym_of(phi_n.operands[0])
+                                                rhs_s = _sym_of(cins.operands[1])
+                                                conds.append(
+                                                    z3.Implies(
+                                                        z3.And(init_s >= 0, rhs_s < z3.BitVecVal(1 << 60, 64, ctx)),
+                                                        lhs_s >= init_s,
+                                                    )
+                                                )
                             block_bounds.setdefault(true_b_name, []).extend(conds)
+
+                        if true_b_name != false_b_name and _is_phi_free(cond_v):
+                            for tgt_b, other_b, fact in (
+                                (true_b_name, false_b_name, guard_c),
+                                (false_b_name, true_b_name, z3.Not(guard_c)),
+                            ):
+                                if tgt_b in dom and blk.name in dom[tgt_b] and not _is_reachable(other_b, tgt_b):
+                                    for b_name, b_dom in dom.items():
+                                        if tgt_b in b_dom:
+                                            block_bounds.setdefault(b_name, []).append(fact)
 
         checks_passed = 0
         violations: List[Dict[str, Any]] = []

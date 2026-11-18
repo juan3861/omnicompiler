@@ -175,7 +175,7 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
             and s_info["name"].startswith((".rdata", ".rodata", ".data"))
             and s_info["raw_size"] > 0
         ):
-            pad = (16 - (len(mod.text_bytes) % 16)) % 16
+            pad = (32 - (len(mod.text_bytes) % 32)) % 32
             if pad:
                 mod.text_bytes.extend(b"\x00" * pad)
             rodata_sec_offsets[s_info["index_1based"]] = len(mod.text_bytes)
@@ -255,7 +255,7 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
         if s.name == ".text":
             text_shndx = i
         elif s.name.startswith((".rodata", ".rdata", ".data")) and s.data_size > 0:
-            pad = (16 - (len(mod.text_bytes) % 16)) % 16
+            pad = (32 - (len(mod.text_bytes) % 32)) % 32
             if pad:
                 mod.text_bytes.extend(b"\x00" * pad)
             rodata_sec_offsets[i] = len(mod.text_bytes)
@@ -473,6 +473,9 @@ class NativeObjectLinker:
 
         # 1. Section Aggregation & Global Symbol Placement
         for idx, mod in enumerate(self.modules):
+            pad = (32 - (len(combined_text) % 32)) % 32
+            if pad:
+                combined_text.extend(b"\x90" * pad)
             mod_offset = len(combined_text)
             module_text_offsets[idx] = mod_offset
             combined_text.extend(mod.text_bytes)

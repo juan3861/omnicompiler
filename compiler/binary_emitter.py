@@ -1572,6 +1572,9 @@ class StandaloneBinaryEmitter:
         asm.emit(b"\xff\x15" + struct.pack("<i", exit_iat_rva - call_exit_rip))
         asm.emit(b"\x48\x83\xc4\x28\xc3")
 
+        pad = (32 - (len(asm.code) % 32)) % 32
+        if pad:
+            asm.emit(b"\x90" * pad)
         asm.label("fn_target")
 
     @staticmethod
@@ -1621,6 +1624,9 @@ class StandaloneBinaryEmitter:
             asm.emit(b"\xb8\x3c\x00\x00\x00")
             asm.emit(b"\x0f\x05")
 
+        pad = (32 - (len(asm.code) % 32)) % 32
+        if pad:
+            asm.emit(b"\x90" * pad)
         asm.label("fn_target")
 
     @staticmethod
