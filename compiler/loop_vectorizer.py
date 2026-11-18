@@ -217,28 +217,46 @@ class LoopVectorizerPass:
                 struct_sum_pattern = self._match_struct_array_sum(block, body_blk, reachable_from_body)
                 if struct_sum_pattern:
                     base_ptr, base_offset, stride, bound_count, width, acc_prev, acc_next, is_float = struct_sum_pattern
-                    replacement_insts, res_var = self._build_unrolled_tree_reduction(
-                        fn=fn,
-                        pre_bb=pre_bb,
-                        cond_bb=block,
-                        base_ptr=base_ptr,
-                        base_offset=base_offset,
-                        stride=stride,
-                        bound_count=bound_count,
-                        width=width,
-                        acc_prev=acc_prev,
-                        is_float=is_float,
-                        step_id=stats["vectorized_sums"],
-                    )
-                    self._rewrite_loop(
-                        fn=fn,
-                        pre_bb=pre_bb,
-                        cond_bb=block,
-                        exit_bb=exit_blk,
-                        replacement_insts=replacement_insts,
-                        replaced_vars=[acc_prev, acc_next],
-                        res_var=res_var,
-                    )
+                    if bound_count <= 64:
+                        replacement_insts, res_var = self._build_unrolled_tree_reduction(
+                            fn=fn,
+                            pre_bb=pre_bb,
+                            cond_bb=block,
+                            base_ptr=base_ptr,
+                            base_offset=base_offset,
+                            stride=stride,
+                            bound_count=bound_count,
+                            width=width,
+                            acc_prev=acc_prev,
+                            is_float=is_float,
+                            step_id=stats["vectorized_sums"],
+                        )
+                        self._rewrite_loop(
+                            fn=fn,
+                            pre_bb=pre_bb,
+                            cond_bb=block,
+                            exit_bb=exit_blk,
+                            replacement_insts=replacement_insts,
+                            replaced_vars=[acc_prev, acc_next],
+                            res_var=res_var,
+                        )
+                    else:
+                        self._rewrite_struct_array_strip_mined_4x(
+                            fn=fn,
+                            pre_bb=pre_bb,
+                            cond_bb=block,
+                            body_blk=body_blk,
+                            exit_bb=exit_blk,
+                            base_ptr=base_ptr,
+                            base_offset=base_offset,
+                            stride=stride,
+                            bound_count=bound_count,
+                            width=width,
+                            acc_prev=acc_prev,
+                            acc_next=acc_next,
+                            is_float=is_float,
+                            step_id=stats["vectorized_sums"],
+                        )
                     stats["vectorized_sums"] += 1
                     changed = True
                     break
@@ -472,20 +490,22 @@ class LoopVectorizerPass:
         if bound_val is None:
             return None
         bound_count = (bound_val + 1) if is_le else bound_val
-        if bound_count <= 0 or bound_count > 64:
+        if bound_count <= 0 or bound_count > 4096:
             return None
 
-        # 2. In loop body blocks, find load_off (must be a pure reduction without stores)
+        # 2. In loop body blocks, find load_off (must be a single pure reduction without stores)
         all_body_insts = list(body_bb.instructions)
         for b in reachable_from_body:
-            all_body_insts.extend(b.instructions)
+            if b is not body_bb:
+                all_body_insts.extend(b.instructions)
 
         if any(ins.opcode in ("store", "store_off") for ins in all_body_insts):
             return None
 
-        load_off_inst = next((ins for ins in all_body_insts if ins.opcode == "load_off"), None)
-        if not load_off_inst or len(load_off_inst.operands) < 3:
+        load_offs = [ins for ins in all_body_insts if ins.opcode == "load_off"]
+        if len(load_offs) != 1 or len(load_offs[0].operands) < 3:
             return None
+        load_off_inst = load_offs[0]
 
         base_ptr, off_var, width = load_off_inst.operands[0], load_off_inst.operands[1], str(load_off_inst.operands[2])
 
@@ -521,6 +541,29 @@ class LoopVectorizerPass:
 
         return (base_ptr, int(base_offset), int(stride), int(bound_count), width, acc_prev, acc_next, is_float)
 
+    @staticmethod
+    def _tree_reduce_ssa(
+        items: List[SSAVar],
+        op: str,
+        ssa_vt: str,
+        prefix: str,
+        out_insts: List[SSAInstruction],
+    ) -> SSAVar:
+        curr = list(items)
+        round_idx = 0
+        while len(curr) > 1:
+            nxt: List[SSAVar] = []
+            for j in range(0, len(curr), 2):
+                if j + 1 < len(curr):
+                    r_v = SSAVar(f"{prefix}_{round_idx}_{j // 2}", 0, var_type=ssa_vt)
+                    out_insts.append(SSAInstruction(r_v, op, [curr[j], curr[j + 1]]))
+                    nxt.append(r_v)
+                else:
+                    nxt.append(curr[j])
+            curr = nxt
+            round_idx += 1
+        return curr[0]
+
     def _build_unrolled_tree_reduction(
         self,
         fn: SSAFunction,
@@ -537,44 +580,167 @@ class LoopVectorizerPass:
     ) -> Tuple[List[SSAInstruction], SSAVar]:
         insts: List[SSAInstruction] = []
         loads: List[SSAVar] = []
+        ssa_vt = "f64" if is_float else "i64"
+        op = "fadd" if is_float else "add"
 
         for k in range(bound_count):
             cur_off = base_offset + k * stride
             off_v = SSAVar(f"vec_off_{step_id}_{k}", 0)
             insts.append(SSAInstruction(off_v, "const", [cur_off]))
-            ld_v = SSAVar(f"vec_ld_{step_id}_{k}", 0, var_type=width)
+            ld_v = SSAVar(f"vec_ld_{step_id}_{k}", 0, var_type=ssa_vt)
             insts.append(SSAInstruction(ld_v, "load_off", [base_ptr, off_v, width]))
             loads.append(ld_v)
 
-        curr = loads
-        round_idx = 0
-        op = "fadd" if is_float else "add"
-        while len(curr) > 1:
-            nxt = []
-            for j in range(0, len(curr), 2):
-                if j + 1 < len(curr):
-                    r_v = SSAVar(f"vec_tree_{step_id}_{round_idx}_{j//2}", 0, var_type=width)
-                    insts.append(SSAInstruction(r_v, op, [curr[j], curr[j+1]]))
-                    nxt.append(r_v)
-                else:
-                    nxt.append(curr[j])
-            curr = nxt
-            round_idx += 1
-
-        sum_res = curr[0] if curr else SSAVar(f"vec_zero_{step_id}", 0, var_type=width)
+        sum_res = (
+            self._tree_reduce_ssa(loads, op, ssa_vt, f"vec_tree_{step_id}", insts)
+            if loads
+            else SSAVar(f"vec_zero_{step_id}", 0, var_type=ssa_vt)
+        )
 
         # Check initial accumulator from pre_bb
         init_val = self._find_init_acc(cond_bb, pre_bb, acc_prev)
         if init_val is not None and not self._is_const_zero(fn, init_val):
-            final_res = SSAVar(f"vec_sum_acc_{step_id}", 0, var_type=width)
+            final_res = SSAVar(f"vec_sum_acc_{step_id}", 0, var_type=ssa_vt)
             insts.append(SSAInstruction(final_res, op, [init_val, sum_res]))
         else:
             final_res = sum_res
 
         if is_float and fn.return_type in ("float", "f32", "f64", None):
-            fn.return_type = "f64" if "64" in width else "f32"
+            fn.return_type = "f64"
 
         return insts, final_res
+
+    def _rewrite_struct_array_strip_mined_4x(
+        self,
+        fn: SSAFunction,
+        pre_bb: BasicBlock,
+        cond_bb: BasicBlock,
+        body_blk: BasicBlock,
+        exit_bb: BasicBlock,
+        base_ptr: Any,
+        base_offset: int,
+        stride: int,
+        bound_count: int,
+        width: str,
+        acc_prev: SSAVar,
+        acc_next: SSAVar,
+        is_float: bool,
+        step_id: int,
+    ) -> None:
+        """Transforms large constant struct/buffer reductions into a 4-way ILP strip-mined VLA loop."""
+        chunks = bound_count // 4
+        rem = bound_count % 4
+        ssa_vt = "f64" if is_float else "i64"
+        op = "fadd" if is_float else "add"
+
+        # Pre-header initializers for chunk index + 4 independent accumulators
+        init_val = self._find_init_acc(cond_bb, pre_bb, acc_prev)
+        pre_insts: List[SSAInstruction] = []
+        zero_idx = SSAVar(f"vec_cinit_{step_id}", 0)
+        pre_insts.append(SSAInstruction(zero_idx, "const", [0]))
+
+        acc0_init = init_val if init_val is not None else SSAVar(f"vec_a0_z_{step_id}", 0, var_type=ssa_vt)
+        if init_val is None:
+            pre_insts.append(SSAInstruction(acc0_init, "fconst" if is_float else "const", [0.0 if is_float else 0]))
+        acc_other_inits: List[SSAVar] = []
+        for lane in range(1, 4):
+            av = SSAVar(f"vec_a{lane}_z_{step_id}", 0, var_type=ssa_vt)
+            pre_insts.append(SSAInstruction(av, "fconst" if is_float else "const", [0.0 if is_float else 0]))
+            acc_other_inits.append(av)
+
+        if pre_bb.instructions:
+            term = pre_bb.instructions[-1]
+            pre_bb.instructions = pre_bb.instructions[:-1] + pre_insts + [term]
+        else:
+            pre_bb.instructions.extend(pre_insts)
+
+        # Induction + 4 accumulator PHI nodes in cond_bb
+        c_iv = SSAVar(f"vec_ci_{step_id}", 0)
+        c_iv_next = SSAVar(f"vec_ci_nxt_{step_id}", 0)
+        acc_phis = [SSAVar(f"vec_acc{lane}_{step_id}", 0, var_type=ssa_vt) for lane in range(4)]
+        acc_nexts = [SSAVar(f"vec_acc{lane}_nxt_{step_id}", 0, var_type=ssa_vt) for lane in range(4)]
+
+        cond_bb.phi_nodes = [
+            SSAInstruction(c_iv, "phi", [zero_idx, c_iv_next], phi_incoming=[(pre_bb.name, zero_idx), (body_blk.name, c_iv_next)]),
+            SSAInstruction(acc_phis[0], "phi", [acc0_init, acc_nexts[0]], phi_incoming=[(pre_bb.name, acc0_init), (body_blk.name, acc_nexts[0])]),
+        ] + [
+            SSAInstruction(
+                acc_phis[lane], "phi", [acc_other_inits[lane - 1], acc_nexts[lane]],
+                phi_incoming=[(pre_bb.name, acc_other_inits[lane - 1]), (body_blk.name, acc_nexts[lane])],
+            )
+            for lane in range(1, 4)
+        ]
+
+        c_bound = SSAVar(f"vec_cbound_{step_id}", 0)
+        c_cmp = SSAVar(f"vec_ccmp_{step_id}", 0)
+        cond_bb.instructions = [
+            SSAInstruction(c_bound, "const", [chunks]),
+            SSAInstruction(c_cmp, "cmp_lt", [c_iv, c_bound]),
+            SSAInstruction(None, "br_cond", [c_cmp, body_blk.name, exit_bb.name]),
+        ]
+
+        # Rewrite body_blk to compute 4 parallel loads & 4 independent lane additions
+        c_s4 = SSAVar(f"vec_s4_{step_id}", 0)
+        c_step_off = SSAVar(f"vec_coff_{step_id}", 0)
+        c_base_c = SSAVar(f"vec_cbase_{step_id}", 0)
+        c_elem_base = SSAVar(f"vec_ebase_{step_id}", 0)
+        body_insts: List[SSAInstruction] = [
+            SSAInstruction(c_s4, "const", [stride * 4]),
+            SSAInstruction(c_step_off, "mul", [c_iv, c_s4]),
+            SSAInstruction(c_base_c, "const", [base_offset]),
+            SSAInstruction(c_elem_base, "add", [c_base_c, c_step_off]),
+        ]
+        for lane in range(4):
+            if lane == 0:
+                addr_off = c_elem_base
+            else:
+                l_c = SSAVar(f"vec_loff_{step_id}_{lane}", 0)
+                addr_off = SSAVar(f"vec_ladd_{step_id}_{lane}", 0)
+                body_insts.append(SSAInstruction(l_c, "const", [lane * stride]))
+                body_insts.append(SSAInstruction(addr_off, "add", [c_elem_base, l_c]))
+            ld_v = SSAVar(f"vec_lld_{step_id}_{lane}", 0, var_type=ssa_vt)
+            body_insts.append(SSAInstruction(ld_v, "load_off", [base_ptr, addr_off, width]))
+            body_insts.append(SSAInstruction(acc_nexts[lane], op, [acc_phis[lane], ld_v]))
+
+        c_one = SSAVar(f"vec_cone_{step_id}", 0)
+        body_insts.extend([
+            SSAInstruction(c_one, "const", [1]),
+            SSAInstruction(c_iv_next, "add", [c_iv, c_one]),
+            SSAInstruction(None, "br", [cond_bb.name]),
+        ])
+        body_blk.phi_nodes = []
+        body_blk.instructions = body_insts
+        cond_bb.successors = [body_blk, exit_bb]
+        body_blk.successors = [cond_bb]
+        body_blk.predecessors = [cond_bb]
+
+        # Merge the 4 lane accumulators + optional tail remainder at top of exit_bb
+        merge_insts: List[SSAInstruction] = []
+        merged_var = self._tree_reduce_ssa(acc_phis, op, ssa_vt, f"vec_merge_{step_id}", merge_insts)
+        for t_idx in range(chunks * 4, bound_count):
+            t_off_v = SSAVar(f"vec_toff_{step_id}_{t_idx}", 0)
+            t_ld_v = SSAVar(f"vec_tld_{step_id}_{t_idx}", 0, var_type=ssa_vt)
+            t_next = SSAVar(f"vec_tacc_{step_id}_{t_idx}", 0, var_type=ssa_vt)
+            merge_insts.extend([
+                SSAInstruction(t_off_v, "const", [base_offset + t_idx * stride]),
+                SSAInstruction(t_ld_v, "load_off", [base_ptr, t_off_v, width]),
+                SSAInstruction(t_next, op, [merged_var, t_ld_v]),
+            ])
+            merged_var = t_next
+
+        # Substitute uses of acc_prev / acc_next outside the loop with merged_var BEFORE inserting merge_insts
+        target_vars = {v for v in (acc_prev, acc_next) if isinstance(v, SSAVar)}
+        for blk in fn.blocks:
+            if blk in (cond_bb, body_blk):
+                continue
+            for inst in blk.instructions:
+                for idx_o, operand in enumerate(inst.operands):
+                    if operand in target_vars:
+                        inst.operands[idx_o] = merged_var
+
+        exit_bb.instructions = merge_insts + exit_bb.instructions
+        if is_float and fn.return_type in ("float", "f32", "f64", None):
+            fn.return_type = "f64"
 
     def vectorize_vla_function(
         self,

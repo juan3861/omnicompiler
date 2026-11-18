@@ -579,7 +579,7 @@ class LLVMIRToSSALifter:
                     )
                 continue
 
-            m_call = re.match(r"^call\s+(i64|double)\s+@([A-Za-z0-9_.$]+)\((.*)\)$", rhs)
+            m_call = re.match(r"^call\s+(i64|double)\s+(?:\([^)]*\)\s+)?@([A-Za-z0-9_.$]+)\((.*)\)$", rhs)
             if m_call:
                 ret_is_f = m_call.group(1) == "double"
                 callee = m_call.group(2)

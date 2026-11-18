@@ -440,10 +440,15 @@ class LLVMBackend:
                         aty = "double" if (isinstance(orig_a, float) or (isinstance(orig_a, SSAVar) and orig_a.var_type == "f64")) else "i64"
                         arg_pairs.append(f"{aty} {fmt_a}")
                         arg_tys.append(aty)
-                    if declared_externals is not None and callee != ssa_func.name:
-                        declared_externals.setdefault(callee, (res_ty, arg_tys))
                     args_sig = ", ".join(arg_pairs)
-                    lines.append(f"    {lhs} = call {res_ty} @{callee}({args_sig})")
+                    if callee in ("printf",):
+                        if declared_externals is not None and callee != ssa_func.name:
+                            declared_externals[callee] = ("i64", "vararg")
+                        lines.append(f"    {lhs} = call i64 (i64, ...) @{callee}({args_sig})")
+                    else:
+                        if declared_externals is not None and callee != ssa_func.name:
+                            declared_externals.setdefault(callee, (res_ty, arg_tys))
+                        lines.append(f"    {lhs} = call {res_ty} @{callee}({args_sig})")
                     last_val = lhs
 
                 elif opcode == "br":
@@ -502,6 +507,16 @@ class LLVMBackend:
                 )
         return out
 
+    @staticmethod
+    def _format_external_decl(ext_name: str, spec: Any) -> str:
+        if isinstance(spec, int):
+            ret_ty, arg_tys = "i64", ["i64"] * spec
+            return f"declare {ret_ty} @{ext_name}({', '.join(arg_tys)})"
+        ret_ty, arg_tys = spec
+        if arg_tys == "vararg":
+            return f"declare {ret_ty} @{ext_name}(i64, ...)"
+        return f"declare {ret_ty} @{ext_name}({', '.join(arg_tys)})"
+
     def ssa_to_llvm_ir(self, ssa_func: SSAFunction) -> str:
         """Lowers a single OmniCompiler `SSAFunction` (including multi-block CFGs & external decls) to LLVM IR."""
         externals: Dict[str, Any] = {}
@@ -512,11 +527,7 @@ class LLVMBackend:
         ]
         header.extend(self._emit_llvm_luts([ssa_func]))
         for ext_name, spec in sorted(externals.items()):
-            if isinstance(spec, int):
-                ret_ty, arg_tys = "i64", ["i64"] * spec
-            else:
-                ret_ty, arg_tys = spec
-            header.append(f"declare {ret_ty} @{ext_name}({', '.join(arg_tys)})")
+            header.append(self._format_external_decl(ext_name, spec))
         header.append(body)
         return "\n".join(header)
 
@@ -532,10 +543,6 @@ class LLVMBackend:
         lines.extend(self._emit_llvm_luts(ssa_funcs))
         for ext_name, spec in sorted(externals.items()):
             if ext_name not in defined:
-                if isinstance(spec, int):
-                    ret_ty, arg_tys = "i64", ["i64"] * spec
-                else:
-                    ret_ty, arg_tys = spec
-                lines.append(f"declare {ret_ty} @{ext_name}({', '.join(arg_tys)})")
+                lines.append(self._format_external_decl(ext_name, spec))
         lines.extend(bodies)
         return "\n".join(lines)

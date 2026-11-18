@@ -440,14 +440,28 @@ class NativeObjectLinker:
             self.modules.append(runtime_mod)
 
         if needed_os_syms:
+            is_arm64_link = any(
+                r.reloc_type == "ARM64_CALL26"
+                for m in self.modules
+                for r in m.relocations
+            )
             os_mod = ObjectModule("__omni_os_imports__")
             for sym in sorted(needed_os_syms):
-                # 6-byte sandbox-safe stub; replaced by `jmp qword ptr [rip + iat_or_got_disp32]`
-                # during dynamic exe emission. Allocators return mapped Unicorn scratch 0x2009800.
-                if sym in ("malloc", "calloc", "realloc"):
-                    stub = b"\xb8" + struct.pack("<I", 0x2009800) + b"\xc3"
+                if is_arm64_link:
+                    # 12-byte ARM64 sandbox-safe stub (replaced by ADRP+LDR+BR in dynamic ARM64 ELF).
+                    if sym in ("malloc", "calloc", "realloc"):
+                        # MOVZ X0, #0x9800; MOVK X0, #0x0200, LSL #16; RET
+                        stub = struct.pack("<III", 0xD2930000, 0xF2A04000, 0xD65F03C0)
+                    else:
+                        # MOVZ W0, #0; RET; NOP
+                        stub = struct.pack("<III", 0x52800000, 0xD65F03C0, 0xD503201F)
                 else:
-                    stub = b"\x31\xc0\xc3\x90\x90\x90"
+                    # 6-byte x86-64 sandbox-safe stub; replaced by `jmp qword ptr [rip + iat_or_got_disp32]`
+                    # during dynamic exe emission. Allocators return mapped Unicorn scratch 0x2009800.
+                    if sym in ("malloc", "calloc", "realloc"):
+                        stub = b"\xb8" + struct.pack("<I", 0x2009800) + b"\xc3"
+                    else:
+                        stub = b"\x31\xc0\xc3\x90\x90\x90"
                 os_mod.add_symbol(sym, stub, is_exported=False)
             self.modules.append(os_mod)
 
@@ -580,7 +594,7 @@ class NativeObjectLinker:
         os_imports = link_res.get("external_os_imports") or {}
 
         resolved_fmt = ("pe64" if sys.platform == "win32" else "elf64") if target_format == "auto" else target_format
-        if os_imports and resolved_fmt in ("pe64", "elf64"):
+        if os_imports and resolved_fmt in ("pe64", "elf64", "arm64_elf"):
             return self.emitter.emit_dynamic_linked_executable(
                 output_path=output_path,
                 linked_code=code,

@@ -806,8 +806,9 @@ class X64CodeGenerator:
                             ca = call_args[a_idx]
                             is_fp_arg = isinstance(ca, float) or (isinstance(ca, SSAVar) and ca.var_type == "f64")
                             if is_fp_arg:
-                                resolve_operand_to_reg(ca, "rax")
-                                buf.emit(_x64_movq_xmm_r64(a_idx, "rax"))
+                                # Mirror FP arg in both integer param reg and XMM reg per Win64 varargs ABI
+                                resolve_operand_to_reg(ca, self.param_regs[a_idx])
+                                buf.emit(_x64_movq_xmm_r64(a_idx, self.param_regs[a_idx]))
                             else:
                                 resolve_operand_to_reg(ca, self.param_regs[a_idx])
                     else:
@@ -837,6 +838,8 @@ class X64CodeGenerator:
                                 buf.emit(_x64_movq_xmm_r64(r_idx, "rax"))
                             else:
                                 resolve_operand_to_reg(ca, SYSV_PARAM_REGS[r_idx])
+                        # SysV AMD64 variadic ABI requires %al = number of vector registers used
+                        buf.emit(_x64_mov_ri("rax", min(8, c_fp)))
 
                     if callee == fn.name:
                         buf.call_label(".L_func_entry")

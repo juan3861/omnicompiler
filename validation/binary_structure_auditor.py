@@ -131,6 +131,15 @@ class BinaryStructureAuditor:
                             sectname = macho_bytes[sec_offset:sec_offset+16].decode("utf-8", errors="ignore").rstrip("\x00")
                             sections.append(f"{segname}.{sectname}")
                             sec_offset += 80
+            elif cmd == 0x0C:  # LC_LOAD_DYLIB
+                if cmdsize >= 24:
+                    name_off, = struct.unpack("<I", macho_bytes[offset+8:offset+12])
+                    if offset + name_off < offset + cmdsize:
+                        raw_name = macho_bytes[offset+name_off:offset+cmdsize].split(b"\x00")[0]
+                        dylib_str = raw_name.decode("utf-8", errors="ignore")
+                        metrics.setdefault("dylib_dependencies", []).append(dylib_str)
+                        if dylib_str and dylib_str not in imports:
+                            imports.append(dylib_str)
             elif cmd == 0x0D:  # LC_ID_DYLIB
                 if cmdsize >= 24:
                     name_off, = struct.unpack("<I", macho_bytes[offset+8:offset+12])
@@ -140,7 +149,7 @@ class BinaryStructureAuditor:
                         metrics["install_name"] = install_str
                         if install_str and install_str not in exports:
                             exports.append(install_str)
-            elif cmd == 0x02:  # LC_SYMTAB (nlist_64 exported symbols)
+            elif cmd == 0x02:  # LC_SYMTAB (nlist_64 exported & undefined imported symbols)
                 if cmdsize >= 24:
                     symoff, nsyms, stroff, strsize = struct.unpack("<IIII", macho_bytes[offset+8:offset+24])
                     if symoff + nsyms * 16 <= len(macho_bytes) and stroff + strsize <= len(macho_bytes):
@@ -151,7 +160,10 @@ class BinaryStructureAuditor:
                             if (n_type & 0x01) and n_strx < len(strtab):  # N_EXT external symbol
                                 raw_sym = strtab[n_strx:].split(b"\x00")[0].decode("utf-8", errors="ignore")
                                 clean_sym = raw_sym[1:] if raw_sym.startswith("_") else raw_sym
-                                if clean_sym and clean_sym not in exports:
+                                if (n_type & 0x0E) == 0 and n_sect == 0:  # N_UNDF import
+                                    if clean_sym and clean_sym not in imports:
+                                        imports.append(clean_sym)
+                                elif clean_sym and clean_sym not in exports:
                                     exports.append(clean_sym)
             elif cmd == 0x1D:  # LC_CODE_SIGNATURE (Apple Silicon XNU Ad-Hoc CodeDirectory)
                 if cmdsize >= 16:
@@ -394,10 +406,12 @@ class BinaryStructureAuditor:
             # Fallback for segment-only ELF shared objects via PT_DYNAMIC
             strtab_vaddr = None
             symtab_vaddr = None
+            hash_vaddr = None
             strsz = None
             syment = 24
             dynamic_offset = None
             load_vaddr: Optional[int] = None
+            needed_offsets: List[int] = []
 
             for seg in elf.iter_segments():
                 if seg["p_type"] == "PT_LOAD" and load_vaddr is None:
@@ -409,25 +423,43 @@ class BinaryStructureAuditor:
                             strtab_vaddr = tag.entry.d_val
                         elif tag.entry.d_tag == "DT_SYMTAB":
                             symtab_vaddr = tag.entry.d_val
+                        elif tag.entry.d_tag == "DT_HASH":
+                            hash_vaddr = tag.entry.d_val
                         elif tag.entry.d_tag == "DT_STRSZ":
                             strsz = tag.entry.d_val
                         elif tag.entry.d_tag == "DT_SYMENT":
                             syment = tag.entry.d_val
+                        elif tag.entry.d_tag == "DT_NEEDED":
+                            needed_offsets.append(tag.entry.d_val)
 
             if strtab_vaddr is not None and symtab_vaddr is not None and strsz is not None and load_vaddr is not None:
                 strtab_offset = strtab_vaddr - load_vaddr
                 symtab_offset = symtab_vaddr - load_vaddr
                 strtab = elf_bytes[strtab_offset:strtab_offset + strsz]
+                for n_off in needed_offsets:
+                    if n_off < len(strtab):
+                        lib_name = strtab[n_off:].split(b"\0")[0].decode("utf-8", errors="ignore")
+                        if lib_name:
+                            metrics.setdefault("needed_libs", []).append(lib_name)
                 max_sym_offset = dynamic_offset if dynamic_offset else len(elf_bytes)
-                curr = symtab_offset + syment  # skip null symbol
                 import struct
+                if hash_vaddr is not None:
+                    hash_offset = hash_vaddr - load_vaddr
+                    if 0 <= hash_offset + 8 <= len(elf_bytes):
+                        _, nchain = struct.unpack("<II", elf_bytes[hash_offset:hash_offset + 8])
+                        max_sym_offset = min(max_sym_offset, symtab_offset + nchain * syment)
+                curr = symtab_offset + syment  # skip null symbol
                 while curr + syment <= max_sym_offset:
                     entry = elf_bytes[curr:curr + syment]
                     st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack("<IBBHQQ", entry)
                     if st_name != 0 and st_name < len(strtab):
                         sym_name = strtab[st_name:].split(b"\0")[0].decode("utf-8", errors="ignore")
-                        if sym_name and sym_name not in exports:
-                            exports.append(sym_name)
+                        if sym_name:
+                            if st_shndx == 0:
+                                if sym_name not in imports:
+                                    imports.append(sym_name)
+                            elif sym_name not in exports:
+                                exports.append(sym_name)
                     curr += syment
 
         metrics["entry_point"] = hex(elf.header["e_entry"])
