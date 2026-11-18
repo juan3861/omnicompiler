@@ -299,7 +299,7 @@ class NativeJitCompiler:
             ctypes.c_double if ssa_fn.param_types.get(p) == "f64" else ctypes.c_int64
             for p in ssa_fn.params
         ]
-        ret_ctype = ctypes.c_double if getattr(ssa_fn, "return_type", "i64") == "f64" else ctypes.c_int64
+        ret_ctype = ctypes.c_double if getattr(ssa_fn, "return_type", "i64") in ("f64", "f32", "float") else ctypes.c_int64
         fn_type = ctypes.CFUNCTYPE(ret_ctype, *arg_ctypes)
         callable_fn = fn_type(mem.ptr)
         callable_fn._jit_mem = mem

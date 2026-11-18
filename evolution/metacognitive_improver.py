@@ -73,7 +73,7 @@ class MetacognitiveImprover:
         ]
         for s_name, s_ms in sorted(stage_pairs, key=lambda kv: kv[1], reverse=True):
             pct = (s_ms / total_ms) * 100.0
-            if pct >= 40.0 and s_ms >= 250.0:
+            if pct >= 35.0 and s_ms >= 100.0:
                 goals.append(ImprovementGoal(
                     goal_id=f"META-BOTTLENECK-{s_name.upper()}",
                     priority="P1_HIGH",
@@ -98,8 +98,8 @@ class MetacognitiveImprover:
                     recommendation="Tighten dependency keys in _salsa_ssa_cache / _salsa_obj_cache.",
                 ))
 
-        # 4. Optimization opportunity detection
-        if codegen.get("real_ast_functions_compiled", 0) >= 4 and codegen.get("vectorized_loops", 0) == 0:
+        # 4. Optimization opportunity detection (evaluated on fresh compilation)
+        if build_kind == "cold" and codegen.get("real_ast_functions_compiled", 0) >= 4 and codegen.get("vectorized_loops", 0) == 0:
             goals.append(ImprovementGoal(
                 goal_id="META-P2-VECTORIZER",
                 priority="P2_OPTIMIZATION",

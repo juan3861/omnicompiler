@@ -46,7 +46,7 @@ class LLVMBackend:
 
     @staticmethod
     def _llvm_type(var_type: str) -> str:
-        return "double" if var_type == "f64" else "i64"
+        return "double" if var_type in ("f64", "f32", "float", "double") else "i64"
 
     def __init__(self, opt_level: int = 3):
         self.opt_level = opt_level

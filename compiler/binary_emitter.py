@@ -1376,6 +1376,14 @@ class StandaloneBinaryEmitter:
         code_off = self._align_up(interp_off + len(interp_bytes), 16)
         entry_vaddr = vaddr + code_off
 
+        if callable(custom_code):
+            # Two-pass: probe length with dummy GOT slots, then emit with the real slot vaddrs.
+            probe = bytes(custom_code({fn: 0 for fn in imported_funcs}, entry_vaddr))
+            _, real_slots = self.build_elf64_dynamic_exe(needed_libs, imported_funcs, probe, exit_code)
+            real = bytes(custom_code(real_slots, entry_vaddr))
+            assert len(real) == len(probe), "ELF code builder must be length-stable across passes"
+            return self.build_elf64_dynamic_exe(needed_libs, imported_funcs, real, exit_code)
+
         if custom_code is not None:
             code = bytearray(custom_code)
         else:
@@ -1431,6 +1439,8 @@ class StandaloneBinaryEmitter:
         dyn_table.extend(struct.pack("<QQ", 20, 7))                       # DT_PLTREL = DT_RELA
         dyn_table.extend(struct.pack("<QQ", 2, len(rela_plt)))            # DT_PLTRELSZ
         dyn_table.extend(struct.pack("<QQ", 23, vaddr + rela_plt_off))    # DT_JMPREL
+        dyn_table.extend(struct.pack("<QQ", 24, 0))                       # DT_BIND_NOW (no lazy PLT0 stub emitted)
+        dyn_table.extend(struct.pack("<QQ", 30, 8))                       # DT_FLAGS = DF_BIND_NOW
         dyn_table.extend(struct.pack("<QQ", 0, 0))                        # DT_NULL
 
         total_size = dynamic_off + len(dyn_table)
@@ -1464,9 +1474,70 @@ class StandaloneBinaryEmitter:
         buf[dynstr_off:dynstr_off + len(dynstr)] = dynstr
         buf[dynsym_off:dynsym_off + len(dynsym)] = dynsym
         buf[hash_off:hash_off + len(hash_bytes)] = hash_bytes
+        buf[got_plt_off:got_plt_off + 8] = struct.pack("<Q", vaddr + dynamic_off)  # GOT[0] = _DYNAMIC
         buf[rela_plt_off:rela_plt_off + len(rela_plt)] = rela_plt
         buf[dynamic_off:dynamic_off + len(dyn_table)] = dyn_table
         return bytes(buf), got_slot_vaddrs
+
+    def emit_dynamic_executable(
+        self,
+        output_path: str,
+        needed_libs: Union[List[str], Dict[str, List[str]]],
+        imported_funcs: Optional[List[str]] = None,
+        target_format: str = "auto",
+        custom_code: Optional[Any] = None,
+        exit_code: int = 0,
+    ) -> Tuple[str, Dict[str, int]]:
+        """
+        Emits a dynamic standalone native executable (.exe on Windows or ELF64 on Linux)
+        with real OS dynamic import tables and GOT/IAT slot resolutions.
+        """
+        if target_format == "auto":
+            target_format = "pe64" if sys.platform == "win32" else "elf64"
+
+        if target_format == "pe64":
+            if not output_path.endswith(".exe"):
+                output_path += ".exe"
+            if isinstance(needed_libs, dict):
+                imports_by_dll = needed_libs
+            else:
+                imports_by_dll = {lib: (imported_funcs or []) for lib in needed_libs}
+            if callable(custom_code):
+                builder = custom_code
+            else:
+                def builder(slots, text_rva):
+                    exit_proc_rva = next((rva for (dll, sym), rva in slots.items() if sym == "ExitProcess"), None)
+                    if exit_proc_rva is not None:
+                        c = bytearray()
+                        c.extend(b"\x48\x83\xec\x28")  # sub rsp, 40
+                        c.extend(b"\xb9" + struct.pack("<I", exit_code & 0xFFFFFFFF))  # mov ecx, exit_code
+                        c.extend(b"\xff\x15")  # call [rip + disp32]
+                        disp = exit_proc_rva - (text_rva + len(c) + 4)
+                        c.extend(struct.pack("<i", disp))
+                        c.extend(b"\x90" * 8)
+                        return bytes(c)
+                    return b"\xb8" + struct.pack("<I", exit_code & 0xFFFFFFFF) + b"\xc3"
+            data, raw_slots = self.build_pe64_multi_import_exe(
+                imports=imports_by_dll,
+                code_builder=builder,
+            )
+            slot_map = {sym: rva for (dll, sym), rva in raw_slots.items()}
+        elif target_format == "elf64":
+            libs_list = list(needed_libs.keys()) if isinstance(needed_libs, dict) else needed_libs
+            funcs_list = imported_funcs or (
+                [fn for fns in needed_libs.values() for fn in fns] if isinstance(needed_libs, dict) else []
+            )
+            data, slot_map = self.build_elf64_dynamic_exe(
+                needed_libs=libs_list,
+                imported_funcs=funcs_list,
+                custom_code=custom_code,
+                exit_code=exit_code,
+            )
+        else:
+            raise ValueError(f"Dynamic executables unsupported for format: {target_format}")
+
+        self._write_file(output_path, data)
+        return output_path, slot_map
 
     def _write_file(self, path: str, data: bytes):
         dir_path = os.path.dirname(path)

@@ -88,7 +88,7 @@ class LoopVectorizerPass:
                     continue
                 insts = body_blk.instructions
                 has_raw_store = any(
-                    ins.opcode == "store"
+                    ins.opcode in ("store", "store_off")
                     or (
                         ins.opcode == "call"
                         and ins.operands
@@ -209,6 +209,36 @@ class LoopVectorizerPass:
                         res_var=final_var,
                     )
 
+                    stats["vectorized_sums"] += 1
+                    changed = True
+                    break
+
+                # 4. Check for Struct/Buffer Array Parallel Reduction Sum pattern (META-P2-VECTORIZER):
+                struct_sum_pattern = self._match_struct_array_sum(block, body_blk, reachable_from_body)
+                if struct_sum_pattern:
+                    base_ptr, base_offset, stride, bound_count, width, acc_prev, acc_next, is_float = struct_sum_pattern
+                    replacement_insts, res_var = self._build_unrolled_tree_reduction(
+                        fn=fn,
+                        pre_bb=pre_bb,
+                        cond_bb=block,
+                        base_ptr=base_ptr,
+                        base_offset=base_offset,
+                        stride=stride,
+                        bound_count=bound_count,
+                        width=width,
+                        acc_prev=acc_prev,
+                        is_float=is_float,
+                        step_id=stats["vectorized_sums"],
+                    )
+                    self._rewrite_loop(
+                        fn=fn,
+                        pre_bb=pre_bb,
+                        cond_bb=block,
+                        exit_bb=exit_blk,
+                        replacement_insts=replacement_insts,
+                        replaced_vars=[acc_prev, acc_next],
+                        res_var=res_var,
+                    )
                     stats["vectorized_sums"] += 1
                     changed = True
                     break
@@ -414,6 +444,137 @@ class LoopVectorizerPass:
                     return (loads[m0], loads[m1], acc_var, res_var, is_f)
 
         return None
+
+    def _match_struct_array_sum(
+        self,
+        cond_bb: BasicBlock,
+        body_bb: BasicBlock,
+        reachable_from_body: Set[BasicBlock],
+    ) -> Optional[Tuple[Any, int, int, int, str, SSAVar, SSAVar, bool]]:
+        # 1. Identify induction var and bound in cond_bb
+        cmp_inst = next((ins for ins in cond_bb.instructions if ins.opcode in ("cmp_lt", "cmp_le")), None)
+        if not cmp_inst or len(cmp_inst.operands) < 2:
+            return None
+        i_var, bound_op = cmp_inst.operands[0], cmp_inst.operands[1]
+        is_le = cmp_inst.opcode == "cmp_le"
+
+        bound_val = None
+        if isinstance(bound_op, int):
+            bound_val = bound_op
+        else:
+            search_insts = list(cond_bb.instructions)
+            for p in cond_bb.predecessors:
+                search_insts.extend(p.instructions)
+            for ins in search_insts:
+                if ins.result == bound_op and ins.opcode == "const" and ins.operands:
+                    bound_val = ins.operands[0]
+                    break
+        if bound_val is None:
+            return None
+        bound_count = (bound_val + 1) if is_le else bound_val
+        if bound_count <= 0 or bound_count > 64:
+            return None
+
+        # 2. In loop body blocks, find load_off (must be a pure reduction without stores)
+        all_body_insts = list(body_bb.instructions)
+        for b in reachable_from_body:
+            all_body_insts.extend(b.instructions)
+
+        if any(ins.opcode in ("store", "store_off") for ins in all_body_insts):
+            return None
+
+        load_off_inst = next((ins for ins in all_body_insts if ins.opcode == "load_off"), None)
+        if not load_off_inst or len(load_off_inst.operands) < 3:
+            return None
+
+        base_ptr, off_var, width = load_off_inst.operands[0], load_off_inst.operands[1], str(load_off_inst.operands[2])
+
+        # Resolve offset computation
+        base_offset = 0
+        stride = 4 if "32" in width else 8
+        for ins in all_body_insts:
+            if ins.result == off_var and ins.opcode == "add" and len(ins.operands) == 2:
+                op0, op1 = ins.operands[0], ins.operands[1]
+                for c_ins in all_body_insts:
+                    if c_ins.result in (op0, op1) and c_ins.opcode == "const" and c_ins.operands:
+                        base_offset = c_ins.operands[0]
+                    if c_ins.result in (op0, op1) and c_ins.opcode == "mul" and len(c_ins.operands) == 2:
+                        for m_ins in all_body_insts:
+                            if m_ins.result in c_ins.operands and m_ins.opcode == "const" and m_ins.operands:
+                                stride = m_ins.operands[0]
+            elif ins.result == off_var and ins.opcode == "mul" and len(ins.operands) == 2:
+                for m_ins in all_body_insts:
+                    if m_ins.result in ins.operands and m_ins.opcode == "const" and m_ins.operands:
+                        stride = m_ins.operands[0]
+
+        # 3. Find accumulator update
+        acc_inst = next(
+            (ins for ins in all_body_insts if ins.opcode in ("add", "fadd") and load_off_inst.result in ins.operands),
+            None,
+        )
+        if not acc_inst or len(acc_inst.operands) < 2:
+            return None
+
+        acc_prev = acc_inst.operands[0] if acc_inst.operands[1] == load_off_inst.result else acc_inst.operands[1]
+        acc_next = acc_inst.result
+        is_float = acc_inst.opcode == "fadd" or "f" in width
+
+        return (base_ptr, int(base_offset), int(stride), int(bound_count), width, acc_prev, acc_next, is_float)
+
+    def _build_unrolled_tree_reduction(
+        self,
+        fn: SSAFunction,
+        pre_bb: BasicBlock,
+        cond_bb: BasicBlock,
+        base_ptr: Any,
+        base_offset: int,
+        stride: int,
+        bound_count: int,
+        width: str,
+        acc_prev: Any,
+        is_float: bool,
+        step_id: int,
+    ) -> Tuple[List[SSAInstruction], SSAVar]:
+        insts: List[SSAInstruction] = []
+        loads: List[SSAVar] = []
+
+        for k in range(bound_count):
+            cur_off = base_offset + k * stride
+            off_v = SSAVar(f"vec_off_{step_id}_{k}", 0)
+            insts.append(SSAInstruction(off_v, "const", [cur_off]))
+            ld_v = SSAVar(f"vec_ld_{step_id}_{k}", 0, var_type=width)
+            insts.append(SSAInstruction(ld_v, "load_off", [base_ptr, off_v, width]))
+            loads.append(ld_v)
+
+        curr = loads
+        round_idx = 0
+        op = "fadd" if is_float else "add"
+        while len(curr) > 1:
+            nxt = []
+            for j in range(0, len(curr), 2):
+                if j + 1 < len(curr):
+                    r_v = SSAVar(f"vec_tree_{step_id}_{round_idx}_{j//2}", 0, var_type=width)
+                    insts.append(SSAInstruction(r_v, op, [curr[j], curr[j+1]]))
+                    nxt.append(r_v)
+                else:
+                    nxt.append(curr[j])
+            curr = nxt
+            round_idx += 1
+
+        sum_res = curr[0] if curr else SSAVar(f"vec_zero_{step_id}", 0, var_type=width)
+
+        # Check initial accumulator from pre_bb
+        init_val = self._find_init_acc(cond_bb, pre_bb, acc_prev)
+        if init_val is not None and not self._is_const_zero(fn, init_val):
+            final_res = SSAVar(f"vec_sum_acc_{step_id}", 0, var_type=width)
+            insts.append(SSAInstruction(final_res, op, [init_val, sum_res]))
+        else:
+            final_res = sum_res
+
+        if is_float and fn.return_type in ("float", "f32", "f64", None):
+            fn.return_type = "f64" if "64" in width else "f32"
+
+        return insts, final_res
 
     def vectorize_vla_function(
         self,

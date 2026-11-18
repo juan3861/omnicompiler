@@ -1,14 +1,13 @@
 # ALPHA-C40 METACOGNITION & CONTINUOUS IMPROVEMENT GOALS
 
 - **Stress Topology:** 9 polyglot repos, 41 exported symbols
-- **Cold Compile:** `1169.8 ms` | **Warm Compile:** `217.09 ms` (**5.39x**)
-- **1-File Edit Compile:** `344.47 ms` (`stage5_ssa_opt_smt`: `253.42 ms`, `salsa_artifact_hits`: `40`)
+- **Cold Compile:** `2510.11 ms` | **Warm Compile:** `241.92 ms` (**10.38x**)
+- **1-File Edit Compile:** `400.81 ms` (`stage5_ssa_opt_smt`: `291.96 ms`, `salsa_artifact_hits`: `40`)
 
 ## Detected Bottlenecks & Generated Improvement Goals
 | Build | Goal ID | Priority | Stage | Observed | Target | Action |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| cold | `META-BOTTLENECK-STAGE5_SSA_OPT_SMT` | P1_HIGH | `stage5_ssa_opt_smt` | 890.17 ms (76.1% of 1169.42 ms) | < 25% of total pipeline latency | Parallelize or memoize hot path in stage5_ssa_opt_smt. |
-| cold | `META-P2-VECTORIZER` | P2_OPTIMIZATION | `stage5_ssa_opt_smt` | vectorized_loops=0 | Auto-vectorize contiguous array/struct reduction loops | Extend LoopVectorizerPass to recognize C-ABI struct Array[T, N] reductions. |
-| warm | `META-P2-VECTORIZER` | P2_OPTIMIZATION | `stage5_ssa_opt_smt` | vectorized_loops=0 | Auto-vectorize contiguous array/struct reduction loops | Extend LoopVectorizerPass to recognize C-ABI struct Array[T, N] reductions. |
-| incremental | `META-BOTTLENECK-STAGE5_SSA_OPT_SMT` | P1_HIGH | `stage5_ssa_opt_smt` | 253.42 ms (73.7% of 343.91 ms) | < 25% of total pipeline latency | Parallelize or memoize hot path in stage5_ssa_opt_smt. |
-| incremental | `META-P2-VECTORIZER` | P2_OPTIMIZATION | `stage5_ssa_opt_smt` | vectorized_loops=0 | Auto-vectorize contiguous array/struct reduction loops | Extend LoopVectorizerPass to recognize C-ABI struct Array[T, N] reductions. |
+| cold | `META-BOTTLENECK-STAGE5C_Z3_BOUNDS` | P1_HIGH | `stage5c_z3_bounds` | 1298.50 ms (51.7% of 2509.37 ms) | < 25% of total pipeline latency | Parallelize or memoize hot path in stage5c_z3_bounds. |
+| cold | `META-BOTTLENECK-STAGE5_SSA_OPT_SMT` | P1_HIGH | `stage5_ssa_opt_smt` | 916.30 ms (36.5% of 2509.37 ms) | < 25% of total pipeline latency | Parallelize or memoize hot path in stage5_ssa_opt_smt. |
+| warm | `META-BOTTLENECK-STAGE1_INGESTION` | P1_HIGH | `stage1_ingestion` | 118.60 ms (49.2% of 241.23 ms) | < 25% of total pipeline latency | Parallelize or memoize hot path in stage1_ingestion. |
+| incremental | `META-BOTTLENECK-STAGE5_SSA_OPT_SMT` | P1_HIGH | `stage5_ssa_opt_smt` | 291.96 ms (72.9% of 400.29 ms) | < 25% of total pipeline latency | Parallelize or memoize hot path in stage5_ssa_opt_smt. |

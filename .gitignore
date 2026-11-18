@@ -29,6 +29,7 @@ MANIFEST
 # Workspaces & Compiler Cache
 .rc_workspace/
 .rc_evolution_workspace/
+.proof/
 HEAD/
 *.db
 *.db-wal
