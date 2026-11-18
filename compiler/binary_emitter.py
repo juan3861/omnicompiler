@@ -153,78 +153,7 @@ class StandaloneBinaryEmitter:
             rva_idata = 0x1000 + self._align_up(max(1, est_text), sec_align)
 
             asm = MiniAssembler()
-            asm.emit(b"\x48\x83\xec\x28")  # sub rsp, 40
-
-            call_getcmd_rip = 0x1000 + len(asm.code) + 6
-            asm.emit(b"\xff\x15" + struct.pack("<i", (rva_idata + 0x58) - call_getcmd_rip))
-
-            asm.emit(b"\x48\x89\xc6")                    # mov rsi, rax
-            asm.emit(b"\x48\xc7\xc3\x0a\x00\x00\x00")    # mov rbx, 10 (default argument)
-
-            asm.emit(b"\x0f\xb6\x0e")                    # movzx rcx, byte [rsi]
-            asm.emit(b"\x80\xf9\x22")                    # cmp cl, '"'
-            asm.jmp_rel8(0x75, "skip_no_quote")
-
-            asm.label("skip_quoted")
-            asm.emit(b"\x48\xff\xc6")
-            asm.emit(b"\x0f\xb6\x0e")
-            asm.emit(b"\x84\xc9")
-            asm.jmp_rel8(0x74, "use_default")
-            asm.emit(b"\x80\xf9\x22")
-            asm.jmp_rel8(0x75, "skip_quoted")
-            asm.emit(b"\x48\xff\xc6")
-            asm.jmp_rel8(0xeb, "find_arg")
-
-            asm.label("skip_no_quote")
-            asm.emit(b"\x0f\xb6\x0e")
-            asm.emit(b"\x84\xc9")
-            asm.jmp_rel8(0x74, "use_default")
-            asm.emit(b"\x80\xf9\x20")
-            asm.jmp_rel8(0x74, "find_arg")
-            asm.emit(b"\x48\xff\xc6")
-            asm.jmp_rel8(0xeb, "skip_no_quote")
-
-            asm.label("find_arg")
-            asm.emit(b"\x0f\xb6\x0e")
-            asm.emit(b"\x84\xc9")
-            asm.jmp_rel8(0x74, "use_default")
-            asm.emit(b"\x80\xf9\x20")
-            asm.jmp_rel8(0x75, "parse_num")
-            asm.emit(b"\x48\xff\xc6")
-            asm.jmp_rel8(0xeb, "find_arg")
-
-            asm.label("parse_num")
-            asm.emit(b"\x80\xf9\x30")
-            asm.jmp_rel8(0x72, "use_default")
-            asm.emit(b"\x80\xf9\x39")
-            asm.jmp_rel8(0x77, "use_default")
-            asm.emit(b"\x48\x31\xdb")
-
-            asm.label("num_loop")
-            asm.emit(b"\x0f\xb6\x0e")
-            asm.emit(b"\x48\xff\xc6")
-            asm.emit(b"\x84\xc9")
-            asm.jmp_rel8(0x74, "use_default")
-            asm.emit(b"\x80\xf9\x30")
-            asm.jmp_rel8(0x72, "use_default")
-            asm.emit(b"\x80\xf9\x39")
-            asm.jmp_rel8(0x77, "use_default")
-            asm.emit(b"\x80\xe9\x30")
-            asm.emit(b"\x48\x6b\xdb\x0a")
-            asm.emit(b"\x48\x0f\xb6\xd1")
-            asm.emit(b"\x48\x01\xd3")
-            asm.jmp_rel8(0xeb, "num_loop")
-
-            asm.label("use_default")
-            asm.emit(b"\x48\x89\xd9")                    # mov rcx, rbx
-            asm.jmp_rel32(b"\xe8", "fn_target", entry_offset)
-            asm.emit(b"\x89\xc1")                        # mov ecx, eax
-
-            call_exit_rip = 0x1000 + len(asm.code) + 6
-            asm.emit(b"\xff\x15" + struct.pack("<i", (rva_idata + 0x50) - call_exit_rip))
-            asm.emit(b"\x48\x83\xc4\x28\xc3")
-
-            asm.label("fn_target")
+            self._emit_pe64_cli_entry_prefix(asm, 0x1000, rva_idata + 0x58, rva_idata + 0x50, entry_offset)
             asm.emit(custom_code)
 
             text_code = bytearray(asm.resolve())
@@ -607,42 +536,7 @@ class StandaloneBinaryEmitter:
         code = bytearray()
         if entry_offset is not None and custom_code:
             asm = MiniAssembler()
-            asm.emit(b"\x48\xc7\xc0\x0a\x00\x00\x00")
-            asm.emit(b"\x48\x8b\x34\x24")
-            asm.emit(b"\x48\x83\xfe\x02")
-            asm.jmp_rel8(0x7c, "use_default")
-
-            asm.emit(b"\x48\x8b\x74\x24\x10")
-            asm.emit(b"\x0f\xb6\x0e")
-            asm.emit(b"\x80\xf9\x30")
-            asm.jmp_rel8(0x72, "use_default")
-            asm.emit(b"\x80\xf9\x39")
-            asm.jmp_rel8(0x77, "use_default")
-            asm.emit(b"\x48\x31\xc0")
-
-            asm.label("parse_loop")
-            asm.emit(b"\x0f\xb6\x0e")
-            asm.emit(b"\x48\xff\xc6")
-            asm.emit(b"\x84\xc9")
-            asm.jmp_rel8(0x74, "use_default")
-            asm.emit(b"\x80\xf9\x30")
-            asm.jmp_rel8(0x72, "use_default")
-            asm.emit(b"\x80\xf9\x39")
-            asm.jmp_rel8(0x77, "use_default")
-            asm.emit(b"\x80\xe9\x30")
-            asm.emit(b"\x48\x6b\xc0\x0a")
-            asm.emit(b"\x48\x0f\xb6\xd1")
-            asm.emit(b"\x48\x01\xd0")
-            asm.jmp_rel8(0xeb, "parse_loop")
-
-            asm.label("use_default")
-            asm.emit(b"\x48\x89\xc7")
-            asm.jmp_rel32(b"\xe8", "fn_target", entry_offset)
-            asm.emit(b"\x89\xc7")
-            asm.emit(b"\xb8\x3c\x00\x00\x00")
-            asm.emit(b"\x0f\x05")
-
-            asm.label("fn_target")
+            self._emit_elf64_cli_entry_prefix(asm, entry_offset)
             asm.emit(custom_code)
             code = bytearray(asm.resolve())
         elif custom_code:
@@ -1538,6 +1432,219 @@ class StandaloneBinaryEmitter:
 
         self._write_file(output_path, data)
         return output_path, slot_map
+
+    @staticmethod
+    def _emit_pe64_cli_entry_prefix(
+        asm: "MiniAssembler",
+        text_rva: int,
+        getcmd_iat_rva: int,
+        exit_iat_rva: int,
+        entry_offset: int,
+    ) -> None:
+        """Emits Win64 CLI entrypoint parsing argv[1] into rcx, calling fn_target+entry_offset, and calling ExitProcess(eax)."""
+        asm.emit(b"\x48\x83\xec\x28")  # sub rsp, 40
+
+        call_getcmd_rip = text_rva + len(asm.code) + 6
+        asm.emit(b"\xff\x15" + struct.pack("<i", getcmd_iat_rva - call_getcmd_rip))
+
+        asm.emit(b"\x48\x89\xc6")                    # mov rsi, rax
+        asm.emit(b"\x48\xc7\xc3\x0a\x00\x00\x00")    # mov rbx, 10 (default argument)
+
+        asm.emit(b"\x0f\xb6\x0e")                    # movzx rcx, byte [rsi]
+        asm.emit(b"\x80\xf9\x22")                    # cmp cl, '"'
+        asm.jmp_rel8(0x75, "skip_no_quote")
+
+        asm.label("skip_quoted")
+        asm.emit(b"\x48\xff\xc6")
+        asm.emit(b"\x0f\xb6\x0e")
+        asm.emit(b"\x84\xc9")
+        asm.jmp_rel8(0x74, "use_default")
+        asm.emit(b"\x80\xf9\x22")
+        asm.jmp_rel8(0x75, "skip_quoted")
+        asm.emit(b"\x48\xff\xc6")
+        asm.jmp_rel8(0xeb, "find_arg")
+
+        asm.label("skip_no_quote")
+        asm.emit(b"\x0f\xb6\x0e")
+        asm.emit(b"\x84\xc9")
+        asm.jmp_rel8(0x74, "use_default")
+        asm.emit(b"\x80\xf9\x20")
+        asm.jmp_rel8(0x74, "find_arg")
+        asm.emit(b"\x48\xff\xc6")
+        asm.jmp_rel8(0xeb, "skip_no_quote")
+
+        asm.label("find_arg")
+        asm.emit(b"\x0f\xb6\x0e")
+        asm.emit(b"\x84\xc9")
+        asm.jmp_rel8(0x74, "use_default")
+        asm.emit(b"\x80\xf9\x20")
+        asm.jmp_rel8(0x75, "parse_num")
+        asm.emit(b"\x48\xff\xc6")
+        asm.jmp_rel8(0xeb, "find_arg")
+
+        asm.label("parse_num")
+        asm.emit(b"\x80\xf9\x30")
+        asm.jmp_rel8(0x72, "use_default")
+        asm.emit(b"\x80\xf9\x39")
+        asm.jmp_rel8(0x77, "use_default")
+        asm.emit(b"\x48\x31\xdb")
+
+        asm.label("num_loop")
+        asm.emit(b"\x0f\xb6\x0e")
+        asm.emit(b"\x48\xff\xc6")
+        asm.emit(b"\x84\xc9")
+        asm.jmp_rel8(0x74, "use_default")
+        asm.emit(b"\x80\xf9\x30")
+        asm.jmp_rel8(0x72, "use_default")
+        asm.emit(b"\x80\xf9\x39")
+        asm.jmp_rel8(0x77, "use_default")
+        asm.emit(b"\x80\xe9\x30")
+        asm.emit(b"\x48\x6b\xdb\x0a")
+        asm.emit(b"\x48\x0f\xb6\xd1")
+        asm.emit(b"\x48\x01\xd3")
+        asm.jmp_rel8(0xeb, "num_loop")
+
+        asm.label("use_default")
+        asm.emit(b"\x48\x89\xd9")                    # mov rcx, rbx
+        asm.jmp_rel32(b"\xe8", "fn_target", entry_offset)
+        asm.emit(b"\x89\xc1")                        # mov ecx, eax
+
+        call_exit_rip = text_rva + len(asm.code) + 6
+        asm.emit(b"\xff\x15" + struct.pack("<i", exit_iat_rva - call_exit_rip))
+        asm.emit(b"\x48\x83\xc4\x28\xc3")
+
+        asm.label("fn_target")
+
+    @staticmethod
+    def _emit_elf64_cli_entry_prefix(
+        asm: "MiniAssembler",
+        entry_offset: int,
+        exit_got_spec: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        """Emits Linux SysV _start CLI entrypoint parsing argv[1] into rdi, calling fn_target+entry_offset, and exiting."""
+        asm.emit(b"\x48\xc7\xc0\x0a\x00\x00\x00")
+        asm.emit(b"\x48\x8b\x34\x24")
+        asm.emit(b"\x48\x83\xfe\x02")
+        asm.jmp_rel8(0x7c, "use_default")
+
+        asm.emit(b"\x48\x8b\x74\x24\x10")
+        asm.emit(b"\x0f\xb6\x0e")
+        asm.emit(b"\x80\xf9\x30")
+        asm.jmp_rel8(0x72, "use_default")
+        asm.emit(b"\x80\xf9\x39")
+        asm.jmp_rel8(0x77, "use_default")
+        asm.emit(b"\x48\x31\xc0")
+
+        asm.label("parse_loop")
+        asm.emit(b"\x0f\xb6\x0e")
+        asm.emit(b"\x48\xff\xc6")
+        asm.emit(b"\x84\xc9")
+        asm.jmp_rel8(0x74, "use_default")
+        asm.emit(b"\x80\xf9\x30")
+        asm.jmp_rel8(0x72, "use_default")
+        asm.emit(b"\x80\xf9\x39")
+        asm.jmp_rel8(0x77, "use_default")
+        asm.emit(b"\x80\xe9\x30")
+        asm.emit(b"\x48\x6b\xc0\x0a")
+        asm.emit(b"\x48\x0f\xb6\xd1")
+        asm.emit(b"\x48\x01\xd0")
+        asm.jmp_rel8(0xeb, "parse_loop")
+
+        asm.label("use_default")
+        asm.emit(b"\x48\x89\xc7")
+        asm.jmp_rel32(b"\xe8", "fn_target", entry_offset)
+        asm.emit(b"\x89\xc7")
+        if exit_got_spec is not None:
+            entry_vaddr, exit_got_vaddr = exit_got_spec
+            call_exit_rip = entry_vaddr + len(asm.code) + 6
+            asm.emit(b"\xff\x15" + struct.pack("<i", exit_got_vaddr - call_exit_rip))
+        else:
+            asm.emit(b"\xb8\x3c\x00\x00\x00")
+            asm.emit(b"\x0f\x05")
+
+        asm.label("fn_target")
+
+    def emit_dynamic_linked_executable(
+        self,
+        output_path: str,
+        linked_code: bytes,
+        entry_offset: int,
+        os_import_stubs: Dict[str, int],
+        os_import_table: Dict[str, Tuple[str, str]],
+        target_format: str = "auto",
+    ) -> str:
+        """
+        Emits a native executable (`pe64` or `elf64`) wrapping `linked_code` with CLI entrypoint,
+        synthesizing OS dynamic import tables (`.idata` / `.dynsym`+`.got.plt`), and patching
+        every OS stub in `os_import_stubs` to `jmp qword ptr [rip + iat_or_got_disp32]`.
+        """
+        if target_format == "auto":
+            target_format = "pe64" if sys.platform == "win32" else "elf64"
+
+        if target_format == "pe64":
+            if not output_path.endswith(".exe"):
+                output_path += ".exe"
+            imports_by_dll: Dict[str, List[str]] = {
+                "KERNEL32.dll": ["ExitProcess", "GetCommandLineA"],
+            }
+            for sym in sorted(os_import_stubs.keys()):
+                win_dll, _ = os_import_table[sym]
+                syms_for_dll = imports_by_dll.setdefault(win_dll, [])
+                if sym not in syms_for_dll:
+                    syms_for_dll.append(sym)
+
+            def pe_builder(iat_rva_map: Dict[Tuple[str, str], int], text_rva: int) -> bytes:
+                getcmd_rva = iat_rva_map[("KERNEL32.dll", "GetCommandLineA")]
+                exit_rva = iat_rva_map[("KERNEL32.dll", "ExitProcess")]
+                flat_slots = {s: rva for (_d, s), rva in iat_rva_map.items()}
+                asm = MiniAssembler()
+                self._emit_pe64_cli_entry_prefix(asm, text_rva, getcmd_rva, exit_rva, entry_offset)
+                code_start_off = len(asm.code)
+                patched = bytearray(linked_code)
+                for sym, stub_off in os_import_stubs.items():
+                    stub_rip = text_rva + code_start_off + stub_off + 6
+                    disp = flat_slots[sym] - stub_rip
+                    patched[stub_off : stub_off + 6] = b"\xff\x25" + struct.pack("<i", disp)
+                asm.emit(bytes(patched))
+                return asm.resolve()
+
+            data, _ = self.build_pe64_multi_import_exe(imports=imports_by_dll, code_builder=pe_builder)
+
+        elif target_format == "elf64":
+            needed_libs: List[str] = ["libc.so.6"]
+            imported_funcs = sorted(set(os_import_stubs.keys()) | {"exit"})
+            for sym in imported_funcs:
+                if sym in os_import_table:
+                    _, so_name = os_import_table[sym]
+                    if so_name not in needed_libs:
+                        needed_libs.append(so_name)
+
+            def elf_builder(got_slots: Dict[str, int], entry_vaddr: int) -> bytes:
+                asm = MiniAssembler()
+                self._emit_elf64_cli_entry_prefix(
+                    asm,
+                    entry_offset,
+                    exit_got_spec=(entry_vaddr, got_slots["exit"]),
+                )
+                code_start_off = len(asm.code)
+                patched = bytearray(linked_code)
+                for sym, stub_off in os_import_stubs.items():
+                    stub_rip = entry_vaddr + code_start_off + stub_off + 6
+                    disp = got_slots[sym] - stub_rip
+                    patched[stub_off : stub_off + 6] = b"\xff\x25" + struct.pack("<i", disp)
+                asm.emit(bytes(patched))
+                return asm.resolve()
+
+            data, _ = self.build_elf64_dynamic_exe(
+                needed_libs=needed_libs,
+                imported_funcs=imported_funcs,
+                custom_code=elf_builder,
+            )
+        else:
+            raise ValueError(f"Dynamic linked executables unsupported for format: {target_format}")
+
+        self._write_file(output_path, data)
+        return output_path
 
     def _write_file(self, path: str, data: bytes):
         dir_path = os.path.dirname(path)

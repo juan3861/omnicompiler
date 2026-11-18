@@ -201,8 +201,28 @@ class LLVMIRToSSALifter:
         load_narrow_map: Dict[str, Tuple[Any, Any, str]] = {}
         load_f32_map: Dict[str, Tuple[Any, Any, bool]] = {}
         module_luts: Dict[str, Tuple[str, Tuple[Any, ...]]] = {}
+        module_cstrs: Dict[str, bytes] = {}
         lut_gep_map: Dict[str, Tuple[str, Any]] = {}
         load_lut_narrow_map: Dict[str, Tuple[str, Any]] = {}
+
+        for cm in re.finditer(
+            r'@([A-Za-z0-9_.$]+)\s*=\s*[^\n]*?constant\s*\[\d+\s+x\s+i8\]\s*c"([^"]*)"',
+            llvm_ir,
+        ):
+            c_sym, hex_body = cm.group(1), cm.group(2)
+            raw_out = bytearray()
+            idx_h = 0
+            while idx_h < len(hex_body):
+                if hex_body[idx_h] == "\\" and idx_h + 2 < len(hex_body):
+                    try:
+                        raw_out.append(int(hex_body[idx_h + 1 : idx_h + 3], 16))
+                        idx_h += 3
+                        continue
+                    except ValueError:
+                        pass
+                raw_out.append(ord(hex_body[idx_h]))
+                idx_h += 1
+            module_cstrs[c_sym] = bytes(raw_out)
 
         for lm in re.finditer(
             r"@([A-Za-z0-9_.$]+)\s*=\s*[^\n]*?constant\s*\[(\d+)\s+x\s+(i8|i16|i32|i64|float|double)\]\s*\[([^\]]+)\]",
@@ -347,6 +367,17 @@ class LLVMIRToSSALifter:
                 res_v = get_or_create_var(lhs_tok)
                 alloca_ptrs[lhs_name] = res_v
                 cur_bb.add_instruction(SSAInstruction(res_v, "alloca", [parse_val(m_alloca.group(1))]))
+                continue
+
+            m_ptoi_g = re.match(r"^ptrtoint\s+ptr\s+@([A-Za-z0-9_.$]+)\s+to\s+i64$", rhs)
+            if m_ptoi_g:
+                g_sym = m_ptoi_g.group(1)
+                res_v = get_or_create_var(lhs_tok)
+                if g_sym in module_cstrs:
+                    ssa_fn.cstrs[g_sym] = module_cstrs[g_sym]
+                    cur_bb.add_instruction(SSAInstruction(res_v, "cstr_addr", [g_sym]))
+                else:
+                    cur_bb.add_instruction(SSAInstruction(res_v, "const", [0]))
                 continue
 
             m_ptoi = re.match(r"^ptrtoint\s+ptr\s+(%[A-Za-z0-9_.$]+)\s+to\s+i64$", rhs)

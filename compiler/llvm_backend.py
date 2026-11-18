@@ -427,6 +427,11 @@ class LLVMBackend:
                         lines.append(f"    {lhs} = load {elem_ty}, ptr {gep_v}, align 1")
                     last_val = lhs
 
+                elif opcode == "cstr_addr":
+                    c_name = str(inst.operands[0])
+                    lines.append(f"    {lhs} = ptrtoint ptr @__omni_cstr_{ssa_func.name}_{c_name} to i64")
+                    last_val = lhs
+
                 elif opcode == "call":
                     callee = str(inst.operands[0])
                     arg_pairs = []
@@ -489,6 +494,11 @@ class LLVMBackend:
                         items.append(f"{elem_ty} {int(v)}")
                 out.append(
                     f"@__omni_lut_{fn.name}_{lut_name} = private unnamed_addr constant [{len(vals)} x {elem_ty}] [{', '.join(items)}], align 8"
+                )
+            for c_name, raw_b in sorted((getattr(fn, "cstrs", {}) or {}).items()):
+                hex_str = "".join(f"\\{b:02X}" for b in raw_b)
+                out.append(
+                    f'@__omni_cstr_{fn.name}_{c_name} = private unnamed_addr constant [{len(raw_b)} x i8] c"{hex_str}", align 1'
                 )
         return out
 

@@ -759,6 +759,11 @@ class X64CodeGenerator:
                         buf.emit(b"\x49\x8b\x03")
                     write_result_from_reg(inst.result, "rax")
 
+                elif op == "cstr_addr":
+                    c_name = str(inst.operands[0])
+                    buf.lea_r11_label(f".L_cstr_{c_name}")
+                    write_result_from_reg(inst.result, "r11")
+
                 elif op == "store_off":
                     resolve_operand_to_reg(inst.operands[0], "r11")  # base ptr
                     resolve_operand_to_reg(inst.operands[1], "rcx")  # byte offset
@@ -891,13 +896,17 @@ class X64CodeGenerator:
 
         code_end_off = len(buf.code)
         luts_map = getattr(fn, "luts", {}) or {}
-        if luts_map:
+        cstrs_map = getattr(fn, "cstrs", {}) or {}
+        if luts_map or cstrs_map:
             pad_rem = (-len(buf.code)) & 7
             if pad_rem:
                 buf.emit(b"\x90" * pad_rem)
             for l_name, (l_wt, l_vals) in sorted(luts_map.items()):
                 buf.mark(f".L_ro_{l_name}")
                 buf.emit(_pack_lut_bytes(l_wt, l_vals))
+            for c_name, c_bytes in sorted(cstrs_map.items()):
+                buf.mark(f".L_cstr_{c_name}")
+                buf.emit(c_bytes)
 
         final_bytes = buf.finalize()
         return CompiledFunctionArtifact(
@@ -1455,6 +1464,11 @@ class Arm64CodeGenerator:
                     else:
                         code.extend(_a64_u32(0xF940012B))
                     store_res(inst.result, 11)
+                elif op == "cstr_addr":
+                    c_name = str(inst.operands[0])
+                    b_fixups.append((len(code), "ADR", f".L_cstr_{c_name}"))
+                    code.extend(_a64_u32(0x10000009))  # ADR X9, #0 (patched)
+                    store_res(inst.result, 9)
                 elif op == "store_off":
                     load_op(inst.operands[0], 9)   # base ptr in X9
                     load_op(inst.operands[1], 10)  # byte offset in X10
@@ -1569,7 +1583,8 @@ class Arm64CodeGenerator:
         a64_code_end = len(code)
 
         luts_map = getattr(fn, "luts", {}) or {}
-        if luts_map:
+        cstrs_map = getattr(fn, "cstrs", {}) or {}
+        if luts_map or cstrs_map:
             if len(code) % 8 != 0:
                 code.extend(_a64_u32(0xD503201F))
             for l_name, (l_wt, l_vals) in sorted(luts_map.items()):
@@ -1577,6 +1592,10 @@ class Arm64CodeGenerator:
                 packed = _pack_lut_bytes(l_wt, l_vals)
                 rem4 = (-len(packed)) & 3
                 code.extend(packed + b"\x00" * rem4)
+            for c_name, c_bytes in sorted(cstrs_map.items()):
+                mark(f".L_cstr_{c_name}")
+                rem4 = (-len(c_bytes)) & 3
+                code.extend(c_bytes + b"\x00" * rem4)
 
         # Patch branches
         for off, kind, lbl in b_fixups:

@@ -42,6 +42,7 @@ def canonical_ssa_digest(fn: SSAFunction) -> str:
         tuple(sorted((getattr(fn, "param_types", {}) or {}).items())),
         getattr(fn, "return_type", "i64"),
         tuple(sorted((getattr(fn, "luts", {}) or {}).items())),
+        tuple(sorted((getattr(fn, "cstrs", {}) or {}).items())),
     )).encode("utf-8"))
     for blk in fn.blocks:
         h.update(blk.name.encode("utf-8"))
@@ -62,7 +63,7 @@ SUPPORTED_Z3_OPCODES = frozenset({
     "br", "br_cond", "ret",
 })
 
-SUPPORTED_Z3_MEMORY_OPCODES = frozenset({"alloca", "load", "store", "load_off", "store_off", "lut_load"})
+SUPPORTED_Z3_MEMORY_OPCODES = frozenset({"alloca", "load", "store", "load_off", "store_off", "lut_load", "cstr_addr"})
 SUPPORTED_Z3_METADATA_OPCODES = frozenset({"unroll_meta", "unroll_factor"})
 SUPPORTED_Z3_FLOAT_OPCODES = frozenset({
     "fconst", "fneg", "fadd", "fsub", "fmul", "fdiv",
@@ -202,6 +203,13 @@ class SSATranslationValidator:
         for k in range(1, len(elem_bvs)):
             acc = z3.If(idx_bv == z3.BitVecVal(k, 64), elem_bvs[k], acc)
         return acc
+
+    @staticmethod
+    def _eval_cstr_z3(fn: SSAFunction, c_name: str) -> z3.BitVecRef:
+        cstrs_m = getattr(fn, "cstrs", {}) or {}
+        raw_b = cstrs_m.get(c_name, b"\x00")
+        h_int = int.from_bytes(hashlib.sha256(raw_b).digest()[:6], "little") | 0x100000
+        return z3.BitVecVal(h_int, 64)
 
     @classmethod
     def _load_off_z3(cls, raw_bv: z3.BitVecRef, width: str) -> z3.BitVecRef:
@@ -555,6 +563,11 @@ class SSATranslationValidator:
                         if idx_v is None:
                             return {"error": "UNRESOLVED_LUT_LOAD"}
                         env_levels[lvl][inst.result] = self._eval_lut_load_z3(fn, lut_name, width, idx_v)
+
+                    elif op == "cstr_addr":
+                        if inst.result is None or not inst.operands:
+                            return {"error": "INVALID_CSTR_ADDR"}
+                        env_levels[lvl][inst.result] = self._eval_cstr_z3(fn, str(inst.operands[0]))
 
                     elif op in ("neg", "not"):
                         if len(inst.operands) != 1 or inst.result is None:
@@ -1009,6 +1022,11 @@ class SSATranslationValidator:
                     if idx_v is None:
                         return {"error": "UNRESOLVED_LUT_LOAD"}
                     local_env[inst.result] = self._eval_lut_load_z3(fn, lut_name, width, idx_v)
+
+                elif op == "cstr_addr":
+                    if inst.result is None or not inst.operands:
+                        return {"error": "INVALID_CSTR_ADDR"}
+                    local_env[inst.result] = self._eval_cstr_z3(fn, str(inst.operands[0]))
 
                 elif op in ("neg", "not"):
                     if len(inst.operands) != 1 or inst.result is None:

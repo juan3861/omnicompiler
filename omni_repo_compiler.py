@@ -22,7 +22,7 @@ from orchestrator.salsa_query_engine import SalsaQueryEngine
 from orchestrator.persistent_salsa_cache import PersistentSalsaCache
 from slicer.persistent_cpg import PersistentCodePropertyGraph
 from adapters.universal_abi_bridge import UniversalAbiBridge
-from compiler.object_linker import NativeObjectLinker, ObjectModule, load_coff_object, load_elf_object
+from compiler.object_linker import NativeObjectLinker, ObjectModule, OS_C_ABI_IMPORT_TABLE, load_coff_object, load_elf_object
 from compiler.binary_emitter import StandaloneBinaryEmitter
 from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator
 from compiler.ssa_ir import lower_ast_to_ssa
@@ -43,7 +43,7 @@ from compiler.audit_ledger import create_compilation_audit_ledger, save_audit_le
 
 
 NATIVE_BUILTIN_CALLS = frozenset({
-    "abs", "min", "max", "int", "float", "range", "len",
+    "abs", "min", "max", "int", "float", "range", "len", "c_str",
     "load_i8", "store_i8", "load_u8", "store_u8",
     "load_i16", "store_i16", "load_u16", "store_u16",
     "load_i32", "store_i32", "load_u32", "store_u32", "load_f32", "store_f32",
@@ -123,7 +123,7 @@ def _compute_native_compilable_set(
         for fname in list(candidates):
             callees = _extract_called_names(all_ast_funcs[fname])
             for c in callees:
-                if c not in NATIVE_BUILTIN_CALLS and c not in candidates:
+                if c not in NATIVE_BUILTIN_CALLS and c not in OS_C_ABI_IMPORT_TABLE and c not in candidates:
                     candidates.discard(fname)
                     changed = True
                     break
@@ -1137,7 +1137,7 @@ class OmniRepoCompiler:
                 else:
                     self._salsa_obj_misses += 1
                     artifact = codegen.compile_ssa(ssa_fn)
-                    if effective_arch == "x86_64" and not artifact.relocations and not getattr(ssa_fn, "luts", None):
+                    if effective_arch == "x86_64" and not artifact.relocations and not getattr(ssa_fn, "luts", None) and not getattr(ssa_fn, "cstrs", None):
                         try:
                             from compiler.tco_and_layout import PeepholeMachineOptimizer
                             opt_bytes, ph_stats = PeepholeMachineOptimizer().optimize_bytes(
@@ -1290,6 +1290,7 @@ class OmniRepoCompiler:
             "total_text_size": link_res["total_text_size"],
             "relocations_applied": link_res["relocations_applied"],
             "exported_symbols": sorted(link_res["exported_symbols"].keys()),
+            "external_os_imports": sorted((link_res.get("external_os_imports") or {}).keys()),
         }
 
         results["stages"]["ingestion"]["salsa_artifact_hits"] = self._salsa_obj_hits
@@ -1425,6 +1426,7 @@ class OmniRepoCompiler:
             "binary_type": audit_report.binary_type,
             "sections": audit_report.sections,
             "exported_symbols": audit_report.exported_symbols,
+            "imported_symbols": audit_report.imported_symbols,
             "metrics": audit_report.metrics,
         }
 

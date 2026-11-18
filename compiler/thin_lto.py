@@ -168,6 +168,8 @@ class ThinLtoOptimizer:
         assert callee_fn is not None
         if getattr(callee_fn, "luts", None):
             caller_fn.luts.update(callee_fn.luts)
+        if getattr(callee_fn, "cstrs", None):
+            caller_fn.cstrs.update(callee_fn.cstrs)
 
         # 1. Split caller_block into head (stays in caller_block) and tail
         head_insts = caller_block.instructions[:call_idx]
@@ -355,6 +357,8 @@ class ThinLtoOptimizer:
                         if summary and summary.can_inline and summary.ssa_fn and len(summary.ssa_fn.blocks) == 1:
                             if getattr(summary.ssa_fn, "luts", None):
                                 ssa_fn.luts.update(summary.ssa_fn.luts)
+                            if getattr(summary.ssa_fn, "cstrs", None):
+                                ssa_fn.cstrs.update(summary.ssa_fn.cstrs)
                             target_blk = summary.ssa_fn.blocks[0]
                             param_map: Dict[str, Any] = {
                                 p_name: arg for p_name, arg in zip(summary.params, call_args)

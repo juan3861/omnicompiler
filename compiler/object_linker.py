@@ -336,6 +336,37 @@ NATIVE_FREESTANDING_KERNELS_X64: Dict[str, bytes] = {
     "omni_list_sum": bytes.fromhex("4885c97418488b51084885d2741031c04531c04a0344c11049ffc04939d07cf2c331c0c3"),
 }
 
+OS_C_ABI_IMPORT_TABLE: Dict[str, Tuple[str, str]] = {
+    "ExitProcess": ("KERNEL32.dll", "libc.so.6"),
+    "GetCommandLineA": ("KERNEL32.dll", "libc.so.6"),
+    "Sleep": ("KERNEL32.dll", "libc.so.6"),
+    "abs": ("MSVCRT.dll", "libc.so.6"),
+    "labs": ("MSVCRT.dll", "libc.so.6"),
+    "atoi": ("MSVCRT.dll", "libc.so.6"),
+    "atol": ("MSVCRT.dll", "libc.so.6"),
+    "puts": ("MSVCRT.dll", "libc.so.6"),
+    "putchar": ("MSVCRT.dll", "libc.so.6"),
+    "strlen": ("MSVCRT.dll", "libc.so.6"),
+    "strcmp": ("MSVCRT.dll", "libc.so.6"),
+    "printf": ("MSVCRT.dll", "libc.so.6"),
+    "malloc": ("MSVCRT.dll", "libc.so.6"),
+    "calloc": ("MSVCRT.dll", "libc.so.6"),
+    "realloc": ("MSVCRT.dll", "libc.so.6"),
+    "free": ("MSVCRT.dll", "libc.so.6"),
+    "memcpy": ("MSVCRT.dll", "libc.so.6"),
+    "memset": ("MSVCRT.dll", "libc.so.6"),
+    "memmove": ("MSVCRT.dll", "libc.so.6"),
+    "exit": ("MSVCRT.dll", "libc.so.6"),
+    "sin": ("MSVCRT.dll", "libm.so.6"),
+    "cos": ("MSVCRT.dll", "libm.so.6"),
+    "tan": ("MSVCRT.dll", "libm.so.6"),
+    "sqrt": ("MSVCRT.dll", "libm.so.6"),
+    "pow": ("MSVCRT.dll", "libm.so.6"),
+    "floor": ("MSVCRT.dll", "libm.so.6"),
+    "ceil": ("MSVCRT.dll", "libm.so.6"),
+    "fabs": ("MSVCRT.dll", "libm.so.6"),
+}
+
 
 class NativeObjectLinker:
     """
@@ -379,10 +410,14 @@ class NativeObjectLinker:
                 defined_syms.add(s)
 
         needed_runtime_syms = set()
+        needed_os_syms = set()
         for mod in self.modules:
             for reloc in mod.relocations:
-                if reloc.symbol_name not in defined_syms and reloc.symbol_name in NATIVE_COLLECTION_SYMBOLS:
-                    needed_runtime_syms.add(reloc.symbol_name)
+                if reloc.symbol_name not in defined_syms:
+                    if reloc.symbol_name in NATIVE_COLLECTION_SYMBOLS:
+                        needed_runtime_syms.add(reloc.symbol_name)
+                    elif reloc.symbol_name in OS_C_ABI_IMPORT_TABLE:
+                        needed_os_syms.add(reloc.symbol_name)
 
         if needed_runtime_syms:
             if not hasattr(self, "_active_callbacks"):
@@ -404,10 +439,23 @@ class NativeObjectLinker:
                     runtime_mod.add_symbol(sym, thunk_bytes, is_exported=True)
             self.modules.append(runtime_mod)
 
+        if needed_os_syms:
+            os_mod = ObjectModule("__omni_os_imports__")
+            for sym in sorted(needed_os_syms):
+                # 6-byte sandbox-safe stub; replaced by `jmp qword ptr [rip + iat_or_got_disp32]`
+                # during dynamic exe emission. Allocators return mapped Unicorn scratch 0x2009800.
+                if sym in ("malloc", "calloc", "realloc"):
+                    stub = b"\xb8" + struct.pack("<I", 0x2009800) + b"\xc3"
+                else:
+                    stub = b"\x31\xc0\xc3\x90\x90\x90"
+                os_mod.add_symbol(sym, stub, is_exported=False)
+            self.modules.append(os_mod)
+
         combined_text = bytearray()
         module_text_offsets: Dict[int, int] = {}
         global_symbol_table: Dict[str, int] = {}
         exported_symbols: Dict[str, int] = {}
+        external_os_imports: Dict[str, int] = {}
 
         # 1. Section Aggregation & Global Symbol Placement
         for idx, mod in enumerate(self.modules):
@@ -419,6 +467,8 @@ class NativeObjectLinker:
                 if sym.section in (".text", ".rodata"):
                     global_offset = mod_offset + sym.offset
                     global_symbol_table[sym_name] = global_offset
+                    if mod.repo_name == "__omni_os_imports__":
+                        external_os_imports[sym_name] = global_offset
                     if sym.section == ".text" and sym.is_exported:
                         exported_symbols[sym_name] = global_offset
 
@@ -486,6 +536,7 @@ class NativeObjectLinker:
             "total_text_size": len(combined_text),
             "global_symbols": global_symbol_table,
             "exported_symbols": exported_symbols,
+            "external_os_imports": external_os_imports,
             "relocations_applied": applied_relocs,
             "combined_code": bytes(combined_text)
         }
@@ -521,11 +572,23 @@ class NativeObjectLinker:
         entry_symbol: Optional[str] = None,
         target_format: str = "auto"
     ) -> str:
-        """Links modules and emits a standalone executable."""
+        """Links modules and emits a standalone executable (routing OS dynamic imports when present)."""
         link_res = self.link()
         code = link_res["combined_code"]
         global_syms = link_res["global_symbols"]
-        entry_offset = global_syms.get(entry_symbol) if entry_symbol else 0
+        entry_offset = global_syms.get(entry_symbol, 0) if entry_symbol else 0
+        os_imports = link_res.get("external_os_imports") or {}
+
+        resolved_fmt = ("pe64" if sys.platform == "win32" else "elf64") if target_format == "auto" else target_format
+        if os_imports and resolved_fmt in ("pe64", "elf64"):
+            return self.emitter.emit_dynamic_linked_executable(
+                output_path=output_path,
+                linked_code=code,
+                entry_offset=entry_offset,
+                os_import_stubs=os_imports,
+                os_import_table=OS_C_ABI_IMPORT_TABLE,
+                target_format=resolved_fmt,
+            )
 
         return self.emitter.emit_standalone_binary(
             output_path=output_path,

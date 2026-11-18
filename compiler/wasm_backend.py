@@ -227,6 +227,12 @@ class WasmBackend:
                 stride, _ = cls._WASM_LUT_STRIDE.get(wt, (8, "i64.load"))
                 addr_map[(fn.name, lut_name)] = (ro_cursor, wt, stride)
                 ro_cursor += max(8, len(packed))
+            for c_name, raw_b in sorted((getattr(fn, "cstrs", {}) or {}).items()):
+                ro_cursor = (ro_cursor + 7) & ~7
+                esc = "".join(f"\\{b:02x}" for b in raw_b)
+                data_lines.append(f'  (data (i32.const {ro_cursor}) "{esc}")')
+                addr_map[(fn.name, f"__cstr_{c_name}")] = (ro_cursor, "u8", 1)
+                ro_cursor += max(8, len(raw_b))
         return addr_map, data_lines
 
     def _ssa_function_to_wat_func(
@@ -480,6 +486,11 @@ class WasmBackend:
                     wat_lines.append(f"{indent}{ld_instr}")
                     if width == "f32":
                         wat_lines.append(f"{indent}f64.promote_f32")
+                    set_result(inst.result, indent)
+                elif opcode == "cstr_addr":
+                    c_name = str(inst.operands[0])
+                    base_ro, _w, _s = (lut_addr_map or {}).get((ssa_func.name, f"__cstr_{c_name}"), (245760, "u8", 1))
+                    wat_lines.append(f"{indent}i64.const {base_ro}")
                     set_result(inst.result, indent)
                 elif opcode == "call":
                     callee = str(inst.operands[0])

@@ -2366,6 +2366,18 @@ class _PolyglotParser:
         if t.kind == "FLOAT":
             self._advance()
             return ast.Constant(value=float(t.val), lineno=t.line)
+        if t.kind == "STR":
+            self._advance()
+            decoded = (
+                t.val.replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\r", "\r")
+                .replace("\\0", "\0")
+                .replace('\\"', '"')
+                .replace("\\'", "'")
+                .replace("\\\\", "\\")
+            )
+            return ast.Constant(value=decoded, lineno=t.line)
         if t.kind == "ID":
             self._advance()
             if t.val == "true":

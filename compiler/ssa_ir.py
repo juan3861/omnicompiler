@@ -13,6 +13,7 @@ Turing-Complete Multi-Block Static Single Assignment (SSA) IR featuring:
 
 from typing import List, Dict, Set, Tuple, Any, Optional
 import ast
+import hashlib
 
 
 TERMINATOR_OPCODES = frozenset({"ret", "br", "br_cond"})
@@ -113,6 +114,7 @@ class SSAFunction:
         self.blocks: List[BasicBlock] = []
         self.source_file: str = "<module>"
         self.luts: Dict[str, Tuple[str, Tuple[Any, ...]]] = {}
+        self.cstrs: Dict[str, bytes] = {}
 
     def add_block(self, block: BasicBlock):
         if self.entry_block is None:
@@ -757,6 +759,14 @@ class AstToSsaLowering:
     def _emit_fconst(self, val: float, line: int = 0) -> SSAVar:
         v = self._next_var("fc", var_type="f64")
         self._emit(v, "fconst", [float(val)], line=line)
+        return v
+
+    def _emit_cstr(self, text: str, line: int = 0) -> SSAVar:
+        raw = text.encode("utf-8") + b"\x00"
+        c_name = f"s_{hashlib.sha256(raw).hexdigest()[:10]}"
+        self._fn.cstrs[c_name] = raw
+        v = self._next_var("cstr")
+        self._emit(v, "cstr_addr", [c_name], line=line)
         return v
 
     def _promote_to_f64(self, v: SSAVar, line: int = 0) -> SSAVar:
@@ -1775,6 +1785,23 @@ class AstToSsaLowering:
                     b_v = self._lower_expr(node.args[1])
                     res = self._next_var("vec_dot")
                     self._emit(res, "call", ["omni_list_vec_dot", a_v, b_v], line=line)
+                    return res
+                elif fname == "c_str" and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    return self._emit_cstr(node.args[0].value, line=line)
+                elif fname in ("puts", "printf", "strlen", "atoi", "atol", "strcmp"):
+                    arg_vars = [
+                        self._emit_cstr(a.value, line=line)
+                        if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                        else self._lower_expr(a)
+                        for a in node.args
+                    ]
+                    res = self._next_var("call")
+                    self._emit(res, "call", [fname] + arg_vars, line=line)
+                    return res
+                elif fname in ("sin", "cos", "tan", "sqrt", "pow", "floor", "ceil", "fabs"):
+                    arg_vars = [self._promote_to_f64(self._lower_expr(a), line=line) for a in node.args]
+                    res = self._next_var("fcall", var_type="f64")
+                    self._emit(res, "call", [fname] + arg_vars, line=line)
                     return res
                 else:
                     arg_vars = [self._lower_expr(a) for a in node.args]
