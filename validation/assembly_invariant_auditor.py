@@ -167,7 +167,7 @@ class AssemblyInvariantAuditor:
                     if not (-0x80000000 <= disp32 <= 0x7FFFFFFF):
                         branch_safe = False
                         errors.append(f"Branch displacement out of 32-bit range at offset {i}: {disp32}")
-                    i += 5
+                    i += 1
                     continue
                 else:
                     errors.append(f"Truncated call relative displacement at offset {i}")

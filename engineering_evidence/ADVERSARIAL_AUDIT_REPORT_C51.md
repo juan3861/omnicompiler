@@ -18,6 +18,9 @@
 4. **Store-Store Runtime Aliasing Hazard (`sum_arr == diff_arr`):**
    - *Risk:* Vectorizing two stores `sum_arr[i] = a[i] + b[i]; diff_arr[i] = a[i] - b[i]` without checking store-to-store overlap reorders writes if a caller aliases `sum_arr == diff_arr`.
    - *Mitigation:* `_rewrite_struct_array_store_4x` checks pairwise non-overlap across both `(dst_m, load_r)` and `(dst_m, dst_k)` while proving interleaved AoS struct fields (`pts[i].x` vs `pts[i].y`, stride 16) statically disjoint via `_is_statically_disjoint_same_base`.
+5. **Latent `0xE8` ModRM Epilogue-Skip Bug in `AssemblyInvariantAuditor` (`ubuntu-latest` CI):**
+   - *Observation:* On `x86_64-pc-linux-gnu`, LLVM O3 emitted `mov rax, r13` (`4c 89 e8`) immediately before `add rsp, 40` (`48 83 c4 28`). `AssemblyInvariantAuditor.audit_function_code` (`validation/assembly_invariant_auditor.py`) mistook the `0xE8` ModRM byte for an x86 `call rel32` and jumped `i += 5`, skipping the epilogue and falsely reporting `Stack frame imbalance in omni_main: allocated 88 bytes but freed 0 bytes`.
+   - *Fix:* Changed `0xE8` advancement to `i += 1` so unaligned `0xE8` ModRM/displacement bytes never skip trailing epilogue instructions (`is_valid=True`, `stack_balanced=True` over all 1282 bytes).
 
 ---
 
