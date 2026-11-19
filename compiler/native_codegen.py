@@ -570,10 +570,48 @@ class X64CodeGenerator:
                 return tramp_label
             return f".L_bb_{succ_name}"
 
+        _SSE2_PACKED_ALU_OPS: Dict[str, bytes] = {
+            "add": b"\x66\x0f\xd4\xc1",   # paddq xmm0, xmm1
+            "sub": b"\x66\x0f\xfb\xc1",   # psubq xmm0, xmm1
+            "and": b"\x66\x0f\xdb\xc1",   # pand xmm0, xmm1
+            "or":  b"\x66\x0f\xeb\xc1",   # por xmm0, xmm1
+            "xor": b"\x66\x0f\xef\xc1",   # pxor xmm0, xmm1
+            "fadd": b"\x66\x0f\x58\xc1",  # addpd xmm0, xmm1
+            "fsub": b"\x66\x0f\x5c\xc1",  # subpd xmm0, xmm1
+            "fmul": b"\x66\x0f\x59\xc1",  # mulpd xmm0, xmm1
+        }
+
         # --- Emit Basic Blocks ---
         for idx_b, block in enumerate(fn.blocks):
             buf.mark(f".L_bb_{block.name}")
-            for inst in block.instructions:
+            blk_const_int: Dict[SSAVar, int] = {}
+            blk_add_const: Dict[Any, Tuple[Any, int]] = {}
+            blk_def_map: Dict[SSAVar, SSAInstruction] = {}
+            for b_ins in block.instructions:
+                if isinstance(b_ins.result, SSAVar):
+                    blk_def_map[b_ins.result] = b_ins
+                    if b_ins.opcode == "const" and b_ins.operands and isinstance(b_ins.operands[0], int) and not isinstance(b_ins.operands[0], bool):
+                        blk_const_int[b_ins.result] = int(b_ins.operands[0])
+                    elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
+                        op_a, op_b = b_ins.operands[0], b_ins.operands[1]
+                        ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else blk_const_int.get(op_a)
+                        cb = op_b if (isinstance(op_b, int) and not isinstance(op_b, bool)) else blk_const_int.get(op_b)
+                        if cb is not None:
+                            base_v, prev_off = blk_add_const.get(op_a, (op_a, 0))
+                            blk_add_const[b_ins.result] = (base_v, prev_off + int(cb))
+                        elif ca is not None:
+                            base_v, prev_off = blk_add_const.get(op_b, (op_b, 0))
+                            blk_add_const[b_ins.result] = (base_v, prev_off + int(ca))
+
+            def _are_contiguous_8b_offsets(off0: Any, off1: Any) -> bool:
+                b0, d0 = blk_add_const.get(off0, (off0, 0))
+                b1, d1 = blk_add_const.get(off1, (off1, 0))
+                return b0 == b1 and (d1 - d0) == 8
+
+            inst_idx = 0
+            while inst_idx < len(block.instructions):
+                inst = block.instructions[inst_idx]
+                inst_idx += 1
                 buf.record_line(inst.source_line)
                 op = inst.opcode.lower()
 
@@ -765,10 +803,80 @@ class X64CodeGenerator:
                     write_result_from_reg(inst.result, "r11")
 
                 elif op == "store_off":
+                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    if width in ("i64", "u64", "f64") and inst_idx < len(block.instructions):
+                        nxt_st = block.instructions[inst_idx]
+                        nxt_w = str(nxt_st.operands[3]) if (nxt_st.opcode.lower() == "store_off" and len(nxt_st.operands) >= 4) else ""
+                        if (
+                            nxt_st.opcode.lower() == "store_off"
+                            and nxt_w == width
+                            and nxt_st.operands[0] == inst.operands[0]
+                            and _are_contiguous_8b_offsets(inst.operands[1], nxt_st.operands[1])
+                        ):
+                            val0, val1 = inst.operands[2], nxt_st.operands[2]
+                            ins0 = blk_def_map.get(val0) if isinstance(val0, SSAVar) else None
+                            ins1 = blk_def_map.get(val1) if isinstance(val1, SSAVar) else None
+                            emitted_full_simd = False
+                            if (
+                                ins0 is not None
+                                and ins1 is not None
+                                and ins0.opcode.lower() == ins1.opcode.lower()
+                                and ins0.opcode.lower() in _SSE2_PACKED_ALU_OPS
+                                and len(ins0.operands) == 2
+                                and len(ins1.operands) == 2
+                            ):
+                                a0, b0 = ins0.operands[0], ins0.operands[1]
+                                a1, b1 = ins1.operands[0], ins1.operands[1]
+                                ld_a0 = blk_def_map.get(a0) if isinstance(a0, SSAVar) else None
+                                ld_a1 = blk_def_map.get(a1) if isinstance(a1, SSAVar) else None
+                                ld_b0 = blk_def_map.get(b0) if isinstance(b0, SSAVar) else None
+                                ld_b1 = blk_def_map.get(b1) if isinstance(b1, SSAVar) else None
+                                if (
+                                    ld_a0 is not None and ld_a1 is not None and ld_b0 is not None and ld_b1 is not None
+                                    and ld_a0.opcode.lower() == "load_off" and ld_a1.opcode.lower() == "load_off"
+                                    and ld_b0.opcode.lower() == "load_off" and ld_b1.opcode.lower() == "load_off"
+                                    and str(ld_a0.operands[2]) in ("i64", "u64", "f64")
+                                    and str(ld_a0.operands[2]) == str(ld_a1.operands[2])
+                                    and str(ld_b0.operands[2]) in ("i64", "u64", "f64")
+                                    and str(ld_b0.operands[2]) == str(ld_b1.operands[2])
+                                    and ld_a0.operands[0] == ld_a1.operands[0]
+                                    and ld_b0.operands[0] == ld_b1.operands[0]
+                                    and _are_contiguous_8b_offsets(ld_a0.operands[1], ld_a1.operands[1])
+                                    and _are_contiguous_8b_offsets(ld_b0.operands[1], ld_b1.operands[1])
+                                ):
+                                    resolve_operand_to_reg(ld_a0.operands[0], "r11")
+                                    resolve_operand_to_reg(ld_a0.operands[1], "rcx")
+                                    buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                    buf.emit(b"\xf3\x41\x0f\x6f\x03")    # movdqu xmm0, xmmword ptr [r11]
+                                    resolve_operand_to_reg(ld_b0.operands[0], "r11")
+                                    resolve_operand_to_reg(ld_b0.operands[1], "rcx")
+                                    buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                    buf.emit(b"\xf3\x41\x0f\x6f\x0b")    # movdqu xmm1, xmmword ptr [r11]
+                                    buf.emit(_SSE2_PACKED_ALU_OPS[ins0.opcode.lower()])
+                                    resolve_operand_to_reg(inst.operands[0], "r11")
+                                    resolve_operand_to_reg(inst.operands[1], "rcx")
+                                    buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                    buf.emit(b"\xf3\x41\x0f\x7f\x03")    # movdqu xmmword ptr [r11], xmm0
+                                    emitted_full_simd = True
+
+                            if not emitted_full_simd:
+                                resolve_operand_to_reg(val0, "rax")
+                                buf.emit(_x64_movq_xmm_r64(0, "rax"))
+                                resolve_operand_to_reg(val1, "rax")
+                                buf.emit(_x64_movq_xmm_r64(1, "rax"))
+                                buf.emit(b"\x66\x0f\x6c\xc1")            # punpcklqdq xmm0, xmm1
+                                resolve_operand_to_reg(inst.operands[0], "r11")
+                                resolve_operand_to_reg(inst.operands[1], "rcx")
+                                buf.emit(b"\x49\x01\xcb")                # add r11, rcx
+                                buf.emit(b"\xf3\x41\x0f\x7f\x03")        # movdqu xmmword ptr [r11], xmm0
+
+                            buf.record_line(nxt_st.source_line)
+                            inst_idx += 1
+                            continue
+
                     resolve_operand_to_reg(inst.operands[0], "r11")  # base ptr
                     resolve_operand_to_reg(inst.operands[1], "rcx")  # byte offset
                     resolve_operand_to_reg(inst.operands[2], "rax")  # value
-                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
                     buf.emit(b"\x49\x01\xcb")                        # add r11, rcx
                     if width in ("i8", "u8"):
                         buf.emit(b"\x41\x88\x03")                    # mov byte ptr [r11], al

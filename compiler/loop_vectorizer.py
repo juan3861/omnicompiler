@@ -954,9 +954,68 @@ class LoopVectorizerPass:
         "or": ("const", 0),
         "xor": ("const", 0),
         "and": ("const", -1),
+        "smin": ("const", 0x7FFFFFFFFFFFFFFF),
+        "smax": ("const", -0x8000000000000000),
+        "fmin": ("fconst", 1e308),
+        "fmax": ("fconst", -1e308),
     }
 
+    _MINMAX_CMP_MAP = {
+        "smin": "cmp_lt",
+        "smax": "cmp_gt",
+        "fmin": "fcmp_lt",
+        "fmax": "fcmp_gt",
+    }
+
+    @classmethod
+    def _emit_reduction_op(
+        cls,
+        res_var: SSAVar,
+        op: str,
+        lhs: Any,
+        rhs: Any,
+        prefix: str,
+        out_insts: List[SSAInstruction],
+    ) -> None:
+        if op in cls._MINMAX_CMP_MAP:
+            cmp_v = SSAVar(f"{prefix}_mm_{len(out_insts)}", 0)
+            out_insts.append(SSAInstruction(cmp_v, cls._MINMAX_CMP_MAP[op], [lhs, rhs]))
+            out_insts.append(SSAInstruction(res_var, "select", [cmp_v, lhs, rhs]))
+        else:
+            out_insts.append(SSAInstruction(res_var, op, [lhs, rhs]))
+
+    @staticmethod
+    def _classify_minmax_select(
+        sel_ins: Optional[SSAInstruction],
+        acc_prev: SSAVar,
+        body_def_map: Dict[SSAVar, SSAInstruction],
+    ) -> Optional[Tuple[str, Any]]:
+        """Recognizes `select(cmp(a, b), a, b)` min/max patterns where `{a, b} == {acc_prev, delta}`."""
+        if sel_ins is None or sel_ins.opcode != "select" or len(sel_ins.operands) != 3:
+            return None
+        c_v, t_op, f_op = sel_ins.operands[0], sel_ins.operands[1], sel_ins.operands[2]
+        if acc_prev not in (t_op, f_op) or t_op == f_op or not isinstance(c_v, SSAVar):
+            return None
+        other_op = f_op if t_op == acc_prev else t_op
+        cmp_ins = body_def_map.get(c_v)
+        if cmp_ins is None or len(cmp_ins.operands) != 2:
+            return None
+        c_op = cmp_ins.opcode
+        if c_op not in ("cmp_lt", "cmp_le", "cmp_gt", "cmp_ge", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge"):
+            return None
+        lhs, rhs = cmp_ins.operands[0], cmp_ins.operands[1]
+        if {lhs, rhs} != {acc_prev, other_op}:
+            return None
+        smaller_on_true = lhs if c_op.endswith(("lt", "le")) else rhs
+        is_min = (t_op == smaller_on_true)
+        is_f = c_op.startswith("fcmp_") or acc_prev.var_type == "f64"
+        if is_min:
+            return ("fmin" if is_f else "smin", other_op)
+        return ("fmax" if is_f else "smax", other_op)
+
     def _is_reduction_identity(self, fn: SSAFunction, val: Any, op: str) -> bool:
+        if op in self._MINMAX_CMP_MAP:
+            return False
         _c_op, id_val = self._REDUCTION_OPS_IDENTITY[op]
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val == id_val:
             return True
@@ -1030,23 +1089,42 @@ class LoopVectorizerPass:
 
             cond_mask: Optional[Any] = None
             cond_inverted = False
-            if back_ins.opcode in self._REDUCTION_OPS_IDENTITY and len(back_ins.operands) == 2 and acc_prev in back_ins.operands:
-                acc_inst = back_ins
+            mm_direct = self._classify_minmax_select(back_ins, acc_prev, body_def_map)
+            if mm_direct is not None:
+                red_op, delta_var = mm_direct
+            elif (
+                back_ins.opcode in self._REDUCTION_OPS_IDENTITY
+                and back_ins.opcode not in self._MINMAX_CMP_MAP
+                and len(back_ins.operands) == 2
+                and acc_prev in back_ins.operands
+            ):
+                red_op = back_ins.opcode
+                delta_var = back_ins.operands[1] if back_ins.operands[0] == acc_prev else back_ins.operands[0]
             elif back_ins.opcode == "select" and len(back_ins.operands) == 3 and acc_prev in (back_ins.operands[1], back_ins.operands[2]):
                 c_v, t_op, f_op = back_ins.operands[0], back_ins.operands[1], back_ins.operands[2]
                 inner_v = f_op if t_op == acc_prev else t_op
                 cond_inverted = t_op == acc_prev
                 inner_ins = body_def_map.get(inner_v) if isinstance(inner_v, SSAVar) else None
-                if inner_ins is None or inner_ins.opcode not in self._REDUCTION_OPS_IDENTITY or acc_prev not in inner_ins.operands:
+                mm_inner = self._classify_minmax_select(inner_ins, acc_prev, body_def_map)
+                if mm_inner is not None:
+                    red_op, delta_var = mm_inner
+                    cond_mask = c_v
+                elif (
+                    inner_ins is not None
+                    and inner_ins.opcode in self._REDUCTION_OPS_IDENTITY
+                    and inner_ins.opcode not in self._MINMAX_CMP_MAP
+                    and len(inner_ins.operands) == 2
+                    and acc_prev in inner_ins.operands
+                ):
+                    red_op = inner_ins.opcode
+                    delta_var = inner_ins.operands[1] if inner_ins.operands[0] == acc_prev else inner_ins.operands[0]
+                    cond_mask = c_v
+                else:
                     return None
-                acc_inst = inner_ins
-                cond_mask = c_v
             else:
                 return None
 
-            delta_var = acc_inst.operands[1] if acc_inst.operands[0] == acc_prev else acc_inst.operands[0]
-            red_op = acc_inst.opcode
-            is_f = red_op in ("fadd", "fmul") or acc_prev.var_type == "f64"
+            is_f = red_op in ("fadd", "fmul", "fmin", "fmax") or acc_prev.var_type == "f64"
             red_specs.append({
                 "acc_prev": acc_prev,
                 "acc_next": back_acc,
@@ -1163,8 +1241,9 @@ class LoopVectorizerPass:
             "dag_insts": dag_insts,
         }
 
-    @staticmethod
+    @classmethod
     def _tree_reduce_ssa(
+        cls,
         items: List[SSAVar],
         op: str,
         ssa_vt: str,
@@ -1178,7 +1257,7 @@ class LoopVectorizerPass:
             for j in range(0, len(curr), 2):
                 if j + 1 < len(curr):
                     r_v = SSAVar(f"{prefix}_{round_idx}_{j // 2}", 0, var_type=ssa_vt)
-                    out_insts.append(SSAInstruction(r_v, op, [curr[j], curr[j + 1]]))
+                    cls._emit_reduction_op(r_v, op, curr[j], curr[j + 1], f"{prefix}_{round_idx}_{j // 2}", out_insts)
                     nxt.append(r_v)
                 else:
                     nxt.append(curr[j])
@@ -1256,13 +1335,17 @@ class LoopVectorizerPass:
             or any(i_var in ins.operands for ins in dag_insts)
         )
 
-        id_masks: List[Optional[SSAVar]] = []
+        id_masks: List[Optional[Any]] = []
         for r_idx, r in enumerate(red_specs):
             if r["cond_mask"] is not None:
-                id_op, id_val = self._REDUCTION_OPS_IDENTITY[r["op"]]
-                zm = SSAVar(f"vec_zmask_{step_id}_{r_idx}", 0, var_type=r["ssa_vt"])
-                insts.append(SSAInstruction(zm, id_op, [id_val]))
-                id_masks.append(zm)
+                init_m = self._find_init_acc(cond_bb, pre_bb, r["acc_prev"]) if r["op"] in self._MINMAX_CMP_MAP else None
+                if init_m is not None:
+                    id_masks.append(init_m)
+                else:
+                    id_op, id_val = self._REDUCTION_OPS_IDENTITY[r["op"]]
+                    zm = SSAVar(f"vec_zmask_{step_id}_{r_idx}", 0, var_type=r["ssa_vt"])
+                    insts.append(SSAInstruction(zm, id_op, [id_val]))
+                    id_masks.append(zm)
             else:
                 id_masks.append(None)
 
@@ -1305,7 +1388,7 @@ class LoopVectorizerPass:
             init_val = self._find_init_acc(cond_bb, pre_bb, r["acc_prev"])
             if init_val is not None and not self._is_reduction_identity(fn, init_val, op):
                 final_res = SSAVar(f"vec_sum_acc_{step_id}_{r_idx}", 0, var_type=vt)
-                insts.append(SSAInstruction(final_res, op, [init_val, sum_res]))
+                self._emit_reduction_op(final_res, op, init_val, sum_res, f"vec_facc_{step_id}_{r_idx}", insts)
             else:
                 final_res = sum_res
             final_vars.append(final_res)
@@ -1375,10 +1458,14 @@ class LoopVectorizerPass:
                 init_val = SSAVar(f"vec_a0_z_{step_id}_{r_idx}", 0, var_type=vt)
                 pre_insts.append(SSAInstruction(init_val, id_op, [id_val]))
             r_inits: List[Any] = [init_val]
-            for lane in range(1, 4):
-                av = SSAVar(f"vec_a{lane}_z_{step_id}_{r_idx}", 0, var_type=vt)
-                pre_insts.append(SSAInstruction(av, id_op, [id_val]))
-                r_inits.append(av)
+            if r["op"] in self._MINMAX_CMP_MAP:
+                # Idempotent min/max: seeding all 4 lanes with init_val avoids sentinel overflow and handles n < 4
+                r_inits.extend([init_val, init_val, init_val])
+            else:
+                for lane in range(1, 4):
+                    av = SSAVar(f"vec_a{lane}_z_{step_id}_{r_idx}", 0, var_type=vt)
+                    pre_insts.append(SSAInstruction(av, id_op, [id_val]))
+                    r_inits.append(av)
             acc_inits_by_r.append(r_inits)
             acc_phis_by_r.append([SSAVar(f"vec_acc{lane}_{step_id}_{r_idx}", 0, var_type=vt) for lane in range(4)])
             acc_nexts_by_r.append([SSAVar(f"vec_acc{lane}_nxt_{step_id}_{r_idx}", 0, var_type=vt) for lane in range(4)])
@@ -1448,7 +1535,7 @@ class LoopVectorizerPass:
                 if r["cond_mask"] is not None:
                     c_ln = l_map.get(r["cond_mask"], r["cond_mask"])
                     cand_ln = SSAVar(f"vec_cand{ln}_{step_id}_{r_idx}", 0, var_type=vt)
-                    body_insts.append(SSAInstruction(cand_ln, op, [acc_phis_by_r[r_idx][ln], d_ln]))
+                    self._emit_reduction_op(cand_ln, op, acc_phis_by_r[r_idx][ln], d_ln, f"vec_rc_{step_id}_{r_idx}_{ln}", body_insts)
                     sel_ops = (
                         [c_ln, acc_phis_by_r[r_idx][ln], cand_ln]
                         if r["cond_inverted"]
@@ -1456,7 +1543,9 @@ class LoopVectorizerPass:
                     )
                     body_insts.append(SSAInstruction(acc_nexts_by_r[r_idx][ln], "select", sel_ops))
                 else:
-                    body_insts.append(SSAInstruction(acc_nexts_by_r[r_idx][ln], op, [acc_phis_by_r[r_idx][ln], d_ln]))
+                    self._emit_reduction_op(
+                        acc_nexts_by_r[r_idx][ln], op, acc_phis_by_r[r_idx][ln], d_ln, f"vec_rn_{step_id}_{r_idx}_{ln}", body_insts
+                    )
 
         c_one = SSAVar(f"vec_cone_{step_id}", 0)
         body_insts.extend([
@@ -1538,7 +1627,7 @@ class LoopVectorizerPass:
                 if r["cond_mask"] is not None:
                     c_t = t_map.get(r["cond_mask"], r["cond_mask"])
                     t_cand = SSAVar(f"vec_tcand_{step_id}_{r_idx}_{t_idx}", 0, var_type=r["ssa_vt"])
-                    merge_insts.append(SSAInstruction(t_cand, r["op"], [merged_vars[r_idx], d_t]))
+                    self._emit_reduction_op(t_cand, r["op"], merged_vars[r_idx], d_t, f"vec_stc_{step_id}_{r_idx}_{t_idx}", merge_insts)
                     sel_ops = (
                         [c_t, merged_vars[r_idx], t_cand]
                         if r["cond_inverted"]
@@ -1546,7 +1635,7 @@ class LoopVectorizerPass:
                     )
                     merge_insts.append(SSAInstruction(t_next, "select", sel_ops))
                 else:
-                    merge_insts.append(SSAInstruction(t_next, r["op"], [merged_vars[r_idx], d_t]))
+                    self._emit_reduction_op(t_next, r["op"], merged_vars[r_idx], d_t, f"vec_stn_{step_id}_{r_idx}_{t_idx}", merge_insts)
                 merged_vars[r_idx] = t_next
 
         # Substitute uses of acc_prev / acc_next outside the loop BEFORE inserting merge_insts
@@ -1665,7 +1754,7 @@ class LoopVectorizerPass:
             if r["cond_mask"] is not None:
                 c_t = t_map.get(r["cond_mask"], r["cond_mask"])
                 t_cand = SSAVar(f"vec_dtcand_{step_id}_{r_idx}", 0, var_type=r["ssa_vt"])
-                tail_body_insts.append(SSAInstruction(t_cand, r["op"], [t_accs[r_idx], d_t]))
+                self._emit_reduction_op(t_cand, r["op"], t_accs[r_idx], d_t, f"vec_dtc_{step_id}_{r_idx}", tail_body_insts)
                 sel_ops = (
                     [c_t, t_accs[r_idx], t_cand]
                     if r["cond_inverted"]
@@ -1673,7 +1762,7 @@ class LoopVectorizerPass:
                 )
                 tail_body_insts.append(SSAInstruction(t_acc_nexts[r_idx], "select", sel_ops))
             else:
-                tail_body_insts.append(SSAInstruction(t_acc_nexts[r_idx], r["op"], [t_accs[r_idx], d_t]))
+                self._emit_reduction_op(t_acc_nexts[r_idx], r["op"], t_accs[r_idx], d_t, f"vec_dtn_{step_id}_{r_idx}", tail_body_insts)
 
         t_one = SSAVar(f"vec_tone_{step_id}", 0)
         tail_body_insts.extend([
