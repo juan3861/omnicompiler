@@ -196,6 +196,12 @@ class BiAbductionVerifier:
                         r = _sym_of(ins.operands[0]) >> _sym_of(ins.operands[1])
                     elif oc == "lshr" and len(ins.operands) == 2:
                         r = z3.LShR(_sym_of(ins.operands[0]), _sym_of(ins.operands[1]))
+                    elif oc == "and" and len(ins.operands) == 2:
+                        r = _sym_of(ins.operands[0]) & _sym_of(ins.operands[1])
+                    elif oc == "or" and len(ins.operands) == 2:
+                        r = _sym_of(ins.operands[0]) | _sym_of(ins.operands[1])
+                    elif oc == "xor" and len(ins.operands) == 2:
+                        r = _sym_of(ins.operands[0]) ^ _sym_of(ins.operands[1])
                     elif oc == "select" and len(ins.operands) == 3:
                         cond_b = _cmp_bool_of(ins.operands[0])
                         if cond_b is None:
