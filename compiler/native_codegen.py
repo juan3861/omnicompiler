@@ -640,6 +640,41 @@ class X64CodeGenerator:
                     write_result_from_reg(inst.result, "rax")
 
                 elif op in ("add", "sub", "and", "or", "xor"):
+                    if op in ("add", "and", "or", "xor") and inst_idx + 1 < len(block.instructions):
+                        ins_hi = block.instructions[inst_idx]
+                        ins_top = block.instructions[inst_idx + 1]
+                        if (
+                            ins_hi.opcode.lower() == op
+                            and ins_top.opcode.lower() == op
+                            and isinstance(inst.result, SSAVar)
+                            and isinstance(ins_hi.result, SSAVar)
+                            and len(inst.operands) == 2
+                            and len(ins_hi.operands) == 2
+                            and len(ins_top.operands) == 2
+                            and set(ins_top.operands) == {inst.result, ins_hi.result}
+                        ):
+                            resolve_operand_to_reg(inst.operands[0], "rax")
+                            buf.emit(_x64_movq_xmm_r64(0, "rax"))
+                            resolve_operand_to_reg(ins_hi.operands[0], "rax")
+                            buf.emit(_x64_movq_xmm_r64(1, "rax"))
+                            buf.emit(b"\x66\x0f\x6c\xc1")            # punpcklqdq xmm0, xmm1
+                            resolve_operand_to_reg(inst.operands[1], "rax")
+                            buf.emit(_x64_movq_xmm_r64(1, "rax"))
+                            resolve_operand_to_reg(ins_hi.operands[1], "rax")
+                            buf.emit(_x64_movq_xmm_r64(2, "rax"))
+                            buf.emit(b"\x66\x0f\x6c\xca")            # punpcklqdq xmm1, xmm2
+                            buf.emit(_SSE2_PACKED_ALU_OPS[op])       # paddq/pand/por/pxor xmm0, xmm1
+                            buf.emit(_x64_movq_r64_xmm("rax", 0))
+                            write_result_from_reg(inst.result, "rax")
+                            buf.emit(b"\x66\x0f\x70\xc8\x4e")        # pshufd xmm1, xmm0, 0x4E
+                            buf.emit(_x64_movq_r64_xmm("rax", 1))
+                            write_result_from_reg(ins_hi.result, "rax")
+                            buf.emit(_SSE2_PACKED_ALU_OPS[op])       # horizontal collapse xmm0, xmm1
+                            buf.emit(_x64_movq_r64_xmm("rax", 0))
+                            write_result_from_reg(ins_top.result, "rax")
+                            buf.record_line(ins_top.source_line)
+                            inst_idx += 2
+                            continue
                     resolve_operand_to_reg(inst.operands[0], "rax")
                     resolve_operand_to_reg(inst.operands[1], "r11")
                     alu_byte = {"add": 0x01, "sub": 0x29, "and": 0x21, "or": 0x09, "xor": 0x31}[op]
@@ -689,6 +724,41 @@ class X64CodeGenerator:
                     write_result_from_reg(inst.result, "rax")
 
                 elif op in ("fadd", "fsub", "fmul", "fdiv"):
+                    if op == "fadd" and inst_idx + 1 < len(block.instructions):
+                        ins_hi = block.instructions[inst_idx]
+                        ins_top = block.instructions[inst_idx + 1]
+                        if (
+                            ins_hi.opcode.lower() == "fadd"
+                            and ins_top.opcode.lower() == "fadd"
+                            and isinstance(inst.result, SSAVar)
+                            and isinstance(ins_hi.result, SSAVar)
+                            and len(inst.operands) == 2
+                            and len(ins_hi.operands) == 2
+                            and len(ins_top.operands) == 2
+                            and set(ins_top.operands) == {inst.result, ins_hi.result}
+                        ):
+                            resolve_operand_to_reg(inst.operands[0], "rax")
+                            buf.emit(_x64_movq_xmm_r64(0, "rax"))
+                            resolve_operand_to_reg(ins_hi.operands[0], "rax")
+                            buf.emit(_x64_movq_xmm_r64(1, "rax"))
+                            buf.emit(b"\x66\x0f\x6c\xc1")            # punpcklqdq xmm0, xmm1
+                            resolve_operand_to_reg(inst.operands[1], "rax")
+                            buf.emit(_x64_movq_xmm_r64(1, "rax"))
+                            resolve_operand_to_reg(ins_hi.operands[1], "rax")
+                            buf.emit(_x64_movq_xmm_r64(2, "rax"))
+                            buf.emit(b"\x66\x0f\x6c\xca")            # punpcklqdq xmm1, xmm2
+                            buf.emit(b"\x66\x0f\x58\xc1")            # addpd xmm0, xmm1
+                            buf.emit(_x64_movq_r64_xmm("rax", 0))
+                            write_result_from_reg(inst.result, "rax")
+                            buf.emit(b"\x66\x0f\x70\xc8\x4e")        # pshufd xmm1, xmm0, 0x4E
+                            buf.emit(_x64_movq_r64_xmm("rax", 1))
+                            write_result_from_reg(ins_hi.result, "rax")
+                            buf.emit(b"\x66\x0f\x58\xc1")            # addpd xmm0, xmm1 (horizontal collapse)
+                            buf.emit(_x64_movq_r64_xmm("rax", 0))
+                            write_result_from_reg(ins_top.result, "rax")
+                            buf.record_line(ins_top.source_line)
+                            inst_idx += 2
+                            continue
                     resolve_operand_to_reg(inst.operands[0], "rax")
                     resolve_operand_to_reg(inst.operands[1], "r11")
                     buf.emit(_x64_movq_xmm_r64(0, "rax"))
