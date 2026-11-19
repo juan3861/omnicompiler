@@ -580,6 +580,16 @@ class X64CodeGenerator:
             "fsub": b"\x66\x0f\x5c\xc1",  # subpd xmm0, xmm1
             "fmul": b"\x66\x0f\x59\xc1",  # mulpd xmm0, xmm1
         }
+        _SSE2_PACKED_32B_ALU_OPS: Dict[str, bytes] = {
+            "add": b"\x66\x0f\xfe\xc1",   # paddd xmm0, xmm1
+            "sub": b"\x66\x0f\xfa\xc1",   # psubd xmm0, xmm1
+            "and": b"\x66\x0f\xdb\xc1",   # pand xmm0, xmm1
+            "or":  b"\x66\x0f\xeb\xc1",   # por xmm0, xmm1
+            "xor": b"\x66\x0f\xef\xc1",   # pxor xmm0, xmm1
+            "fadd": b"\x0f\x58\xc1",      # addps xmm0, xmm1
+            "fsub": b"\x0f\x5c\xc1",      # subps xmm0, xmm1
+            "fmul": b"\x0f\x59\xc1",      # mulps xmm0, xmm1
+        }
 
         # --- Emit Basic Blocks ---
         for idx_b, block in enumerate(fn.blocks):
@@ -607,6 +617,13 @@ class X64CodeGenerator:
                 b0, d0 = blk_add_const.get(off0, (off0, 0))
                 b1, d1 = blk_add_const.get(off1, (off1, 0))
                 return b0 == b1 and (d1 - d0) == 8
+
+            def _are_contiguous_4b_quad(off0: Any, off1: Any, off2: Any, off3: Any) -> bool:
+                b0, d0 = blk_add_const.get(off0, (off0, 0))
+                b1, d1 = blk_add_const.get(off1, (off1, 0))
+                b2, d2 = blk_add_const.get(off2, (off2, 0))
+                b3, d3 = blk_add_const.get(off3, (off3, 0))
+                return b0 == b1 == b2 == b3 and (d1 - d0) == 4 and (d2 - d0) == 8 and (d3 - d0) == 12
 
             inst_idx = 0
             while inst_idx < len(block.instructions):
@@ -872,6 +889,82 @@ class X64CodeGenerator:
 
                             buf.record_line(nxt_st.source_line)
                             inst_idx += 1
+                            continue
+
+                    if width in ("i32", "u32", "f32") and inst_idx + 2 < len(block.instructions):
+                        st1 = block.instructions[inst_idx]
+                        st2 = block.instructions[inst_idx + 1]
+                        st3 = block.instructions[inst_idx + 2]
+                        if (
+                            st1.opcode.lower() == "store_off" and len(st1.operands) >= 4 and str(st1.operands[3]) == width
+                            and st2.opcode.lower() == "store_off" and len(st2.operands) >= 4 and str(st2.operands[3]) == width
+                            and st3.opcode.lower() == "store_off" and len(st3.operands) >= 4 and str(st3.operands[3]) == width
+                            and st1.operands[0] == inst.operands[0] == st2.operands[0] == st3.operands[0]
+                            and _are_contiguous_4b_quad(inst.operands[1], st1.operands[1], st2.operands[1], st3.operands[1])
+                        ):
+                            vals_q = [inst.operands[2], st1.operands[2], st2.operands[2], st3.operands[2]]
+                            inss_q = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals_q]
+                            emitted_4x_simd = False
+                            if all(
+                                x is not None
+                                and x.opcode.lower() == inss_q[0].opcode.lower()
+                                and x.opcode.lower() in _SSE2_PACKED_32B_ALU_OPS
+                                and len(x.operands) == 2
+                                for x in inss_q
+                            ):
+                                op_4x = inss_q[0].opcode.lower()
+                                is_f32_op = op_4x.startswith("f")
+                                if (width == "f32" and is_f32_op) or (width in ("i32", "u32") and not is_f32_op):
+                                    lds_a = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss_q]
+                                    lds_b = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss_q]
+                                    if (
+                                        all(la is not None and la.opcode.lower() == "load_off" and str(la.operands[2]) == width and la.operands[0] == lds_a[0].operands[0] for la in lds_a)
+                                        and all(lb is not None and lb.opcode.lower() == "load_off" and str(lb.operands[2]) == width and lb.operands[0] == lds_b[0].operands[0] for lb in lds_b)
+                                        and _are_contiguous_4b_quad(lds_a[0].operands[1], lds_a[1].operands[1], lds_a[2].operands[1], lds_a[3].operands[1])
+                                        and _are_contiguous_4b_quad(lds_b[0].operands[1], lds_b[1].operands[1], lds_b[2].operands[1], lds_b[3].operands[1])
+                                    ):
+                                        resolve_operand_to_reg(lds_a[0].operands[0], "r11")
+                                        resolve_operand_to_reg(lds_a[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xf3\x41\x0f\x6f\x03")    # movdqu xmm0, xmmword ptr [r11]
+                                        resolve_operand_to_reg(lds_b[0].operands[0], "r11")
+                                        resolve_operand_to_reg(lds_b[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xf3\x41\x0f\x6f\x0b")    # movdqu xmm1, xmmword ptr [r11]
+                                        buf.emit(_SSE2_PACKED_32B_ALU_OPS[op_4x])
+                                        resolve_operand_to_reg(inst.operands[0], "r11")
+                                        resolve_operand_to_reg(inst.operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xf3\x41\x0f\x7f\x03")    # movdqu xmmword ptr [r11], xmm0
+                                        emitted_4x_simd = True
+
+                            if not emitted_4x_simd:
+                                resolve_operand_to_reg(vals_q[0], "rax")
+                                buf.emit(_x64_movq_xmm_r64(0, "rax"))
+                                if width == "f32":
+                                    buf.emit(b"\xf2\x0f\x5a\xc0")            # cvtsd2ss xmm0, xmm0
+                                resolve_operand_to_reg(vals_q[1], "rax")
+                                buf.emit(_x64_movq_xmm_r64(1, "rax"))
+                                if width == "f32":
+                                    buf.emit(b"\xf2\x0f\x5a\xc9")            # cvtsd2ss xmm1, xmm1
+                                buf.emit(b"\x66\x0f\x62\xc1")                # punpckldq xmm0, xmm1
+                                resolve_operand_to_reg(vals_q[2], "rax")
+                                buf.emit(_x64_movq_xmm_r64(1, "rax"))
+                                if width == "f32":
+                                    buf.emit(b"\xf2\x0f\x5a\xc9")            # cvtsd2ss xmm1, xmm1
+                                resolve_operand_to_reg(vals_q[3], "rax")
+                                buf.emit(_x64_movq_xmm_r64(2, "rax"))
+                                if width == "f32":
+                                    buf.emit(b"\xf2\x0f\x5a\xd2")            # cvtsd2ss xmm2, xmm2
+                                buf.emit(b"\x66\x0f\x62\xca")                # punpckldq xmm1, xmm2
+                                buf.emit(b"\x66\x0f\x6c\xc1")                # punpcklqdq xmm0, xmm1
+                                resolve_operand_to_reg(inst.operands[0], "r11")
+                                resolve_operand_to_reg(inst.operands[1], "rcx")
+                                buf.emit(b"\x49\x01\xcb")                    # add r11, rcx
+                                buf.emit(b"\xf3\x41\x0f\x7f\x03")            # movdqu xmmword ptr [r11], xmm0
+
+                            buf.record_line(st3.source_line)
+                            inst_idx += 3
                             continue
 
                     resolve_operand_to_reg(inst.operands[0], "r11")  # base ptr
