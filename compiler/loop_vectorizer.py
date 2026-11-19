@@ -155,6 +155,8 @@ class LoopVectorizerPass:
                             step_id=stats["vectorized_stores"],
                         )
                         stats["vectorized_stores"] += 1
+                        if store_pattern.get("reductions"):
+                            stats["vectorized_sums"] += 1
                         changed = True
                         break
                     continue
@@ -1130,50 +1132,13 @@ class LoopVectorizerPass:
                         return True
         return False
 
-    def _match_struct_array_sum(
+    def _extract_reduction_specs_from_phis(
         self,
         cond_bb: BasicBlock,
-        body_bb: BasicBlock,
-        reachable_from_body: Set[BasicBlock],
-        fn: Optional[SSAFunction] = None,
-        pre_bb: Optional[BasicBlock] = None,
-        superseded_blks: Optional[Set[BasicBlock]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        loop_info = self._match_zero_based_unit_loop(fn, pre_bb, cond_bb, body_bb, reachable_from_body)
-        if not loop_info:
-            return None
-        i_var, bound_count, bound_op, is_le, all_body_insts, loop_blks, loop_defined, start_i, step_i, bound_delta = loop_info
-
-        if not (2 <= len(cond_bb.phi_nodes) <= 7):
-            return None
-        if any(ins.opcode in ("store", "store_off", "call", "br_cond") for ins in all_body_insts):
-            return None
-
-        acc_phis_list = [p for p in cond_bb.phi_nodes if isinstance(p.result, SSAVar) and p.result != i_var]
-        if not acc_phis_list or len(acc_phis_list) != len(cond_bb.phi_nodes) - 1:
-            return None
-
-        # Match 1..8 affine load_off slots
-        load_offs = [ins for ins in all_body_insts if ins.opcode == "load_off"]
-        if not (1 <= len(load_offs) <= 8):
-            return None
-        load_specs: List[Tuple[Any, int, int, str, SSAVar]] = []
-        load_res_set: Set[SSAVar] = set()
-        for ld in load_offs:
-            if len(ld.operands) < 3 or not isinstance(ld.result, SSAVar):
-                return None
-            ld_base, ld_off, ld_width = ld.operands[0], ld.operands[1], str(ld.operands[2])
-            if isinstance(ld_base, SSAVar) and ld_base in loop_defined:
-                return None
-            aff = self._resolve_linear_offset(fn, all_body_insts, i_var, ld_off, ld_width)
-            if aff is None:
-                return None
-            eff_boff = aff[0] + start_i * aff[1]
-            eff_stride = step_i * aff[1]
-            load_specs.append((ld_base, eff_boff, eff_stride, ld_width, ld.result))
-            load_res_set.add(ld.result)
-
-        body_def_map = {ins.result: ins for ins in all_body_insts if isinstance(ins.result, SSAVar)}
+        pre_bb: Optional[BasicBlock],
+        acc_phis_list: List[SSAInstruction],
+        body_def_map: Dict[SSAVar, SSAInstruction],
+    ) -> Optional[Tuple[List[Dict[str, Any]], Set[SSAVar], Set[SSAVar], List[Any]]]:
         all_acc_prevs: Set[SSAVar] = set()
         all_acc_nexts: Set[SSAVar] = set()
         red_specs: List[Dict[str, Any]] = []
@@ -1181,6 +1146,8 @@ class LoopVectorizerPass:
 
         for acc_phi in acc_phis_list:
             acc_prev = acc_phi.result
+            if not isinstance(acc_prev, SSAVar):
+                return None
             _init_acc, back_acc = self._find_phi_edges(cond_bb, pre_bb, acc_prev)
             if not isinstance(back_acc, SSAVar):
                 return None
@@ -1242,6 +1209,57 @@ class LoopVectorizerPass:
             if cond_mask is not None:
                 all_roots.append(cond_mask)
 
+        return red_specs, all_acc_prevs, all_acc_nexts, all_roots
+
+    def _match_struct_array_sum(
+        self,
+        cond_bb: BasicBlock,
+        body_bb: BasicBlock,
+        reachable_from_body: Set[BasicBlock],
+        fn: Optional[SSAFunction] = None,
+        pre_bb: Optional[BasicBlock] = None,
+        superseded_blks: Optional[Set[BasicBlock]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        loop_info = self._match_zero_based_unit_loop(fn, pre_bb, cond_bb, body_bb, reachable_from_body)
+        if not loop_info:
+            return None
+        i_var, bound_count, bound_op, is_le, all_body_insts, loop_blks, loop_defined, start_i, step_i, bound_delta = loop_info
+
+        if not (2 <= len(cond_bb.phi_nodes) <= 7):
+            return None
+        if any(ins.opcode in ("store", "store_off", "call", "br_cond") for ins in all_body_insts):
+            return None
+
+        acc_phis_list = [p for p in cond_bb.phi_nodes if isinstance(p.result, SSAVar) and p.result != i_var]
+        if not acc_phis_list or len(acc_phis_list) != len(cond_bb.phi_nodes) - 1:
+            return None
+
+        # Match 1..8 affine load_off slots
+        load_offs = [ins for ins in all_body_insts if ins.opcode == "load_off"]
+        if not (1 <= len(load_offs) <= 8):
+            return None
+        load_specs: List[Tuple[Any, int, int, str, SSAVar]] = []
+        load_res_set: Set[SSAVar] = set()
+        for ld in load_offs:
+            if len(ld.operands) < 3 or not isinstance(ld.result, SSAVar):
+                return None
+            ld_base, ld_off, ld_width = ld.operands[0], ld.operands[1], str(ld.operands[2])
+            if isinstance(ld_base, SSAVar) and ld_base in loop_defined:
+                return None
+            aff = self._resolve_linear_offset(fn, all_body_insts, i_var, ld_off, ld_width)
+            if aff is None:
+                return None
+            eff_boff = aff[0] + start_i * aff[1]
+            eff_stride = step_i * aff[1]
+            load_specs.append((ld_base, eff_boff, eff_stride, ld_width, ld.result))
+            load_res_set.add(ld.result)
+
+        body_def_map = {ins.result: ins for ins in all_body_insts if isinstance(ins.result, SSAVar)}
+        red_parsed = self._extract_reduction_specs_from_phis(cond_bb, pre_bb, acc_phis_list, body_def_map)
+        if red_parsed is None:
+            return None
+        red_specs, all_acc_prevs, all_acc_nexts, all_roots = red_parsed
+
         if self._has_escaped_loop_uses(
             fn, loop_blks | (superseded_blks or set()), loop_defined, allowed_vars=all_acc_prevs | all_acc_nexts
         ):
@@ -1282,8 +1300,8 @@ class LoopVectorizerPass:
         pre_bb: Optional[BasicBlock] = None,
         superseded_blks: Optional[Set[BasicBlock]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Matches pure single or multi-field elementwise array/struct write loops (`dst_m[i] = f(src_r[i], ...)`)."""
-        if len(cond_bb.phi_nodes) != 1:
+        """Matches single/multi-field elementwise array/struct write loops, optionally fused with 1..6 reductions."""
+        if not (1 <= len(cond_bb.phi_nodes) <= 7):
             return None
         loop_info = self._match_zero_based_unit_loop(fn, pre_bb, cond_bb, body_bb, reachable_from_body)
         if not loop_info:
@@ -1292,48 +1310,109 @@ class LoopVectorizerPass:
 
         if bound_count is not None and bound_count < 4:
             return None
-        if self._has_escaped_loop_uses(fn, loop_blks | (superseded_blks or set()), loop_defined):
-            return None
         if any(ins.opcode in ("store", "call", "br_cond") for ins in all_body_insts):
+            return None
+
+        acc_phis_list = [p for p in cond_bb.phi_nodes if isinstance(p.result, SSAVar) and p.result != i_var]
+        if len(acc_phis_list) != len(cond_bb.phi_nodes) - 1:
             return None
 
         store_offs = [ins for ins in all_body_insts if ins.opcode == "store_off"]
         if not (1 <= len(store_offs) <= 8):
             return None
+
         dst_specs: List[Tuple[Any, int, int, str, Any]] = []
         store_vals: List[Any] = []
-        for st_inst in store_offs:
-            if len(st_inst.operands) < 4:
-                return None
-            dst_base, dst_off, store_val, dst_width = (
-                st_inst.operands[0], st_inst.operands[1], st_inst.operands[2], str(st_inst.operands[3])
-            )
-            if isinstance(dst_base, SSAVar) and dst_base in loop_defined:
-                return None
-            dst_aff = self._resolve_linear_offset(fn, all_body_insts, i_var, dst_off, dst_width)
-            if dst_aff is None:
-                return None
-            dst_specs.append((dst_base, dst_aff[0] + start_i * dst_aff[1], step_i * dst_aff[1], dst_width, store_val))
-            store_vals.append(store_val)
-
-        load_offs = [ins for ins in all_body_insts if ins.opcode == "load_off"]
         load_specs: List[Tuple[Any, int, int, str, SSAVar]] = []
         load_res_set: Set[SSAVar] = set()
-        for ld in load_offs:
-            if len(ld.operands) < 3 or not isinstance(ld.result, SSAVar):
-                return None
-            ld_base, ld_off, ld_width = ld.operands[0], ld.operands[1], str(ld.operands[2])
-            if isinstance(ld_base, SSAVar) and ld_base in loop_defined:
-                return None
-            ld_aff = self._resolve_linear_offset(fn, all_body_insts, i_var, ld_off, ld_width)
-            if ld_aff is None:
-                return None
-            load_specs.append((ld_base, ld_aff[0] + start_i * ld_aff[1], step_i * ld_aff[1], ld_width, ld.result))
-            load_res_set.add(ld.result)
+        written_slot_keys: Set[Tuple[Any, int, int]] = set()
+        written_slots: Dict[Tuple[Any, int, int, str], Any] = {}
+        forwarded_map: Dict[SSAVar, Any] = {}
 
-        dag_insts = self._extract_pure_dag_slice(all_body_insts, store_vals, load_res_set, i_var, loop_defined)
+        for ins in all_body_insts:
+            if ins.opcode == "store_off":
+                if len(ins.operands) < 4:
+                    return None
+                dst_base, dst_off, raw_sval, dst_width = (
+                    ins.operands[0], ins.operands[1], ins.operands[2], str(ins.operands[3])
+                )
+                store_val = forwarded_map.get(raw_sval, raw_sval)
+                if isinstance(dst_base, SSAVar) and dst_base in loop_defined:
+                    return None
+                dst_aff = self._resolve_linear_offset(fn, all_body_insts, i_var, dst_off, dst_width)
+                if dst_aff is None:
+                    return None
+                eff_dboff = dst_aff[0] + start_i * dst_aff[1]
+                eff_dstride = step_i * dst_aff[1]
+                dst_specs.append((dst_base, eff_dboff, eff_dstride, dst_width, store_val))
+                store_vals.append(store_val)
+                written_slot_keys.add((dst_base, eff_dboff, eff_dstride))
+                written_slots[(dst_base, eff_dboff, eff_dstride, dst_width)] = store_val
+            elif ins.opcode == "load_off":
+                if len(ins.operands) < 3 or not isinstance(ins.result, SSAVar):
+                    return None
+                ld_base, ld_off, ld_width = ins.operands[0], ins.operands[1], str(ins.operands[2])
+                if isinstance(ld_base, SSAVar) and ld_base in loop_defined:
+                    return None
+                ld_aff = self._resolve_linear_offset(fn, all_body_insts, i_var, ld_off, ld_width)
+                if ld_aff is None:
+                    return None
+                eff_lboff = ld_aff[0] + start_i * ld_aff[1]
+                eff_lstride = step_i * ld_aff[1]
+                if (ld_base, eff_lboff, eff_lstride) in written_slot_keys:
+                    l_slot = (ld_base, eff_lboff, eff_lstride, ld_width)
+                    if l_slot in written_slots and ld_width in ("i64", "u64", "f64"):
+                        forwarded_map[ins.result] = written_slots[l_slot]
+                    else:
+                        return None
+                else:
+                    load_specs.append((ld_base, eff_lboff, eff_lstride, ld_width, ins.result))
+                    load_res_set.add(ins.result)
+
+        work_body_insts = all_body_insts
+        if forwarded_map:
+            work_body_insts = [
+                SSAInstruction(ins.result, ins.opcode, [forwarded_map.get(op, op) for op in ins.operands])
+                for ins in all_body_insts
+                if not (ins.opcode == "load_off" and ins.result in forwarded_map)
+            ]
+
+        red_specs: List[Dict[str, Any]] = []
+        all_acc_prevs: Set[SSAVar] = set()
+        all_acc_nexts: Set[SSAVar] = set()
+        red_roots: List[Any] = []
+        if acc_phis_list:
+            body_def_map = {ins.result: ins for ins in work_body_insts if isinstance(ins.result, SSAVar)}
+            red_parsed = self._extract_reduction_specs_from_phis(cond_bb, pre_bb, acc_phis_list, body_def_map)
+            if red_parsed is None:
+                return None
+            red_specs, all_acc_prevs, all_acc_nexts, red_roots = red_parsed
+            red_roots = [forwarded_map.get(r, r) for r in red_roots]
+            for r in red_specs:
+                r["delta_var"] = forwarded_map.get(r["delta_var"], r["delta_var"])
+                if r["cond_mask"] is not None:
+                    r["cond_mask"] = forwarded_map.get(r["cond_mask"], r["cond_mask"])
+
+        if self._has_escaped_loop_uses(
+            fn, loop_blks | (superseded_blks or set()), loop_defined, allowed_vars=all_acc_prevs | all_acc_nexts
+        ):
+            return None
+
+        dag_insts = self._extract_pure_dag_slice(
+            work_body_insts, store_vals + red_roots, load_res_set, i_var, loop_defined
+        )
         if dag_insts is None:
             return None
+
+        if all_acc_prevs:
+            for ins in dag_insts:
+                if any(op in all_acc_prevs for op in ins.operands):
+                    return None
+            if any(sv in all_acc_prevs for sv in store_vals):
+                return None
+            for r in red_specs:
+                if r["delta_var"] in all_acc_prevs or r["cond_mask"] in all_acc_prevs:
+                    return None
 
         return {
             "i_var": i_var,
@@ -1346,6 +1425,8 @@ class LoopVectorizerPass:
             "dsts": dst_specs,
             "loads": load_specs,
             "dag_insts": dag_insts,
+            "reductions": red_specs,
+            "any_float": any(r["is_float"] for r in red_specs),
         }
 
     @classmethod
@@ -2013,6 +2094,7 @@ class LoopVectorizerPass:
         dst_specs: List[Tuple[Any, int, int, str, Any]] = pattern["dsts"]
         load_specs: List[Tuple[Any, int, int, str, SSAVar]] = pattern["loads"]
         dag_insts: List[SSAInstruction] = pattern["dag_insts"]
+        red_specs: List[Dict[str, Any]] = pattern.get("reductions") or []
 
         seq = [0]
 
@@ -2023,10 +2105,33 @@ class LoopVectorizerPass:
             return v
 
         store_vals = [d[4] for d in dst_specs]
-        needs_i_var = (i_var in store_vals) or any(i_var in ins.operands for ins in dag_insts)
+        needs_i_var = (
+            (i_var in store_vals)
+            or any(r["delta_var"] == i_var or r["cond_mask"] == i_var for r in red_specs)
+            or any(i_var in ins.operands for ins in dag_insts)
+        )
 
         # 1. Pre-header: eff_n, raw_chunks, pairwise alias guard across (dst vs read) & (dst vs dst), tail_start
         pre_insts: List[SSAInstruction] = []
+        acc_inits_by_r: List[List[Any]] = []
+        acc_phis_by_r: List[List[SSAVar]] = []
+        acc_nexts_by_r: List[List[SSAVar]] = []
+
+        for r_idx, r in enumerate(red_specs):
+            id_op, id_val = self._REDUCTION_OPS_IDENTITY[r["op"]]
+            vt = r["ssa_vt"]
+            init_val = self._find_init_acc(cond_bb, pre_bb, r["acc_prev"])
+            if init_val is None:
+                init_val = _mk(f"a0z_{r_idx}", id_op, [id_val], pre_insts, vt=vt)
+            r_inits: List[Any] = [init_val]
+            if r["op"] in self._MINMAX_CMP_MAP:
+                r_inits.extend([init_val, init_val, init_val])
+            else:
+                for lane in range(1, 4):
+                    r_inits.append(_mk(f"a{lane}z_{r_idx}", id_op, [id_val], pre_insts, vt=vt))
+            acc_inits_by_r.append(r_inits)
+            acc_phis_by_r.append([SSAVar(f"vec_st_acc{lane}_{step_id}_{r_idx}", 0, var_type=vt) for lane in range(4)])
+            acc_nexts_by_r.append([SSAVar(f"vec_st_acc{lane}_nxt_{step_id}_{r_idx}", 0, var_type=vt) for lane in range(4)])
         z_c = _mk("zc", "const", [0], pre_insts)
         two_c = _mk("two", "const", [2], pre_insts)
         if bound_count is not None:
@@ -2105,8 +2210,9 @@ class LoopVectorizerPass:
                     break
                 if self._is_statically_disjoint_same_base(boff_a, str_a, w_a, boff_b, str_b, w_b, bound_count):
                     continue
-                static_alias_force_scalar = True
-                break
+                if str_a == str_b and abs(boff_a - boff_b) < 4 * str_a:
+                    static_alias_force_scalar = True
+                    break
 
             sa_v, ea_v = _get_interval(base_a, boff_a, str_a, "da")
             sb_v, eb_v = _get_interval(base_b, boff_b, str_b, "sb")
@@ -2138,25 +2244,38 @@ class LoopVectorizerPass:
             pre_bb.instructions.extend(pre_insts)
 
         # 2. Vector chunk loop (cond_bb -> body_blk) and scalar tail loop (tail_cond_bb -> tail_body_bb)
+        merge_bb: Optional[BasicBlock] = BasicBlock(f"vec_st_merge_{step_id}") if red_specs else None
         tail_cond_bb = BasicBlock(f"vec_st_tail_cond_{step_id}")
         tail_body_bb = BasicBlock(f"vec_st_tail_body_{step_id}")
+        cond_false_target = merge_bb if merge_bb is not None else tail_cond_bb
 
         c_iv = SSAVar(f"vec_st_ci_{step_id}", 0)
         c_iv_next = SSAVar(f"vec_st_cin_{step_id}", 0)
-        cond_bb.phi_nodes = [
+        new_cond_phis = [
             SSAInstruction(
                 c_iv, "phi", [zero_idx, c_iv_next],
                 phi_incoming=[(pre_bb.name, zero_idx), (body_blk.name, c_iv_next)],
             )
         ]
+        for r_idx in range(len(red_specs)):
+            for lane in range(4):
+                new_cond_phis.append(
+                    SSAInstruction(
+                        acc_phis_by_r[r_idx][lane],
+                        "phi",
+                        [acc_inits_by_r[r_idx][lane], acc_nexts_by_r[r_idx][lane]],
+                        phi_incoming=[(pre_bb.name, acc_inits_by_r[r_idx][lane]), (body_blk.name, acc_nexts_by_r[r_idx][lane])],
+                    )
+                )
+        cond_bb.phi_nodes = new_cond_phis
         c_cmp = SSAVar(f"vec_st_ccmp_{step_id}", 0)
         cond_bb.instructions = [
             SSAInstruction(c_cmp, "cmp_lt", [c_iv, chunks_v]),
-            SSAInstruction(None, "br_cond", [c_cmp, body_blk.name, tail_cond_bb.name]),
+            SSAInstruction(None, "br_cond", [c_cmp, body_blk.name, cond_false_target.name]),
         ]
-        cond_bb.successors = [body_blk, tail_cond_bb]
+        cond_bb.successors = [body_blk, cond_false_target]
 
-        # Build body_blk: 1) all 4x loads, 2) 4x pure DAG clones, 3) all 4x stores across every dst_spec
+        # Build body_blk: 1) all 4x loads, 2) 4x pure DAG clones, 3) all 4x stores, 4) optional 4x reductions
         body_insts: List[SSAInstruction] = []
         lane_maps: List[Dict[Any, Any]] = [{} for _ in range(4)]
 
@@ -2185,6 +2304,27 @@ class LoopVectorizerPass:
                 st_v = cloned_maps[ln].get(d_val, d_val)
                 body_insts.append(SSAInstruction(None, "store_off", [d_base, dst_addrs[ln], st_v, d_width]))
 
+        for ln in range(4):
+            l_map = cloned_maps[ln]
+            for r_idx, r in enumerate(red_specs):
+                op = r["op"]
+                vt = r["ssa_vt"]
+                d_ln = l_map.get(r["delta_var"], r["delta_var"])
+                if r["cond_mask"] is not None:
+                    c_ln = l_map.get(r["cond_mask"], r["cond_mask"])
+                    cand_ln = SSAVar(f"vec_st_cand{ln}_{step_id}_{r_idx}", 0, var_type=vt)
+                    self._emit_reduction_op(cand_ln, op, acc_phis_by_r[r_idx][ln], d_ln, f"vec_strc_{step_id}_{r_idx}_{ln}", body_insts)
+                    sel_ops = (
+                        [c_ln, acc_phis_by_r[r_idx][ln], cand_ln]
+                        if r["cond_inverted"]
+                        else [c_ln, cand_ln, acc_phis_by_r[r_idx][ln]]
+                    )
+                    body_insts.append(SSAInstruction(acc_nexts_by_r[r_idx][ln], "select", sel_ops))
+                else:
+                    self._emit_reduction_op(
+                        acc_nexts_by_r[r_idx][ln], op, acc_phis_by_r[r_idx][ln], d_ln, f"vec_strn_{step_id}_{r_idx}_{ln}", body_insts
+                    )
+
         body_insts.extend([
             SSAInstruction(c_iv_next, "add", [c_iv, _mk("one", "const", [1], body_insts)]),
             SSAInstruction(None, "br", [cond_bb.name]),
@@ -2194,21 +2334,42 @@ class LoopVectorizerPass:
         body_blk.predecessors = [cond_bb]
         body_blk.successors = [cond_bb]
 
+        merged_vars: List[SSAVar] = []
+        tail_pred_bb = cond_bb
+        if merge_bb is not None:
+            merge_insts: List[SSAInstruction] = []
+            merged_vars = [
+                self._tree_reduce_ssa(acc_phis_by_r[r_idx], r["op"], r["ssa_vt"], f"vec_st_mrg_{step_id}_{r_idx}", merge_insts)
+                for r_idx, r in enumerate(red_specs)
+            ]
+            merge_bb.instructions = merge_insts + [SSAInstruction(None, "br", [tail_cond_bb.name])]
+            merge_bb.predecessors = [cond_bb]
+            merge_bb.successors = [tail_cond_bb]
+            tail_pred_bb = merge_bb
+
         # Build scalar tail loop
         t_iv = SSAVar(f"vec_st_ti_{step_id}", 0)
         t_iv_next = SSAVar(f"vec_st_tin_{step_id}", 0)
         t_cmp = SSAVar(f"vec_st_tcmp_{step_id}", 0)
+        t_accs = [SSAVar(f"vec_st_tacc_{step_id}_{r_idx}", 0, var_type=r["ssa_vt"]) for r_idx, r in enumerate(red_specs)]
+        t_acc_nexts = [SSAVar(f"vec_st_tacc_nxt_{step_id}_{r_idx}", 0, var_type=r["ssa_vt"]) for r_idx, r in enumerate(red_specs)]
         tail_cond_bb.phi_nodes = [
             SSAInstruction(
                 t_iv, "phi", [tail_start, t_iv_next],
-                phi_incoming=[(cond_bb.name, tail_start), (tail_body_bb.name, t_iv_next)],
+                phi_incoming=[(tail_pred_bb.name, tail_start), (tail_body_bb.name, t_iv_next)],
             )
+        ] + [
+            SSAInstruction(
+                t_accs[r_idx], "phi", [merged_vars[r_idx], t_acc_nexts[r_idx]],
+                phi_incoming=[(tail_pred_bb.name, merged_vars[r_idx]), (tail_body_bb.name, t_acc_nexts[r_idx])],
+            )
+            for r_idx in range(len(red_specs))
         ]
         tail_cond_bb.instructions = [
             SSAInstruction(t_cmp, "cmp_lt", [t_iv, eff_n]),
             SSAInstruction(None, "br_cond", [t_cmp, tail_body_bb.name, exit_bb.name]),
         ]
-        tail_cond_bb.predecessors = [cond_bb, tail_body_bb]
+        tail_cond_bb.predecessors = [tail_pred_bb, tail_body_bb]
         tail_cond_bb.successors = [tail_body_bb, exit_bb]
 
         tail_insts: List[SSAInstruction] = []
@@ -2227,6 +2388,20 @@ class LoopVectorizerPass:
         for d_idx, (d_base, d_boff, d_stride, d_width, d_val) in enumerate(dst_specs):
             t_dst_addr = self._emit_scalar_slot_addr(t_iv, d_boff, d_stride, f"tdst{d_idx}", f"vec_st_{step_id}", seq, tail_insts)
             tail_insts.append(SSAInstruction(None, "store_off", [d_base, t_dst_addr, tail_map.get(d_val, d_val), d_width]))
+        for r_idx, r in enumerate(red_specs):
+            d_t = tail_map.get(r["delta_var"], r["delta_var"])
+            if r["cond_mask"] is not None:
+                c_t = tail_map.get(r["cond_mask"], r["cond_mask"])
+                t_cand = SSAVar(f"vec_st_dtcand_{step_id}_{r_idx}", 0, var_type=r["ssa_vt"])
+                self._emit_reduction_op(t_cand, r["op"], t_accs[r_idx], d_t, f"vec_st_dtc_{step_id}_{r_idx}", tail_insts)
+                sel_ops = (
+                    [c_t, t_accs[r_idx], t_cand]
+                    if r["cond_inverted"]
+                    else [c_t, t_cand, t_accs[r_idx]]
+                )
+                tail_insts.append(SSAInstruction(t_acc_nexts[r_idx], "select", sel_ops))
+            else:
+                self._emit_reduction_op(t_acc_nexts[r_idx], r["op"], t_accs[r_idx], d_t, f"vec_st_dtn_{step_id}_{r_idx}", tail_insts)
         tail_insts.extend([
             SSAInstruction(t_iv_next, "add", [t_iv, _mk("tone", "const", [1], tail_insts)]),
             SSAInstruction(None, "br", [tail_cond_bb.name]),
@@ -2245,9 +2420,18 @@ class LoopVectorizerPass:
                     for sb, val in phi.phi_incoming
                 ]
 
+        new_blks_to_insert = (merge_bb, tail_cond_bb, tail_body_bb) if merge_bb is not None else (tail_cond_bb, tail_body_bb)
         exit_idx = fn.blocks.index(exit_bb)
-        for new_blk in reversed((tail_cond_bb, tail_body_bb)):
+        for new_blk in reversed(new_blks_to_insert):
             fn.blocks.insert(exit_idx, new_blk)
+
+        if red_specs:
+            excl_blks = {cond_bb, body_blk, tail_cond_bb, tail_body_bb} | ({merge_bb} if merge_bb is not None else set())
+            for r_idx, r in enumerate(red_specs):
+                target_vars = {v for v in (r["acc_prev"], r["acc_next"]) if isinstance(v, SSAVar)}
+                self._substitute_loop_uses(fn, excl_blks, target_vars, t_accs[r_idx])
+            if pattern.get("any_float") and fn.return_type in ("float", "f32", "f64", None):
+                fn.return_type = "f64"
 
     def vectorize_vla_function(
         self,

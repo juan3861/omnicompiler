@@ -332,8 +332,69 @@ class WasmBackend:
                 wat_lines.append(f"{indent}local.get ${tmp_l}")
                 wat_lines.append(f"{indent}local.set ${dst_l}")
 
+        _WASM_SIMD_64B_OPS = {
+            "add": "i64x2.add",
+            "sub": "i64x2.sub",
+            "mul": "i64x2.mul",
+            "imul": "i64x2.mul",
+            "and": "v128.and",
+            "or": "v128.or",
+            "xor": "v128.xor",
+            "fadd": "f64x2.add",
+            "fsub": "f64x2.sub",
+            "fmul": "f64x2.mul",
+            "fdiv": "f64x2.div",
+        }
+        _WASM_SIMD_32B_OPS = {
+            "add": "i32x4.add",
+            "sub": "i32x4.sub",
+            "mul": "i32x4.mul",
+            "imul": "i32x4.mul",
+            "and": "v128.and",
+            "or": "v128.or",
+            "xor": "v128.xor",
+            "fadd": "f32x4.add",
+            "fsub": "f32x4.sub",
+            "fmul": "f32x4.mul",
+            "fdiv": "f32x4.div",
+        }
+
         def emit_inst_sequence(block, indent: str):
-            for inst in block.instructions:
+            blk_const_int: Dict[SSAVar, int] = {}
+            blk_add_const: Dict[Any, Tuple[Any, int]] = {}
+            blk_def_map: Dict[SSAVar, Any] = {}
+            for b_ins in block.instructions:
+                if isinstance(b_ins.result, SSAVar):
+                    blk_def_map[b_ins.result] = b_ins
+                    if b_ins.opcode == "const" and b_ins.operands and isinstance(b_ins.operands[0], int) and not isinstance(b_ins.operands[0], bool):
+                        blk_const_int[b_ins.result] = int(b_ins.operands[0])
+                    elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
+                        op_a, op_b = b_ins.operands[0], b_ins.operands[1]
+                        ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else blk_const_int.get(op_a)
+                        cb = op_b if (isinstance(op_b, int) and not isinstance(op_b, bool)) else blk_const_int.get(op_b)
+                        if cb is not None:
+                            base_v, prev_off = blk_add_const.get(op_a, (op_a, 0))
+                            blk_add_const[b_ins.result] = (base_v, prev_off + int(cb))
+                        elif ca is not None:
+                            base_v, prev_off = blk_add_const.get(op_b, (op_b, 0))
+                            blk_add_const[b_ins.result] = (base_v, prev_off + int(ca))
+
+            def _are_contiguous_8b_offsets(off0: Any, off1: Any) -> bool:
+                b0, d0 = blk_add_const.get(off0, (off0, 0))
+                b1, d1 = blk_add_const.get(off1, (off1, 0))
+                return b0 == b1 and (d1 - d0) == 8
+
+            def _are_contiguous_4b_quad(off0: Any, off1: Any, off2: Any, off3: Any) -> bool:
+                b0, d0 = blk_add_const.get(off0, (off0, 0))
+                b1, d1 = blk_add_const.get(off1, (off1, 0))
+                b2, d2 = blk_add_const.get(off2, (off2, 0))
+                b3, d3 = blk_add_const.get(off3, (off3, 0))
+                return b0 == b1 == b2 == b3 and (d1 - d0) == 4 and (d2 - d0) == 8 and (d3 - d0) == 12
+
+            inst_idx = 0
+            while inst_idx < len(block.instructions):
+                inst = block.instructions[inst_idx]
+                inst_idx += 1
                 opcode = inst.opcode.lower()
                 if opcode == "param":
                     if inst.result and not (inst.result.version == 0 and inst.result.name in param_set):
@@ -451,6 +512,140 @@ class WasmBackend:
                     off_op = inst.operands[1] if len(inst.operands) > 1 else 0
                     val_op = inst.operands[2] if len(inst.operands) > 2 else 0
                     width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    if width in ("i64", "u64", "f64") and inst_idx < len(block.instructions):
+                        nxt_st = block.instructions[inst_idx]
+                        nxt_w = str(nxt_st.operands[3]) if (nxt_st.opcode.lower() == "store_off" and len(nxt_st.operands) >= 4) else ""
+                        if (
+                            nxt_st.opcode.lower() == "store_off"
+                            and nxt_w == width
+                            and nxt_st.operands[0] == base_op
+                            and _are_contiguous_8b_offsets(off_op, nxt_st.operands[1])
+                        ):
+                            val0, val1 = val_op, nxt_st.operands[2]
+                            ins0 = blk_def_map.get(val0) if isinstance(val0, SSAVar) else None
+                            ins1 = blk_def_map.get(val1) if isinstance(val1, SSAVar) else None
+                            wat_lines.append(f"{indent}{emit_operand(base_op)}")
+                            wat_lines.append(f"{indent}{emit_operand(off_op)}")
+                            wat_lines.append(f"{indent}i64.add")
+                            wat_lines.append(f"{indent}i32.wrap_i64")
+                            emitted_simd = False
+                            if (
+                                ins0 is not None and ins1 is not None
+                                and ins0.opcode.lower() == ins1.opcode.lower()
+                                and ins0.opcode.lower() in _WASM_SIMD_64B_OPS
+                                and len(ins0.operands) == 2 and len(ins1.operands) == 2
+                            ):
+                                op_2x = ins0.opcode.lower()
+                                is_f_op = op_2x.startswith("f")
+                                if (width == "f64" and is_f_op) or (width in ("i64", "u64") and not is_f_op):
+                                    ld_a0 = blk_def_map.get(ins0.operands[0]) if isinstance(ins0.operands[0], SSAVar) else None
+                                    ld_a1 = blk_def_map.get(ins1.operands[0]) if isinstance(ins1.operands[0], SSAVar) else None
+                                    ld_b0 = blk_def_map.get(ins0.operands[1]) if isinstance(ins0.operands[1], SSAVar) else None
+                                    ld_b1 = blk_def_map.get(ins1.operands[1]) if isinstance(ins1.operands[1], SSAVar) else None
+                                    if (
+                                        ld_a0 is not None and ld_a1 is not None and ld_b0 is not None and ld_b1 is not None
+                                        and ld_a0.opcode.lower() == "load_off" and ld_a1.opcode.lower() == "load_off"
+                                        and ld_b0.opcode.lower() == "load_off" and ld_b1.opcode.lower() == "load_off"
+                                        and str(ld_a0.operands[2]) == width == str(ld_a1.operands[2])
+                                        and str(ld_b0.operands[2]) == width == str(ld_b1.operands[2])
+                                        and ld_a0.operands[0] == ld_a1.operands[0]
+                                        and ld_b0.operands[0] == ld_b1.operands[0]
+                                        and _are_contiguous_8b_offsets(ld_a0.operands[1], ld_a1.operands[1])
+                                        and _are_contiguous_8b_offsets(ld_b0.operands[1], ld_b1.operands[1])
+                                    ):
+                                        wat_lines.append(f"{indent}{emit_operand(ld_a0.operands[0])}")
+                                        wat_lines.append(f"{indent}{emit_operand(ld_a0.operands[1])}")
+                                        wat_lines.append(f"{indent}i64.add")
+                                        wat_lines.append(f"{indent}i32.wrap_i64")
+                                        wat_lines.append(f"{indent}v128.load")
+                                        wat_lines.append(f"{indent}{emit_operand(ld_b0.operands[0])}")
+                                        wat_lines.append(f"{indent}{emit_operand(ld_b0.operands[1])}")
+                                        wat_lines.append(f"{indent}i64.add")
+                                        wat_lines.append(f"{indent}i32.wrap_i64")
+                                        wat_lines.append(f"{indent}v128.load")
+                                        wat_lines.append(f"{indent}{_WASM_SIMD_64B_OPS[op_2x]}")
+                                        wat_lines.append(f"{indent}v128.store")
+                                        emitted_simd = True
+                            if not emitted_simd:
+                                pfx_2x = "f64x2" if (width == "f64" or (isinstance(val0, SSAVar) and val0.var_type == "f64") or isinstance(val0, float)) else "i64x2"
+                                wat_lines.append(f"{indent}{emit_operand(val0)}")
+                                wat_lines.append(f"{indent}{pfx_2x}.splat")
+                                wat_lines.append(f"{indent}{emit_operand(val1)}")
+                                wat_lines.append(f"{indent}{pfx_2x}.replace_lane 1")
+                                wat_lines.append(f"{indent}v128.store")
+                            inst_idx += 1
+                            continue
+
+                    if width in ("i32", "u32", "f32") and inst_idx + 2 < len(block.instructions):
+                        st1 = block.instructions[inst_idx]
+                        st2 = block.instructions[inst_idx + 1]
+                        st3 = block.instructions[inst_idx + 2]
+                        if (
+                            st1.opcode.lower() == "store_off" and len(st1.operands) >= 4 and str(st1.operands[3]) == width
+                            and st2.opcode.lower() == "store_off" and len(st2.operands) >= 4 and str(st2.operands[3]) == width
+                            and st3.opcode.lower() == "store_off" and len(st3.operands) >= 4 and str(st3.operands[3]) == width
+                            and st1.operands[0] == base_op == st2.operands[0] == st3.operands[0]
+                            and _are_contiguous_4b_quad(off_op, st1.operands[1], st2.operands[1], st3.operands[1])
+                        ):
+                            vals_q = [val_op, st1.operands[2], st2.operands[2], st3.operands[2]]
+                            inss_q = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals_q]
+                            wat_lines.append(f"{indent}{emit_operand(base_op)}")
+                            wat_lines.append(f"{indent}{emit_operand(off_op)}")
+                            wat_lines.append(f"{indent}i64.add")
+                            wat_lines.append(f"{indent}i32.wrap_i64")
+                            emitted_4x = False
+                            if all(
+                                x is not None
+                                and x.opcode.lower() == inss_q[0].opcode.lower()
+                                and x.opcode.lower() in _WASM_SIMD_32B_OPS
+                                and len(x.operands) == 2
+                                for x in inss_q
+                            ):
+                                op_4x = inss_q[0].opcode.lower()
+                                is_f32_op = op_4x.startswith("f")
+                                if (width == "f32" and is_f32_op) or (width in ("i32", "u32") and not is_f32_op):
+                                    lds_a = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss_q]
+                                    lds_b = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss_q]
+                                    if (
+                                        all(la is not None and la.opcode.lower() == "load_off" and str(la.operands[2]) == width and la.operands[0] == lds_a[0].operands[0] for la in lds_a)
+                                        and all(lb is not None and lb.opcode.lower() == "load_off" and str(lb.operands[2]) == width and lb.operands[0] == lds_b[0].operands[0] for lb in lds_b)
+                                        and _are_contiguous_4b_quad(lds_a[0].operands[1], lds_a[1].operands[1], lds_a[2].operands[1], lds_a[3].operands[1])
+                                        and _are_contiguous_4b_quad(lds_b[0].operands[1], lds_b[1].operands[1], lds_b[2].operands[1], lds_b[3].operands[1])
+                                    ):
+                                        wat_lines.append(f"{indent}{emit_operand(lds_a[0].operands[0])}")
+                                        wat_lines.append(f"{indent}{emit_operand(lds_a[0].operands[1])}")
+                                        wat_lines.append(f"{indent}i64.add")
+                                        wat_lines.append(f"{indent}i32.wrap_i64")
+                                        wat_lines.append(f"{indent}v128.load")
+                                        wat_lines.append(f"{indent}{emit_operand(lds_b[0].operands[0])}")
+                                        wat_lines.append(f"{indent}{emit_operand(lds_b[0].operands[1])}")
+                                        wat_lines.append(f"{indent}i64.add")
+                                        wat_lines.append(f"{indent}i32.wrap_i64")
+                                        wat_lines.append(f"{indent}v128.load")
+                                        wat_lines.append(f"{indent}{_WASM_SIMD_32B_OPS[op_4x]}")
+                                        wat_lines.append(f"{indent}v128.store")
+                                        emitted_4x = True
+                            if not emitted_4x:
+                                if width == "f32":
+                                    wat_lines.append(f"{indent}{emit_operand(vals_q[0])}")
+                                    wat_lines.append(f"{indent}f32.demote_f64")
+                                    wat_lines.append(f"{indent}f32x4.splat")
+                                    for ln_i in range(1, 4):
+                                        wat_lines.append(f"{indent}{emit_operand(vals_q[ln_i])}")
+                                        wat_lines.append(f"{indent}f32.demote_f64")
+                                        wat_lines.append(f"{indent}f32x4.replace_lane {ln_i}")
+                                else:
+                                    wat_lines.append(f"{indent}{emit_operand(vals_q[0])}")
+                                    wat_lines.append(f"{indent}i32.wrap_i64")
+                                    wat_lines.append(f"{indent}i32x4.splat")
+                                    for ln_i in range(1, 4):
+                                        wat_lines.append(f"{indent}{emit_operand(vals_q[ln_i])}")
+                                        wat_lines.append(f"{indent}i32.wrap_i64")
+                                        wat_lines.append(f"{indent}i32x4.replace_lane {ln_i}")
+                                wat_lines.append(f"{indent}v128.store")
+                            inst_idx += 3
+                            continue
+
                     wat_lines.append(f"{indent}{emit_operand(base_op)}")
                     wat_lines.append(f"{indent}{emit_operand(off_op)}")
                     wat_lines.append(f"{indent}i64.add")
