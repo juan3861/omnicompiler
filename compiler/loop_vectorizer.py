@@ -1077,7 +1077,7 @@ class LoopVectorizerPass:
         "fmin": ("fconst", 1e308),
         "fmax": ("fconst", -1e308),
         "linear_recurrence": ("const", 0),
-        "coupled_2x2": ("const", 0),
+        "coupled_nxn": ("const", 0),
     }
 
     _MINMAX_CMP_MAP = {
@@ -1193,20 +1193,18 @@ class LoopVectorizerPass:
         return None
 
     @classmethod
-    def _mat2x2_mul(
+    def _mat_nxn_mul(
         cls,
-        a: Tuple[Tuple[int, int], Tuple[int, int]],
-        b: Tuple[Tuple[int, int], Tuple[int, int]],
-    ) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-        return (
-            (
-                cls._s64(cls._s64(a[0][0] * b[0][0]) + cls._s64(a[0][1] * b[1][0])),
-                cls._s64(cls._s64(a[0][0] * b[0][1]) + cls._s64(a[0][1] * b[1][1])),
-            ),
-            (
-                cls._s64(cls._s64(a[1][0] * b[0][0]) + cls._s64(a[1][1] * b[1][0])),
-                cls._s64(cls._s64(a[1][0] * b[0][1]) + cls._s64(a[1][1] * b[1][1])),
-            ),
+        a: Tuple[Tuple[int, ...], ...],
+        b: Tuple[Tuple[int, ...], ...],
+    ) -> Tuple[Tuple[int, ...], ...]:
+        k = len(a)
+        return tuple(
+            tuple(
+                cls._s64(sum(cls._s64(a[i][m] * b[m][j]) for m in range(k)))
+                for j in range(k)
+            )
+            for i in range(k)
         )
 
     @classmethod
@@ -1244,54 +1242,49 @@ class LoopVectorizerPass:
             out_insts.append(SSAInstruction(res_var, "mov", [acc_v]))
 
     @classmethod
-    def _emit_coupled_2x2_1x_row(
+    def _emit_coupled_nxn_1x_row(
         cls,
         res_var: SSAVar,
-        x_var: Any,
-        y_var: Any,
+        state_vars: List[Any],
         d_var: Optional[Any],
         r_spec: Dict[str, Any],
         prefix: str,
         out_insts: List[SSAInstruction],
     ) -> None:
         role = int(r_spec["coupled_role"])
-        mat = r_spec["matrix_2x2"]
-        m_r0, m_r1 = mat[role][0], mat[role][1]
+        mat = r_spec["matrix_nxn"]
         d_sgn = -1 if r_spec.get("negate_delta") else 1
-        terms: List[Tuple[int, Any]] = [(m_r0, x_var), (m_r1, y_var)]
+        terms: List[Tuple[int, Any]] = [(mat[role][j], state_vars[j]) for j in range(len(state_vars))]
         if d_var is not None:
             terms.append((d_sgn, d_var))
         cls._emit_weighted_linear_sum(res_var, terms, prefix, out_insts)
 
     @classmethod
-    def _emit_coupled_2x2_4x_row(
+    def _emit_coupled_nxn_4x_row(
         cls,
         res_var: SSAVar,
-        x_var: Any,
-        y_var: Any,
-        dx_lanes: List[Optional[Any]],
-        dy_lanes: List[Optional[Any]],
-        r_x_spec: Dict[str, Any],
-        r_y_spec: Dict[str, Any],
+        state_vars: List[Any],
+        delta_lanes_by_state: List[List[Optional[Any]]],
+        group_specs: List[Dict[str, Any]],
         role: int,
         prefix: str,
         out_insts: List[SSAInstruction],
     ) -> None:
-        m1 = r_x_spec["matrix_2x2"]
-        m2 = cls._mat2x2_mul(m1, m1)
-        m3 = cls._mat2x2_mul(m2, m1)
-        m4 = cls._mat2x2_mul(m2, m2)
-        m0 = ((1, 0), (0, 1))
+        m1 = group_specs[0]["matrix_nxn"]
+        k = len(m1)
+        m2 = cls._mat_nxn_mul(m1, m1)
+        m3 = cls._mat_nxn_mul(m2, m1)
+        m4 = cls._mat_nxn_mul(m2, m2)
+        m0 = tuple(tuple(1 if i == j else 0 for j in range(k)) for i in range(k))
         mats_by_lane = (m3, m2, m1, m0)
-        sx = -1 if r_x_spec.get("negate_delta") else 1
-        sy = -1 if r_y_spec.get("negate_delta") else 1
-        terms: List[Tuple[int, Any]] = [(m4[role][0], x_var), (m4[role][1], y_var)]
+        signs = [-1 if sp.get("negate_delta") else 1 for sp in group_specs]
+        terms: List[Tuple[int, Any]] = [(m4[role][j], state_vars[j]) for j in range(k)]
         for ln in range(4):
             ml = mats_by_lane[ln]
-            if dx_lanes[ln] is not None:
-                terms.append((cls._s64(ml[role][0] * sx), dx_lanes[ln]))
-            if dy_lanes[ln] is not None:
-                terms.append((cls._s64(ml[role][1] * sy), dy_lanes[ln]))
+            for j in range(k):
+                dl = delta_lanes_by_state[j][ln]
+                if dl is not None:
+                    terms.append((cls._s64(ml[role][j] * signs[j]), dl))
         cls._emit_weighted_linear_sum(res_var, terms, prefix, out_insts)
 
     def _decompose_coupled_linear_expr(
@@ -1364,7 +1357,7 @@ class LoopVectorizerPass:
             return None
         coeffs, d_list = res
         nz_coeffs = {k: v for k, v in coeffs.items() if v != 0}
-        if not (1 <= len(nz_coeffs) <= 2):
+        if not (1 <= len(nz_coeffs) <= 4):
             return None
         if len(d_list) == 0:
             return (nz_coeffs, None, False)
@@ -1403,7 +1396,7 @@ class LoopVectorizerPass:
         return ("fmax" if is_f else "smax", other_op)
 
     def _is_reduction_identity(self, fn: SSAFunction, val: Any, op: str) -> bool:
-        if op in self._MINMAX_CMP_MAP or op in ("linear_recurrence", "coupled_2x2"):
+        if op in self._MINMAX_CMP_MAP or op in ("linear_recurrence", "coupled_nxn"):
             return False
         _c_op, id_val = self._REDUCTION_OPS_IDENTITY[op]
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val == id_val:
@@ -1461,7 +1454,7 @@ class LoopVectorizerPass:
                 back_ins is not None
                 and back_ins.opcode in self._REDUCTION_OPS_IDENTITY
                 and back_ins.opcode not in self._MINMAX_CMP_MAP
-                and back_ins.opcode not in ("linear_recurrence", "coupled_2x2")
+                and back_ins.opcode not in ("linear_recurrence", "coupled_nxn")
                 and len(back_ins.operands) == 2
                 and acc_prev in back_ins.operands
                 and not (
@@ -1489,7 +1482,7 @@ class LoopVectorizerPass:
                     inner_ins is not None
                     and inner_ins.opcode in self._REDUCTION_OPS_IDENTITY
                     and inner_ins.opcode not in self._MINMAX_CMP_MAP
-                    and inner_ins.opcode not in ("linear_recurrence", "coupled_2x2")
+                    and inner_ins.opcode not in ("linear_recurrence", "coupled_nxn")
                     and len(inner_ins.operands) == 2
                     and acc_prev in inner_ins.operands
                 ):
@@ -1502,7 +1495,7 @@ class LoopVectorizerPass:
                 cp_res = self._decompose_coupled_linear_expr(fn, c_insts, back_acc, all_candidate_accs, body_def_map)
                 if cp_res is None:
                     return None
-                red_op = "coupled_2x2"
+                red_op = "coupled_nxn"
                 delta_var = cp_res[1]
                 negate_delta = cp_res[2]
                 pending_coupled[r_idx] = cp_res
@@ -1529,45 +1522,47 @@ class LoopVectorizerPass:
                 all_roots.append(cond_mask)
 
         if pending_coupled:
-            if len(pending_coupled) % 2 != 0:
-                return None
-            unpaired = sorted(pending_coupled.keys())
-            paired_visited: Set[int] = set()
-            for idx_x in unpaired:
-                if idx_x in paired_visited:
+            coupled_idxs = sorted(pending_coupled.keys())
+            acc_to_ridx = {red_specs[ri]["acc_prev"]: ri for ri in coupled_idxs}
+            adj: Dict[int, Set[int]] = {ri: set() for ri in coupled_idxs}
+            for ri in coupled_idxs:
+                cmap, _, _ = pending_coupled[ri]
+                for dep_acc in cmap.keys():
+                    rj = acc_to_ridx.get(dep_acc)
+                    if rj is None:
+                        return None
+                    if rj != ri:
+                        adj[ri].add(rj)
+                        adj[rj].add(ri)
+            visited_cp: Set[int] = set()
+            for root_i in coupled_idxs:
+                if root_i in visited_cp:
                     continue
-                acc_x = red_specs[idx_x]["acc_prev"]
-                cx_map, _, _ = pending_coupled[idx_x]
-                partner_found: Optional[int] = None
-                for cand_y in unpaired:
-                    if cand_y == idx_x or cand_y in paired_visited:
-                        continue
-                    acc_y = red_specs[cand_y]["acc_prev"]
-                    cy_map, _, _ = pending_coupled[cand_y]
-                    if (
-                        set(cx_map.keys()) <= {acc_x, acc_y}
-                        and set(cy_map.keys()) <= {acc_x, acc_y}
-                        and (acc_y in cx_map or acc_x in cy_map)
-                    ):
-                        partner_found = cand_y
-                        break
-                if partner_found is None:
+                comp: List[int] = []
+                stack = [root_i]
+                visited_cp.add(root_i)
+                while stack:
+                    cur = stack.pop()
+                    comp.append(cur)
+                    for nb in adj[cur]:
+                        if nb not in visited_cp:
+                            visited_cp.add(nb)
+                            stack.append(nb)
+                comp.sort()
+                if not (2 <= len(comp) <= 4):
                     return None
-                idx_y = partner_found
-                paired_visited.add(idx_x)
-                paired_visited.add(idx_y)
-                acc_y = red_specs[idx_y]["acc_prev"]
-                cy_map, _, _ = pending_coupled[idx_y]
-                mat_2x2 = (
-                    (int(cx_map.get(acc_x, 0)), int(cx_map.get(acc_y, 0))),
-                    (int(cy_map.get(acc_x, 0)), int(cy_map.get(acc_y, 0))),
+                comp_accs = {red_specs[ci]["acc_prev"] for ci in comp}
+                for ci in comp:
+                    if not (set(pending_coupled[ci][0].keys()) <= comp_accs):
+                        return None
+                mat_nxn = tuple(
+                    tuple(int(pending_coupled[ri][0].get(red_specs[cj]["acc_prev"], 0)) for cj in comp)
+                    for ri in comp
                 )
-                red_specs[idx_x]["partner_idx"] = idx_y
-                red_specs[idx_x]["coupled_role"] = 0
-                red_specs[idx_x]["matrix_2x2"] = mat_2x2
-                red_specs[idx_y]["partner_idx"] = idx_x
-                red_specs[idx_y]["coupled_role"] = 1
-                red_specs[idx_y]["matrix_2x2"] = mat_2x2
+                for role, ri in enumerate(comp):
+                    red_specs[ri]["group_indices"] = comp
+                    red_specs[ri]["coupled_role"] = role
+                    red_specs[ri]["matrix_nxn"] = mat_nxn
 
         return red_specs, all_acc_prevs, all_acc_nexts, all_roots
 
@@ -1938,41 +1933,43 @@ class LoopVectorizerPass:
             vt = r["ssa_vt"]
             items = items_by_r[r_idx]
             init_val = self._find_init_acc(cond_bb, pre_bb, r["acc_prev"])
-            if op == "coupled_2x2":
-                p_idx = int(r["partner_idx"])
-                r_x_idx, r_y_idx = (r_idx, p_idx) if int(r["coupled_role"]) == 0 else (p_idx, r_idx)
-                rx, ry = red_specs[r_x_idx], red_specs[r_y_idx]
-                ix = self._find_init_acc(cond_bb, pre_bb, rx["acc_prev"])
-                iy = self._find_init_acc(cond_bb, pre_bb, ry["acc_prev"])
-                if ix is None:
-                    ix = SSAVar(f"vec_cp_ix_{step_id}_{r_x_idx}", 0, var_type=vt)
-                    insts.append(SSAInstruction(ix, "const", [0]))
-                if iy is None:
-                    iy = SSAVar(f"vec_cp_iy_{step_id}_{r_y_idx}", 0, var_type=vt)
-                    insts.append(SSAInstruction(iy, "const", [0]))
-                cur_x, cur_y = ix, iy
-                items_x, items_y = items_by_r[r_x_idx], items_by_r[r_y_idx]
+            if op == "coupled_nxn":
+                grp = r["group_indices"]
+                if r_idx != grp[0]:
+                    continue
+                grp_specs = [red_specs[gi] for gi in grp]
+                cur_states: List[Any] = []
+                for gi, gsp in zip(grp, grp_specs):
+                    iv = self._find_init_acc(cond_bb, pre_bb, gsp["acc_prev"])
+                    if iv is None:
+                        iv = SSAVar(f"vec_cp_init_{step_id}_{gi}", 0, var_type=vt)
+                        insts.append(SSAInstruction(iv, "const", [0]))
+                    cur_states.append(iv)
+                items_grp = [items_by_r[gi] for gi in grp]
                 idx_k = 0
                 while idx_k + 4 <= bound_count:
-                    nx = SSAVar(f"vec_cp4x_{step_id}_{r_x_idx}_{idx_k}", 0, var_type=vt)
-                    ny = SSAVar(f"vec_cp4y_{step_id}_{r_y_idx}_{idx_k}", 0, var_type=vt)
-                    self._emit_coupled_2x2_4x_row(
-                        nx, cur_x, cur_y, items_x[idx_k : idx_k + 4], items_y[idx_k : idx_k + 4], rx, ry, 0, f"vec_cpe0_{step_id}_{r_x_idx}_{idx_k}", insts
-                    )
-                    self._emit_coupled_2x2_4x_row(
-                        ny, cur_x, cur_y, items_x[idx_k : idx_k + 4], items_y[idx_k : idx_k + 4], rx, ry, 1, f"vec_cpe1_{step_id}_{r_y_idx}_{idx_k}", insts
-                    )
-                    cur_x, cur_y = nx, ny
+                    nxt_states: List[SSAVar] = []
+                    d_lanes_grp = [items_grp[si][idx_k : idx_k + 4] for si in range(len(grp))]
+                    for role, gi in enumerate(grp):
+                        ns = SSAVar(f"vec_cp4_{step_id}_{gi}_{idx_k}", 0, var_type=vt)
+                        self._emit_coupled_nxn_4x_row(
+                            ns, cur_states, d_lanes_grp, grp_specs, role, f"vec_cpe{role}_{step_id}_{gi}_{idx_k}", insts
+                        )
+                        nxt_states.append(ns)
+                    cur_states = nxt_states
                     idx_k += 4
                 while idx_k < bound_count:
-                    nx = SSAVar(f"vec_cp1x_{step_id}_{r_x_idx}_{idx_k}", 0, var_type=vt)
-                    ny = SSAVar(f"vec_cp1y_{step_id}_{r_y_idx}_{idx_k}", 0, var_type=vt)
-                    self._emit_coupled_2x2_1x_row(nx, cur_x, cur_y, items_x[idx_k], rx, f"vec_cps0_{step_id}_{r_x_idx}_{idx_k}", insts)
-                    self._emit_coupled_2x2_1x_row(ny, cur_x, cur_y, items_y[idx_k], ry, f"vec_cps1_{step_id}_{r_y_idx}_{idx_k}", insts)
-                    cur_x, cur_y = nx, ny
+                    nxt_states = []
+                    for role, (gi, gsp) in enumerate(zip(grp, grp_specs)):
+                        ns = SSAVar(f"vec_cp1_{step_id}_{gi}_{idx_k}", 0, var_type=vt)
+                        self._emit_coupled_nxn_1x_row(
+                            ns, cur_states, items_grp[role][idx_k], gsp, f"vec_cps{role}_{step_id}_{gi}_{idx_k}", insts
+                        )
+                        nxt_states.append(ns)
+                    cur_states = nxt_states
                     idx_k += 1
-                final_vars[r_x_idx] = cur_x
-                final_vars[r_y_idx] = cur_y
+                for gi, st_v in zip(grp, cur_states):
+                    final_vars[gi] = st_v
                 continue
             if op == "linear_recurrence":
                 if init_val is None:
@@ -2154,21 +2151,17 @@ class LoopVectorizerPass:
         for r_idx, r in enumerate(red_specs):
             op = r["op"]
             vt = r["ssa_vt"]
-            if op == "coupled_2x2":
-                p_idx = int(r["partner_idx"])
+            if op == "coupled_nxn":
+                grp = r["group_indices"]
                 role = int(r["coupled_role"])
-                r_x_idx, r_y_idx = (r_idx, p_idx) if role == 0 else (p_idx, r_idx)
-                rx, ry = red_specs[r_x_idx], red_specs[r_y_idx]
-                dx_lanes = [cloned_lmaps[ln].get(rx["delta_var"], rx["delta_var"]) for ln in range(4)]
-                dy_lanes = [cloned_lmaps[ln].get(ry["delta_var"], ry["delta_var"]) for ln in range(4)]
-                self._emit_coupled_2x2_4x_row(
+                grp_specs = [red_specs[gi] for gi in grp]
+                state_vars = [acc_phis_by_r[gi][0] for gi in grp]
+                d_lanes_grp = [[cloned_lmaps[ln].get(gsp["delta_var"], gsp["delta_var"]) for ln in range(4)] for gsp in grp_specs]
+                self._emit_coupled_nxn_4x_row(
                     acc_nexts_by_r[r_idx][0],
-                    acc_phis_by_r[r_x_idx][0],
-                    acc_phis_by_r[r_y_idx][0],
-                    dx_lanes,
-                    dy_lanes,
-                    rx,
-                    ry,
+                    state_vars,
+                    d_lanes_grp,
+                    grp_specs,
                     role,
                     f"vec_cpe_{step_id}_{r_idx}",
                     body_insts,
@@ -2222,7 +2215,7 @@ class LoopVectorizerPass:
         merge_insts: List[SSAInstruction] = []
         merged_vars: List[SSAVar] = [
             acc_phis_by_r[r_idx][0]
-            if r["op"] in ("linear_recurrence", "coupled_2x2")
+            if r["op"] in ("linear_recurrence", "coupled_nxn")
             else self._tree_reduce_ssa(acc_phis_by_r[r_idx], r["op"], r["ssa_vt"], f"vec_merge_{step_id}_{r_idx}", merge_insts)
             for r_idx, r in enumerate(red_specs)
         ]
@@ -2289,11 +2282,10 @@ class LoopVectorizerPass:
             for r_idx, r in enumerate(red_specs):
                 d_t = t_map.get(r["delta_var"], r["delta_var"])
                 t_next = SSAVar(f"vec_tacc_{step_id}_{r_idx}_{t_idx}", 0, var_type=r["ssa_vt"])
-                if r["op"] == "coupled_2x2":
-                    p_idx = int(r["partner_idx"])
-                    r_x_idx, r_y_idx = (r_idx, p_idx) if int(r["coupled_role"]) == 0 else (p_idx, r_idx)
-                    self._emit_coupled_2x2_1x_row(
-                        t_next, prev_merged[r_x_idx], prev_merged[r_y_idx], d_t, r, f"vec_stcp_{step_id}_{r_idx}_{t_idx}", merge_insts
+                if r["op"] == "coupled_nxn":
+                    grp = r["group_indices"]
+                    self._emit_coupled_nxn_1x_row(
+                        t_next, [prev_merged[gi] for gi in grp], d_t, r, f"vec_stcp_{step_id}_{r_idx}_{t_idx}", merge_insts
                     )
                 elif r["cond_mask"] is not None:
                     c_t = t_map.get(r["cond_mask"], r["cond_mask"])
@@ -2475,11 +2467,10 @@ class LoopVectorizerPass:
         t_map = self._clone_dag_insts(dag_insts, t_map, f"vec_rtd_{step_id}", t_seq, tail_body_insts)
         for r_idx, r in enumerate(red_specs):
             d_t = t_map.get(r["delta_var"], r["delta_var"])
-            if r["op"] == "coupled_2x2":
-                p_idx = int(r["partner_idx"])
-                r_x_idx, r_y_idx = (r_idx, p_idx) if int(r["coupled_role"]) == 0 else (p_idx, r_idx)
-                self._emit_coupled_2x2_1x_row(
-                    t_acc_nexts[r_idx], t_accs[r_x_idx], t_accs[r_y_idx], d_t, r, f"vec_dtcp_{step_id}_{r_idx}", tail_body_insts
+            if r["op"] == "coupled_nxn":
+                grp = r["group_indices"]
+                self._emit_coupled_nxn_1x_row(
+                    t_acc_nexts[r_idx], [t_accs[gi] for gi in grp], d_t, r, f"vec_dtcp_{step_id}_{r_idx}", tail_body_insts
                 )
             elif r["cond_mask"] is not None:
                 c_t = t_map.get(r["cond_mask"], r["cond_mask"])
@@ -2800,21 +2791,17 @@ class LoopVectorizerPass:
                     cur_prev = step_res
                 for ln in range(1, 4):
                     body_insts.append(SSAInstruction(acc_nexts_by_r[r_idx][ln], "mov", [acc_phis_by_r[r_idx][ln]]))
-            elif op == "coupled_2x2":
-                p_idx = int(r["partner_idx"])
+            elif op == "coupled_nxn":
+                grp = r["group_indices"]
                 role = int(r["coupled_role"])
-                r_x_idx, r_y_idx = (r_idx, p_idx) if role == 0 else (p_idx, r_idx)
-                rx, ry = red_specs[r_x_idx], red_specs[r_y_idx]
-                dx_lanes = [cloned_maps[ln].get(rx["delta_var"], rx["delta_var"]) for ln in range(4)]
-                dy_lanes = [cloned_maps[ln].get(ry["delta_var"], ry["delta_var"]) for ln in range(4)]
-                self._emit_coupled_2x2_4x_row(
+                grp_specs = [red_specs[gi] for gi in grp]
+                state_vars = [acc_phis_by_r[gi][0] for gi in grp]
+                d_lanes_grp = [[cloned_maps[ln].get(gsp["delta_var"], gsp["delta_var"]) for ln in range(4)] for gsp in grp_specs]
+                self._emit_coupled_nxn_4x_row(
                     acc_nexts_by_r[r_idx][0],
-                    acc_phis_by_r[r_x_idx][0],
-                    acc_phis_by_r[r_y_idx][0],
-                    dx_lanes,
-                    dy_lanes,
-                    rx,
-                    ry,
+                    state_vars,
+                    d_lanes_grp,
+                    grp_specs,
                     role,
                     f"vec_st_cpe_{step_id}_{r_idx}",
                     body_insts,
@@ -2873,7 +2860,7 @@ class LoopVectorizerPass:
             merge_insts: List[SSAInstruction] = []
             merged_vars = [
                 acc_phis_by_r[r_idx][0]
-                if (r.get("is_scan") or r["op"] in ("linear_recurrence", "coupled_2x2"))
+                if (r.get("is_scan") or r["op"] in ("linear_recurrence", "coupled_nxn"))
                 else self._tree_reduce_ssa(acc_phis_by_r[r_idx], r["op"], r["ssa_vt"], f"vec_st_mrg_{step_id}_{r_idx}", merge_insts)
                 for r_idx, r in enumerate(red_specs)
             ]
@@ -2922,11 +2909,10 @@ class LoopVectorizerPass:
         tail_map = self._clone_dag_insts(dag_insts, tail_map, f"vec_st_{step_id}_tdag", seq, tail_insts)
         for r_idx, r in enumerate(red_specs):
             d_t = tail_map.get(r["delta_var"], r["delta_var"])
-            if r["op"] == "coupled_2x2":
-                p_idx = int(r["partner_idx"])
-                r_x_idx, r_y_idx = (r_idx, p_idx) if int(r["coupled_role"]) == 0 else (p_idx, r_idx)
-                self._emit_coupled_2x2_1x_row(
-                    t_acc_nexts[r_idx], t_accs[r_x_idx], t_accs[r_y_idx], d_t, r, f"vec_st_dtcp_{step_id}_{r_idx}", tail_insts
+            if r["op"] == "coupled_nxn":
+                grp = r["group_indices"]
+                self._emit_coupled_nxn_1x_row(
+                    t_acc_nexts[r_idx], [t_accs[gi] for gi in grp], d_t, r, f"vec_st_dtcp_{step_id}_{r_idx}", tail_insts
                 )
             elif r["cond_mask"] is not None:
                 c_t = tail_map.get(r["cond_mask"], r["cond_mask"])

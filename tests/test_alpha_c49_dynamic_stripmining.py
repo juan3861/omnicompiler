@@ -218,6 +218,20 @@ def sum_le(buf: IntBuf, n: int) -> int:
         (Non-zero start and stride 2 are legitimately vectorized since Alpha-C54.)"""
         cases = [
             (
+                "negative_init",
+                """
+class Buf:
+    arr: Array[i64, 64]
+def fn(b: Buf, n: int) -> int:
+    s = 0
+    i = -2
+    while i < n:
+        s += b.arr[i]
+        i += 1
+    return s
+""",
+            ),
+            (
                 "non_pow2_step",
                 """
 class Buf:

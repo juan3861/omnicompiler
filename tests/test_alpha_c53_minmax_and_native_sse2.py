@@ -197,7 +197,7 @@ def vec_add_i64(dst: int, a: int, b: int, n: int) -> int:
         vec_i, st_i = LoopVectorizerPass().vectorize_function(ssa_i)
         self.assertEqual(st_i["vectorized_stores"], 1)
 
-        cg = X64CodeGenerator()
+        cg = X64CodeGenerator(enable_avx2=False)
         code_i = cg.compile_function(vec_i).code_bytes
         # Verify physical SSE2 128-bit load (f3 41 0f 6f), paddq (66 0f d4 c1), and 128-bit store (f3 41 0f 7f 03)
         self.assertIn(b"\xf3\x41\x0f\x6f\x03", code_i, "Missing SSE2 movdqu xmm0, [r11]")
