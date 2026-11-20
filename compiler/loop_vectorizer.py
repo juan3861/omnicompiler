@@ -1822,6 +1822,7 @@ class LoopVectorizerPass:
         prefix: str,
         seq: List[int],
         out: List[SSAInstruction],
+        lanes: int = 4,
     ) -> List[SSAVar]:
         def _mk_a(suffix: str, opcode: str, ops: List[Any]) -> SSAVar:
             v = SSAVar(f"{prefix}_{tag}_{suffix}_{seq[0]}", 0)
@@ -1829,14 +1830,14 @@ class LoopVectorizerPass:
             out.append(SSAInstruction(v, opcode, ops))
             return v
 
-        s4_c = _mk_a("s4", "const", [stride * 4])
+        s4_c = _mk_a("s4", "const", [stride * lanes])
         step_v = _mk_a("mul", "mul", [c_iv, s4_c])
         if boff != 0:
             ebase = _mk_a("eb", "add", [_mk_a("bo", "const", [boff]), step_v])
         else:
             ebase = step_v
         addrs: List[SSAVar] = [ebase]
-        for ln in range(1, 4):
+        for ln in range(1, lanes):
             addrs.append(_mk_a(f"la{ln}", "add", [ebase, _mk_a(f"lo{ln}", "const", [ln * stride])]))
         return addrs
 
@@ -2603,8 +2604,17 @@ class LoopVectorizerPass:
             acc_inits_by_r.append(r_inits)
             acc_phis_by_r.append([SSAVar(f"vec_st_acc{lane}_{step_id}_{r_idx}", 0, var_type=vt) for lane in range(4)])
             acc_nexts_by_r.append([SSAVar(f"vec_st_acc{lane}_nxt_{step_id}_{r_idx}", 0, var_type=vt) for lane in range(4)])
+        use_8way = (
+            not red_specs
+            and all(d[3] in ("i32", "u32", "f32") and d[2] == 4 for d in dst_specs)
+            and all(l[3] in ("i32", "u32", "f32") and l[2] == 4 for l in load_specs)
+            and (bound_count is None or bound_count >= 8)
+        )
+        lanes = 8 if use_8way else 4
+        lane_shift = 3 if use_8way else 2
+
         z_c = _mk("zc", "const", [0], pre_insts)
-        two_c = _mk("two", "const", [2], pre_insts)
+        two_c = _mk("two", "const", [lane_shift], pre_insts)
         if bound_count is not None:
             eff_n = _mk("effn", "const", [bound_count], pre_insts)
             is_pos = _mk("ispos", "cmp_gt", [eff_n, z_c], pre_insts)
@@ -2681,7 +2691,7 @@ class LoopVectorizerPass:
                     break
                 if self._is_statically_disjoint_same_base(boff_a, str_a, w_a, boff_b, str_b, w_b, bound_count):
                     continue
-                if str_a == str_b and abs(boff_a - boff_b) < 4 * str_a:
+                if str_a == str_b and abs(boff_a - boff_b) < lanes * str_a:
                     static_alias_force_scalar = True
                     break
 
@@ -2746,29 +2756,29 @@ class LoopVectorizerPass:
         ]
         cond_bb.successors = [body_blk, cond_false_target]
 
-        # Build body_blk: 1) all 4x loads, 2) 4x pure DAG clones, 3) all 4x stores, 4) optional 4x reductions
+        # Build body_blk: 1) all kx loads, 2) kx pure DAG clones, 3) all kx stores, 4) optional 4x reductions
         body_insts: List[SSAInstruction] = []
-        lane_maps: List[Dict[Any, Any]] = [{} for _ in range(4)]
+        lane_maps: List[Dict[Any, Any]] = [{} for _ in range(lanes)]
 
         for s_idx, (s_base, s_boff, s_stride, s_width, s_res) in enumerate(load_specs):
-            s_addrs = self._emit_4x_slot_addrs(c_iv, s_boff, s_stride, f"ld{s_idx}", f"vec_st_{step_id}", seq, body_insts)
+            s_addrs = self._emit_4x_slot_addrs(c_iv, s_boff, s_stride, f"ld{s_idx}", f"vec_st_{step_id}", seq, body_insts, lanes=lanes)
             ld_vt = s_res.var_type if isinstance(s_res, SSAVar) else ("f64" if "f" in s_width else "i64")
-            for ln in range(4):
+            for ln in range(lanes):
                 ld_v = _mk(f"ld{s_idx}_l{ln}", "load_off", [s_base, s_addrs[ln], s_width], body_insts, vt=ld_vt)
                 lane_maps[ln][s_res] = ld_v
 
         if needs_i_var:
             if start_i == 0 and step_i == 1:
-                base_i = _mk("ibase", "shl", [c_iv, _mk("itwo", "const", [2], body_insts)], body_insts)
+                base_i = _mk("ibase", "shl", [c_iv, _mk("itwo", "const", [lane_shift], body_insts)], body_insts)
                 lane_maps[0][i_var] = base_i
-                for ln in range(1, 4):
+                for ln in range(1, lanes):
                     lane_maps[ln][i_var] = _mk(f"il{ln}", "add", [base_i, _mk(f"ic{ln}", "const", [ln], body_insts)], body_insts)
             else:
-                iv_addrs = self._emit_4x_slot_addrs(c_iv, start_i, step_i, "iv", f"vec_st_{step_id}", seq, body_insts)
-                for ln in range(4):
+                iv_addrs = self._emit_4x_slot_addrs(c_iv, start_i, step_i, "iv", f"vec_st_{step_id}", seq, body_insts, lanes=lanes)
+                for ln in range(lanes):
                     lane_maps[ln][i_var] = iv_addrs[ln]
 
-        cloned_maps = [self._clone_dag_insts(dag_insts, lane_maps[ln], f"vec_st_{step_id}_l{ln}", seq, body_insts) for ln in range(4)]
+        cloned_maps = [self._clone_dag_insts(dag_insts, lane_maps[ln], f"vec_st_{step_id}_l{ln}", seq, body_insts) for ln in range(lanes)]
         for r_idx, r in enumerate(red_specs):
             op = r["op"]
             vt = r["ssa_vt"]
@@ -2840,8 +2850,8 @@ class LoopVectorizerPass:
                         )
 
         for d_idx, (d_base, d_boff, d_stride, d_width, d_val) in enumerate(dst_specs):
-            dst_addrs = self._emit_4x_slot_addrs(c_iv, d_boff, d_stride, f"dst{d_idx}", f"vec_st_{step_id}", seq, body_insts)
-            for ln in range(4):
+            dst_addrs = self._emit_4x_slot_addrs(c_iv, d_boff, d_stride, f"dst{d_idx}", f"vec_st_{step_id}", seq, body_insts, lanes=lanes)
+            for ln in range(lanes):
                 st_v = cloned_maps[ln].get(d_val, d_val)
                 body_insts.append(SSAInstruction(None, "store_off", [d_base, dst_addrs[ln], st_v, d_width]))
 

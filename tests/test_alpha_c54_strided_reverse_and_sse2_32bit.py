@@ -250,7 +250,7 @@ def run_sse2_32bit(p: Vec32Pack, n: int) -> int:
         vec_fn, stats = LoopVectorizerPass().vectorize_function(ssa_fn)
         self.assertEqual(stats["vectorized_stores"], 1)
 
-        art = X64CodeGenerator().compile_function(vec_fn)
+        art = X64CodeGenerator(enable_avx2=False).compile_function(vec_fn)
         mc = art.code_bytes
         self.assertIn(b"\xf3\x41\x0f\x6f\x03", mc, "Expected 128-bit movdqu xmm0, [r11]")
         self.assertIn(b"\xf3\x41\x0f\x6f\x0b", mc, "Expected 128-bit movdqu xmm1, [r11]")
