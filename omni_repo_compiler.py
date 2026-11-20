@@ -38,6 +38,8 @@ from validation.biabduction_verifier import BiAbductionVerifier
 from validation.backend_translation_validator import BackendTranslationValidator
 from slicer.inter_repo_slicer import InterRepoSlicer
 from compiler.llvm_backend import LLVMBackend
+from compiler.gcc_backend import GCCBackend
+from compiler.homeostasis_router import HomeostasisRouter
 from compiler.wasm_backend import WasmBackend
 from compiler.audit_ledger import create_compilation_audit_ledger, save_audit_ledger
 
@@ -179,7 +181,13 @@ class OmniRepoCompiler:
         self.asm_auditor = AssemblyInvariantAuditor()
         self.slicer = InterRepoSlicer()
         self.llvm = LLVMBackend(opt_level=3)
+        self.gcc = GCCBackend(opt_level=3)
         self.wasm = WasmBackend()
+        self.homeostasis = HomeostasisRouter(
+            llvm_backend=self.llvm,
+            gcc_backend=self.gcc,
+            wasm_backend=self.wasm,
+        )
         self.smt_verifier = SmtRefinementVerifier(bit_width=64)
         self.biabduction = BiAbductionVerifier()
         self.backend_validator = BackendTranslationValidator(
@@ -306,12 +314,22 @@ class OmniRepoCompiler:
         self.linker = NativeObjectLinker()
 
         resolved_backend = backend.lower().strip()
-        if resolved_backend not in ("native", "llvm", "wasm"):
-            raise ValueError(f"Unsupported compiler backend '{backend}'. Expected 'native', 'llvm', or 'wasm'.")
+        if resolved_backend not in ("native", "llvm", "wasm", "gcc", "homeostasis"):
+            raise ValueError(
+                f"Unsupported compiler backend '{backend}'. Expected 'native', 'llvm', 'gcc', 'wasm', or 'homeostasis'."
+            )
 
         results: Dict[str, Any] = {"stages": {}}
         effective_os = (target_os.lower() if target_os else ("windows" if sys.platform == "win32" else "linux"))
         effective_arch = (target_arch.lower() if target_arch else "x86_64")
+        if resolved_backend == "gcc":
+            if not self.gcc.is_available:
+                raise RuntimeError("GCC backend selected, but neither native gcc nor WSL gcc is available.")
+            if effective_os == "windows" and self.gcc.mode != "native_exe":
+                raise ValueError(
+                    "GCC ELF64 backend requires target_os='linux' on Windows without native MinGW; "
+                    "use target_os='linux' or backend='homeostasis'."
+                )
         results["target"] = {
             "os": effective_os,
             "arch": effective_arch,
@@ -1072,6 +1090,8 @@ class OmniRepoCompiler:
         # Native / LLVM O3 Codegen + Object Ingestion per Repository
         _timings_ms["stage5c_z3_bounds"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
         _t_stage = time.perf_counter()
+        llvm_compiled_functions = 0
+        gcc_compiled_functions = 0
         backend_proofs_proven = 0
         backend_refuted = 0
         backend_verdicts: Dict[str, str] = {}
@@ -1083,7 +1103,29 @@ class OmniRepoCompiler:
             ]
             llvm_handled: Set[str] = set()
 
-            if resolved_backend == "llvm" and repo_ssas:
+            if resolved_backend == "gcc" and repo_ssas:
+                gcc_eligible = [
+                    s for s in repo_ssas
+                    if not any(
+                        inst.opcode == "call" and inst.operands and str(inst.operands[0]).startswith("omni_")
+                        for blk in s.blocks for inst in blk.instructions
+                    )
+                ]
+                if gcc_eligible:
+                    gcc_obj_bytes = self.gcc.emit_object(gcc_eligible, module_name=f"omni_{m.repo_name}")
+                    gcc_obj_mod = load_elf_object(gcc_obj_bytes, repo_name=f"{m.repo_name}_gcc")
+                    for s in gcc_eligible:
+                        if s.name in gcc_obj_mod.symbols:
+                            gcc_obj_mod.symbols[s.name].is_exported = unit_export_flag.get(s.name, True)
+                            llvm_handled.add(s.name)
+                            defined_symbols_across_mods.add(s.name)
+                            real_ast_compiled_count += 1
+                            gcc_compiled_functions += 1
+                            backend_verdicts[s.name] = "GCC_O3_COMPILED"
+                    self.linker.add_module(gcc_obj_mod)
+
+            host_matches_target_os = (effective_os == ("windows" if sys.platform == "win32" else "linux"))
+            if (resolved_backend == "llvm" or (resolved_backend == "homeostasis" and self.llvm.is_available and host_matches_target_os)) and repo_ssas:
                 if not self.llvm.is_available:
                     raise RuntimeError("LLVM backend selected, but llvmlite/LLVM is unavailable.")
                 llvm_eligible = [
@@ -1196,6 +1238,15 @@ class OmniRepoCompiler:
             "refuted": backend_refuted,
             "verdicts": backend_verdicts,
         }
+        if resolved_backend == "homeostasis":
+            results["stages"]["homeostasis"] = {
+                "policy": "consensus",
+                "available_engines": self.homeostasis.available_engines(),
+                "llvm_available": self.llvm.is_available,
+                "gcc_available": self.gcc.is_available,
+                "native_available": True,
+                "binary_emitter_engine": "llvm" if llvm_compiled_functions > 0 else "native",
+            }
 
         vla_simd_metadata = None
         if vectorized_loops > 0:
@@ -1236,6 +1287,7 @@ class OmniRepoCompiler:
             "smt_pass_proofs": smt_pass_proofs,
             "smt_pass_rollbacks": smt_pass_rollbacks,
             "llvm_compiled_functions": llvm_compiled_functions,
+            "gcc_compiled_functions": gcc_compiled_functions,
             "effective_os": effective_os,
             "effective_arch": effective_arch,
         }
@@ -1263,7 +1315,7 @@ class OmniRepoCompiler:
                     next_off = sorted_syms[idx_s + 1].offset if idx_s + 1 < len(sorted_syms) else sym_def.offset + sym_def.size
                     end_off = min(sym_def.offset + sym_def.size, next_off)
                     fn_slice = bytes(mod.text_bytes[sym_def.offset:end_off])
-                    if resolved_backend == "llvm":
+                    if resolved_backend in ("llvm", "gcc", "homeostasis"):
                         changed = True
                         while changed and fn_slice:
                             changed = False
@@ -1477,7 +1529,7 @@ def main():
     parser.add_argument("--format", default="shared_lib", choices=["shared_lib", "executable"], help="Target format")
     parser.add_argument("--target-os", choices=["windows", "linux", "macos"], help="Target operating system")
     parser.add_argument("--arch", choices=["x86_64", "arm64"], default="x86_64", help="Target architecture")
-    parser.add_argument("--backend", choices=["native", "llvm", "wasm"], default="native", help="Codegen backend")
+    parser.add_argument("--backend", choices=["native", "llvm", "gcc", "wasm", "homeostasis"], default="native", help="Codegen backend")
     parser.add_argument("--entry", default="omni_main", help="Exported entrypoint name")
     parser.add_argument("--export-all", action="store_true", help="Retain and export all functions across repositories")
     parser.add_argument("--audit-nonce", default="NONCE-C5-20261023-OMNI01", help="Audit nonce for provenance ledger")

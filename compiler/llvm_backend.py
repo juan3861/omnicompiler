@@ -8,6 +8,7 @@ loop unrolling, GVN, instcombine), and compiles to MCJIT silicon or COFF/ELF obj
 
 from typing import Optional, List, Dict, Any, Union
 import ctypes
+import re
 import struct
 
 from compiler.ssa_ir import SSAVar, SSAFunction, TERMINATOR_OPCODES
@@ -48,19 +49,28 @@ class LLVMBackend:
     def _llvm_type(var_type: str) -> str:
         return "double" if var_type in ("f64", "f32", "float", "double") else "i64"
 
-    def __init__(self, opt_level: int = 3):
+    def __init__(self, opt_level: int = 3, target_triple: Optional[str] = None, cpu: str = ""):
         self.opt_level = opt_level
+        self._explicit_triple = target_triple
+        self._cpu = cpu
+        self._target = None
         self._target_machine = None
         self._obj_target_machine = None
         self._initialized = False
 
         if LLVM_AVAILABLE:
             try:
-                llvm.initialize_native_target()
-                llvm.initialize_native_asmprinter()
-                target = llvm.Target.from_default_triple()
-                self._target_machine = target.create_target_machine(opt=self.opt_level, reloc="pic")
-                self._obj_target_machine = target.create_target_machine(opt=self.opt_level, reloc="pic", codemodel="small")
+                if target_triple:
+                    llvm.initialize_all_targets()
+                    llvm.initialize_all_asmprinters()
+                    target = llvm.Target.from_triple(target_triple)
+                else:
+                    llvm.initialize_native_target()
+                    llvm.initialize_native_asmprinter()
+                    target = llvm.Target.from_default_triple()
+                self._target = target
+                self._target_machine = target.create_target_machine(cpu=cpu, opt=self.opt_level, reloc="pic")
+                self._obj_target_machine = target.create_target_machine(cpu=cpu, opt=self.opt_level, reloc="pic", codemodel="small")
                 self._initialized = True
             except Exception:
                 self._initialized = False
@@ -72,7 +82,7 @@ class LLVMBackend:
     @property
     def target_triple(self) -> str:
         if self._target_machine:
-            return self._target_machine.triple
+            return self._explicit_triple or self._target_machine.triple
         return "unknown"
 
     def compile_ir(self, llvm_ir_str: str, optimize: bool = True) -> Any:
@@ -114,6 +124,20 @@ class LLVMBackend:
             raise RuntimeError("LLVM backend is not available.")
         return self._target_machine.emit_assembly(mod)
 
+    def inspect_optimization_stats(self, mod: Any) -> Dict[str, Any]:
+        """Counts vectorized SIMD mnemonics and YMM/XMM/NEON vector register refs from LLVM O3 assembly."""
+        asm_text = self.emit_assembly(mod)
+        simd_hits = re.findall(r"\b(v?(?:padd|psub|pmull|addp|subp|mulp|movdqu|movdqa|fadd|fmul)[a-z0-9]*)\b", asm_text)
+        ymm_refs = re.findall(r"%?ymm\d+", asm_text)
+        neon_refs = re.findall(r"\bv\d+\.(?:2d|4s|16b|8h)\b", asm_text, flags=re.IGNORECASE)
+        return {
+            "target_triple": self.target_triple,
+            "simd_instruction_count": len(simd_hits),
+            "ymm_operand_refs": len(ymm_refs),
+            "neon_vector_refs": len(neon_refs),
+            "sample_simd_mnemonics": sorted(set(simd_hits))[:16],
+        }
+
     def create_jit_callable(self, mod: Any, func_name: str, restype=ctypes.c_int64, argtypes=None):
         """
         Compiles the LLVM module via MCJIT in host memory and returns a directly callable
@@ -123,7 +147,10 @@ class LLVMBackend:
             raise RuntimeError("LLVM backend is not available.")
 
         argtypes = argtypes or []
-        ee = llvm.create_mcjit_compiler(mod, self._target_machine)
+        # create_mcjit_compiler takes ownership of the TargetMachine in llvmlite;
+        # always allocate a fresh instance so self._target_machine stays reusable.
+        jit_tm = self._target.create_target_machine(cpu=self._cpu, opt=self.opt_level, reloc="pic")
+        ee = llvm.create_mcjit_compiler(mod, jit_tm)
         ee.finalize_object()
         func_ptr = ee.get_function_address(func_name)
         if func_ptr == 0:
