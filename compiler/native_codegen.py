@@ -1487,8 +1487,10 @@ class Arm64CodeGenerator:
             b_fixups.append((off, "CBNZ", lbl))
 
         mark(".L_func_entry")
-        # SUB SP, SP, #frame_size -> 0xD10003FF | (frame_size << 10)
-        code.extend(_a64_u32(0xD10003FF | ((frame_size & 0xFFF) << 10)))
+        if frame_size > 0xFFF:
+            code.extend(_a64_u32(0xD14003FF | (((frame_size >> 12) & 0xFFF) << 10)))
+        if (frame_size & 0xFFF) or frame_size <= 0xFFF:
+            code.extend(_a64_u32(0xD10003FF | ((frame_size & 0xFFF) << 10)))
         # STP X29, X30, [SP, #0] -> 0xA9007BFD
         code.extend(_a64_u32(0xA9007BFD))
         prologue_size = len(code)
@@ -1547,9 +1549,66 @@ class Arm64CodeGenerator:
                 return tl
             return f".L_bb_{succ_n}"
 
+        _NEON_64B_ALU_OPS: Dict[str, int] = {
+            "add": 0x4EE18400,   # ADD V0.2D, V0.2D, V1.2D
+            "sub": 0x6EE18400,   # SUB V0.2D, V0.2D, V1.2D
+            "and": 0x4E211C00,   # AND V0.16B, V0.16B, V1.16B
+            "or":  0x4EA11C00,   # ORR V0.16B, V0.16B, V1.16B
+            "xor": 0x6E211C00,   # EOR V0.16B, V0.16B, V1.16B
+            "fadd": 0x4E61D400,  # FADD V0.2D, V0.2D, V1.2D
+            "fsub": 0x4EE1D400,  # FSUB V0.2D, V0.2D, V1.2D
+            "fmul": 0x6E61DC00,  # FMUL V0.2D, V0.2D, V1.2D
+        }
+        _NEON_32B_ALU_OPS: Dict[str, int] = {
+            "add": 0x4EA18400,   # ADD V0.4S, V0.4S, V1.4S
+            "sub": 0x6EA18400,   # SUB V0.4S, V0.4S, V1.4S
+            "mul": 0x4EA19C00,   # MUL V0.4S, V0.4S, V1.4S
+            "imul": 0x4EA19C00,  # MUL V0.4S, V0.4S, V1.4S
+            "and": 0x4E211C00,   # AND V0.16B, V0.16B, V1.16B
+            "or":  0x4EA11C00,   # ORR V0.16B, V0.16B, V1.16B
+            "xor": 0x6E211C00,   # EOR V0.16B, V0.16B, V1.16B
+            "fadd": 0x4E21D400,  # FADD V0.4S, V0.4S, V1.4S
+            "fsub": 0x4EA1D400,  # FSUB V0.4S, V0.4S, V1.4S
+            "fmul": 0x6E21DC00,  # FMUL V0.4S, V0.4S, V1.4S
+        }
+
         for block in fn.blocks:
             mark(f".L_bb_{block.name}")
-            for inst in block.instructions:
+            blk_const_int: Dict[SSAVar, int] = {}
+            blk_add_const: Dict[Any, Tuple[Any, int]] = {}
+            blk_def_map: Dict[SSAVar, SSAInstruction] = {}
+            for b_ins in block.instructions:
+                if isinstance(b_ins.result, SSAVar):
+                    blk_def_map[b_ins.result] = b_ins
+                    if b_ins.opcode == "const" and b_ins.operands and isinstance(b_ins.operands[0], int) and not isinstance(b_ins.operands[0], bool):
+                        blk_const_int[b_ins.result] = int(b_ins.operands[0])
+                    elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
+                        op_a, op_b = b_ins.operands[0], b_ins.operands[1]
+                        ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else blk_const_int.get(op_a)
+                        cb = op_b if (isinstance(op_b, int) and not isinstance(op_b, bool)) else blk_const_int.get(op_b)
+                        if cb is not None:
+                            base_v, prev_off = blk_add_const.get(op_a, (op_a, 0))
+                            blk_add_const[b_ins.result] = (base_v, prev_off + int(cb))
+                        elif ca is not None:
+                            base_v, prev_off = blk_add_const.get(op_b, (op_b, 0))
+                            blk_add_const[b_ins.result] = (base_v, prev_off + int(ca))
+
+            def _are_contiguous_8b_offsets(off0: Any, off1: Any) -> bool:
+                b0, d0 = blk_add_const.get(off0, (off0, 0))
+                b1, d1 = blk_add_const.get(off1, (off1, 0))
+                return b0 == b1 and (d1 - d0) == 8
+
+            def _are_contiguous_4b_quad(off0: Any, off1: Any, off2: Any, off3: Any) -> bool:
+                b0, d0 = blk_add_const.get(off0, (off0, 0))
+                b1, d1 = blk_add_const.get(off1, (off1, 0))
+                b2, d2 = blk_add_const.get(off2, (off2, 0))
+                b3, d3 = blk_add_const.get(off3, (off3, 0))
+                return b0 == b1 == b2 == b3 and (d1 - d0) == 4 and (d2 - d0) == 8 and (d3 - d0) == 12
+
+            inst_idx = 0
+            while inst_idx < len(block.instructions):
+                inst = block.instructions[inst_idx]
+                inst_idx += 1
                 if inst.source_line > 0:
                     line_table.append((len(code), inst.source_line))
                 op = inst.opcode.lower()
@@ -1559,6 +1618,37 @@ class Arm64CodeGenerator:
                     load_op(inst.operands[0], 9)
                     store_res(inst.result, 9)
                 elif op == "add":
+                    if inst_idx + 1 < len(block.instructions):
+                        ins_hi = block.instructions[inst_idx]
+                        ins_top = block.instructions[inst_idx + 1]
+                        if (
+                            ins_hi.opcode.lower() == "add"
+                            and ins_top.opcode.lower() == "add"
+                            and isinstance(inst.result, SSAVar)
+                            and isinstance(ins_hi.result, SSAVar)
+                            and len(inst.operands) == 2
+                            and len(ins_hi.operands) == 2
+                            and len(ins_top.operands) == 2
+                            and set(ins_top.operands) == {inst.result, ins_hi.result}
+                        ):
+                            load_op(inst.operands[0], 11)
+                            code.extend(_a64_u32(0x9E670160))  # FMOV D0, X11
+                            load_op(ins_hi.operands[0], 11)
+                            code.extend(_a64_u32(0x4E181D60))  # INS V0.D[1], X11
+                            load_op(inst.operands[1], 11)
+                            code.extend(_a64_u32(0x9E670161))  # FMOV D1, X11
+                            load_op(ins_hi.operands[1], 11)
+                            code.extend(_a64_u32(0x4E181D61))  # INS V1.D[1], X11
+                            code.extend(_a64_u32(0x4EE18400))  # ADD V0.2D, V0.2D, V1.2D
+                            code.extend(_a64_u32(0x9E660009))  # FMOV X9, D0
+                            store_res(inst.result, 9)
+                            code.extend(_a64_u32(0x4E183C09))  # UMOV X9, V0.D[1]
+                            store_res(ins_hi.result, 9)
+                            code.extend(_a64_u32(0x5EF1B800))  # ADDP D0, V0.2D
+                            code.extend(_a64_u32(0x9E660009))  # FMOV X9, D0
+                            store_res(ins_top.result, 9)
+                            inst_idx += 2
+                            continue
                     load_op(inst.operands[0], 9)
                     load_op(inst.operands[1], 10)
                     code.extend(_a64_u32(0x8B0A0129))  # ADD X9, X9, X10
@@ -1628,6 +1718,37 @@ class Arm64CodeGenerator:
                     code.extend(_a64_u32(0x9A9F07E9 | (inv_c << 12)))
                     store_res(inst.result, 9)
                 elif op in ("fadd", "fsub", "fmul", "fdiv"):
+                    if op == "fadd" and inst_idx + 1 < len(block.instructions):
+                        ins_hi = block.instructions[inst_idx]
+                        ins_top = block.instructions[inst_idx + 1]
+                        if (
+                            ins_hi.opcode.lower() == "fadd"
+                            and ins_top.opcode.lower() == "fadd"
+                            and isinstance(inst.result, SSAVar)
+                            and isinstance(ins_hi.result, SSAVar)
+                            and len(inst.operands) == 2
+                            and len(ins_hi.operands) == 2
+                            and len(ins_top.operands) == 2
+                            and set(ins_top.operands) == {inst.result, ins_hi.result}
+                        ):
+                            load_op(inst.operands[0], 11)
+                            code.extend(_a64_u32(0x9E670160))  # FMOV D0, X11
+                            load_op(ins_hi.operands[0], 11)
+                            code.extend(_a64_u32(0x4E181D60))  # INS V0.D[1], X11
+                            load_op(inst.operands[1], 11)
+                            code.extend(_a64_u32(0x9E670161))  # FMOV D1, X11
+                            load_op(ins_hi.operands[1], 11)
+                            code.extend(_a64_u32(0x4E181D61))  # INS V1.D[1], X11
+                            code.extend(_a64_u32(0x4E61D400))  # FADD V0.2D, V0.2D, V1.2D
+                            code.extend(_a64_u32(0x9E660009))  # FMOV X9, D0
+                            store_res(inst.result, 9)
+                            code.extend(_a64_u32(0x4E183C09))  # UMOV X9, V0.D[1]
+                            store_res(ins_hi.result, 9)
+                            code.extend(_a64_u32(0x7E70D400))  # FADDP D0, V0.2D
+                            code.extend(_a64_u32(0x9E660009))  # FMOV X9, D0
+                            store_res(ins_top.result, 9)
+                            inst_idx += 2
+                            continue
                     load_op(inst.operands[0], 9)
                     load_op(inst.operands[1], 10)
                     code.extend(_a64_u32(0x9E670120))  # FMOV D0, X9
@@ -1744,10 +1865,135 @@ class Arm64CodeGenerator:
                     code.extend(_a64_u32(0x10000009))  # ADR X9, #0 (patched)
                     store_res(inst.result, 9)
                 elif op == "store_off":
+                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    if width in ("i64", "u64", "f64") and inst_idx < len(block.instructions):
+                        nxt_st = block.instructions[inst_idx]
+                        nxt_w = str(nxt_st.operands[3]) if (nxt_st.opcode.lower() == "store_off" and len(nxt_st.operands) >= 4) else ""
+                        if (
+                            nxt_st.opcode.lower() == "store_off"
+                            and nxt_w == width
+                            and nxt_st.operands[0] == inst.operands[0]
+                            and _are_contiguous_8b_offsets(inst.operands[1], nxt_st.operands[1])
+                        ):
+                            val0, val1 = inst.operands[2], nxt_st.operands[2]
+                            ins0 = blk_def_map.get(val0) if isinstance(val0, SSAVar) else None
+                            ins1 = blk_def_map.get(val1) if isinstance(val1, SSAVar) else None
+                            emitted_neon_2x = False
+                            if (
+                                ins0 is not None and ins1 is not None
+                                and ins0.opcode.lower() == ins1.opcode.lower()
+                                and ins0.opcode.lower() in _NEON_64B_ALU_OPS
+                                and len(ins0.operands) == 2 and len(ins1.operands) == 2
+                            ):
+                                op_2x = ins0.opcode.lower()
+                                is_f_op = op_2x.startswith("f")
+                                if (width == "f64" and is_f_op) or (width in ("i64", "u64") and not is_f_op):
+                                    ld_a0 = blk_def_map.get(ins0.operands[0]) if isinstance(ins0.operands[0], SSAVar) else None
+                                    ld_a1 = blk_def_map.get(ins1.operands[0]) if isinstance(ins1.operands[0], SSAVar) else None
+                                    ld_b0 = blk_def_map.get(ins0.operands[1]) if isinstance(ins0.operands[1], SSAVar) else None
+                                    ld_b1 = blk_def_map.get(ins1.operands[1]) if isinstance(ins1.operands[1], SSAVar) else None
+                                    if (
+                                        ld_a0 is not None and ld_a1 is not None and ld_b0 is not None and ld_b1 is not None
+                                        and ld_a0.opcode.lower() == "load_off" and ld_a1.opcode.lower() == "load_off"
+                                        and ld_b0.opcode.lower() == "load_off" and ld_b1.opcode.lower() == "load_off"
+                                        and str(ld_a0.operands[2]) == width == str(ld_a1.operands[2])
+                                        and str(ld_b0.operands[2]) == width == str(ld_b1.operands[2])
+                                        and ld_a0.operands[0] == ld_a1.operands[0]
+                                        and ld_b0.operands[0] == ld_b1.operands[0]
+                                        and _are_contiguous_8b_offsets(ld_a0.operands[1], ld_a1.operands[1])
+                                        and _are_contiguous_8b_offsets(ld_b0.operands[1], ld_b1.operands[1])
+                                    ):
+                                        load_op(ld_a0.operands[0], 9)
+                                        load_op(ld_a0.operands[1], 10)
+                                        code.extend(_a64_u32(0x8B0A0129))                # ADD X9, X9, X10
+                                        code.extend(_a64_u32(0x3DC00120))                # LDR Q0, [X9]
+                                        load_op(ld_b0.operands[0], 9)
+                                        load_op(ld_b0.operands[1], 10)
+                                        code.extend(_a64_u32(0x8B0A0129))                # ADD X9, X9, X10
+                                        code.extend(_a64_u32(0x3DC00121))                # LDR Q1, [X9]
+                                        code.extend(_a64_u32(_NEON_64B_ALU_OPS[op_2x]))  # V0.2D = V0.2D op V1.2D
+                                        load_op(inst.operands[0], 9)
+                                        load_op(inst.operands[1], 10)
+                                        code.extend(_a64_u32(0x8B0A0129))                # ADD X9, X9, X10
+                                        code.extend(_a64_u32(0x3D800120))                # STR Q0, [X9]
+                                        emitted_neon_2x = True
+                            if not emitted_neon_2x:
+                                load_op(val0, 11)
+                                code.extend(_a64_u32(0x9E670160))                        # FMOV D0, X11
+                                load_op(val1, 11)
+                                code.extend(_a64_u32(0x4E181D60))                        # INS V0.D[1], X11
+                                load_op(inst.operands[0], 9)
+                                load_op(inst.operands[1], 10)
+                                code.extend(_a64_u32(0x8B0A0129))                        # ADD X9, X9, X10
+                                code.extend(_a64_u32(0x3D800120))                        # STR Q0, [X9]
+                            inst_idx += 1
+                            continue
+
+                    if width in ("i32", "u32", "f32") and inst_idx + 2 < len(block.instructions):
+                        st1 = block.instructions[inst_idx]
+                        st2 = block.instructions[inst_idx + 1]
+                        st3 = block.instructions[inst_idx + 2]
+                        if (
+                            st1.opcode.lower() == "store_off" and len(st1.operands) >= 4 and str(st1.operands[3]) == width
+                            and st2.opcode.lower() == "store_off" and len(st2.operands) >= 4 and str(st2.operands[3]) == width
+                            and st3.opcode.lower() == "store_off" and len(st3.operands) >= 4 and str(st3.operands[3]) == width
+                            and st1.operands[0] == inst.operands[0] == st2.operands[0] == st3.operands[0]
+                            and _are_contiguous_4b_quad(inst.operands[1], st1.operands[1], st2.operands[1], st3.operands[1])
+                        ):
+                            vals_q = [inst.operands[2], st1.operands[2], st2.operands[2], st3.operands[2]]
+                            inss_q = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals_q]
+                            emitted_neon_4x = False
+                            if all(
+                                x is not None
+                                and x.opcode.lower() == inss_q[0].opcode.lower()
+                                and x.opcode.lower() in _NEON_32B_ALU_OPS
+                                and len(x.operands) == 2
+                                for x in inss_q
+                            ):
+                                op_4x = inss_q[0].opcode.lower()
+                                is_f32_op = op_4x.startswith("f")
+                                if (width == "f32" and is_f32_op) or (width in ("i32", "u32") and not is_f32_op):
+                                    lds_a = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss_q]
+                                    lds_b = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss_q]
+                                    if (
+                                        all(la is not None and la.opcode.lower() == "load_off" and str(la.operands[2]) == width and la.operands[0] == lds_a[0].operands[0] for la in lds_a)
+                                        and all(lb is not None and lb.opcode.lower() == "load_off" and str(lb.operands[2]) == width and lb.operands[0] == lds_b[0].operands[0] for lb in lds_b)
+                                        and _are_contiguous_4b_quad(lds_a[0].operands[1], lds_a[1].operands[1], lds_a[2].operands[1], lds_a[3].operands[1])
+                                        and _are_contiguous_4b_quad(lds_b[0].operands[1], lds_b[1].operands[1], lds_b[2].operands[1], lds_b[3].operands[1])
+                                    ):
+                                        load_op(lds_a[0].operands[0], 9)
+                                        load_op(lds_a[0].operands[1], 10)
+                                        code.extend(_a64_u32(0x8B0A0129))                # ADD X9, X9, X10
+                                        code.extend(_a64_u32(0x3DC00120))                # LDR Q0, [X9]
+                                        load_op(lds_b[0].operands[0], 9)
+                                        load_op(lds_b[0].operands[1], 10)
+                                        code.extend(_a64_u32(0x8B0A0129))                # ADD X9, X9, X10
+                                        code.extend(_a64_u32(0x3DC00121))                # LDR Q1, [X9]
+                                        code.extend(_a64_u32(_NEON_32B_ALU_OPS[op_4x]))  # V0.4S = V0.4S op V1.4S
+                                        load_op(inst.operands[0], 9)
+                                        load_op(inst.operands[1], 10)
+                                        code.extend(_a64_u32(0x8B0A0129))                # ADD X9, X9, X10
+                                        code.extend(_a64_u32(0x3D800120))                # STR Q0, [X9]
+                                        emitted_neon_4x = True
+                            if not emitted_neon_4x:
+                                for ln_k in range(4):
+                                    load_op(vals_q[ln_k], 11)
+                                    if width == "f32":
+                                        code.extend(_a64_u32(0x9E670161))                # FMOV D1, X11
+                                        code.extend(_a64_u32(0x1E624021))                # FCVT S1, D1
+                                        code.extend(_a64_u32(0x1E26002B))                # FMOV W11, S1
+                                    imm5_s = (ln_k << 3) | 0x4
+                                    code.extend(_a64_u32(0x4E001C00 | (imm5_s << 16) | (11 << 5) | 0))  # INS V0.S[ln_k], W11
+                                load_op(inst.operands[0], 9)
+                                load_op(inst.operands[1], 10)
+                                code.extend(_a64_u32(0x8B0A0129))                        # ADD X9, X9, X10
+                                code.extend(_a64_u32(0x3D800120))                        # STR Q0, [X9]
+                            inst_idx += 3
+                            continue
+
                     load_op(inst.operands[0], 9)   # base ptr in X9
                     load_op(inst.operands[1], 10)  # byte offset in X10
                     load_op(inst.operands[2], 11)  # value in X11
-                    width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
                     code.extend(_a64_u32(0x8B0A0129))  # ADD X9, X9, X10
                     if width in ("i8", "u8"):
                         code.extend(_a64_u32(0x3900012B))  # STRB W11, [X9]
@@ -1850,8 +2096,10 @@ class Arm64CodeGenerator:
         mark(".L_epilogue")
         # LDP X29, X30, [SP, #0] -> 0xA9407BFD
         code.extend(_a64_u32(0xA9407BFD))
-        # ADD SP, SP, #frame_size -> 0x910003FF | (frame_size << 10)
-        code.extend(_a64_u32(0x910003FF | ((frame_size & 0xFFF) << 10)))
+        if frame_size > 0xFFF:
+            code.extend(_a64_u32(0x914003FF | (((frame_size >> 12) & 0xFFF) << 10)))
+        if (frame_size & 0xFFF) or frame_size <= 0xFFF:
+            code.extend(_a64_u32(0x910003FF | ((frame_size & 0xFFF) << 10)))
         # RET -> 0xD65F03C0
         code.extend(_a64_u32(0xD65F03C0))
         a64_code_end = len(code)

@@ -214,24 +214,11 @@ def sum_le(buf: IntBuf, n: int) -> int:
             self.assertTrue(wasm_bytes.startswith(b"\x00asm\x01\x00\x00\x00"))
 
     def test_04_anti_misvectorization_nonzero_init_and_step2(self):
-        """Loops starting at i!=0, stepping by +2, or with loop-variant bounds must NOT vectorize."""
+        """Unsupported loops (non power-of-two stride, loop-variant bounds) must NOT vectorize.
+        (Non-zero start and stride 2 are legitimately vectorized since Alpha-C54.)"""
         cases = [
             (
-                "nonzero_init",
-                """
-class Buf:
-    arr: Array[i64, 64]
-def fn(b: Buf, n: int) -> int:
-    s = 0
-    i = 2
-    while i < n:
-        s += b.arr[i]
-        i += 1
-    return s
-""",
-            ),
-            (
-                "step_two",
+                "non_pow2_step",
                 """
 class Buf:
     arr: Array[i64, 64]
@@ -240,7 +227,7 @@ def fn(b: Buf, n: int) -> int:
     i = 0
     while i < n:
         s += b.arr[i]
-        i += 2
+        i += 3
     return s
 """,
             ),

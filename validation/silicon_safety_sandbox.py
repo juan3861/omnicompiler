@@ -68,6 +68,7 @@ class EmulationResult:
     registers: Dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
     is_safe_for_silicon: bool = False
+    memory_snapshots: Dict[int, bytes] = field(default_factory=dict)
 
 
 class SiliconSafetySandbox:
@@ -192,6 +193,7 @@ class SiliconSafetySandbox:
         args: Optional[List[int]] = None,
         max_steps: int = DEFAULT_TIMEOUT_STEPS,
         start_offset: int = 0,
+        memory_regions: Optional[Dict[int, bytes]] = None,
     ) -> EmulationResult:
         """
         Emulates 64-bit ARM64 / AArch64 (AAPCS64) machine code inside an isolated
@@ -216,6 +218,17 @@ class SiliconSafetySandbox:
             mu.mem_map(self.CODE_ADDR, code_map_sz)
             mu.mem_map(self.STACK_ADDR, self.MEMORY_SIZE)
             mu.mem_map(self.STOP_ADDR, self.MEMORY_SIZE)
+
+            mapped_pages: set = set()
+            if memory_regions:
+                for addr, raw_bytes in memory_regions.items():
+                    page_base = addr & ~0xFFF
+                    page_end = (addr + max(len(raw_bytes), 1) + 0xFFF) & ~0xFFF
+                    for pg in range(page_base, page_end, 0x1000):
+                        if pg not in mapped_pages:
+                            mu.mem_map(pg, 0x1000)
+                            mapped_pages.add(pg)
+                    mu.mem_write(addr, raw_bytes)
 
             mu.mem_write(self.CODE_ADDR, machine_code)
             # Write ARM64 NOP (0xD503201F) at STOP_ADDR sentinel
@@ -246,6 +259,11 @@ class SiliconSafetySandbox:
             if x0 >= (1 << 63):
                 x0 -= (1 << 64)
 
+            snapshots: Dict[int, bytes] = {}
+            if memory_regions:
+                for addr, raw_bytes in memory_regions.items():
+                    snapshots[addr] = bytes(mu.mem_read(addr, len(raw_bytes)))
+
             terminated_cleanly = (final_pc == self.STOP_ADDR)
             err = None if terminated_cleanly else f"ARM64 execution did not reach RET within {max_steps} steps (PC: {hex(final_pc)})"
 
@@ -257,6 +275,7 @@ class SiliconSafetySandbox:
                 registers={"X0": x0, "SP": mu.reg_read(UC_ARM64_REG_SP), "PC": final_pc},
                 error=err,
                 is_safe_for_silicon=terminated_cleanly,
+                memory_snapshots=snapshots,
             )
         except UcError as e:
             return EmulationResult(
