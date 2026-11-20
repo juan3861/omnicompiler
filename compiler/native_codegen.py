@@ -599,6 +599,8 @@ class X64CodeGenerator:
         _SSE2_PACKED_32B_ALU_OPS: Dict[str, bytes] = {
             "add": b"\x66\x0f\xfe\xc1",   # paddd xmm0, xmm1
             "sub": b"\x66\x0f\xfa\xc1",   # psubd xmm0, xmm1
+            "mul": b"\x66\x0f\x38\x40\xc1",   # pmulld xmm0, xmm1
+            "imul": b"\x66\x0f\x38\x40\xc1",  # pmulld xmm0, xmm1
             "and": b"\x66\x0f\xdb\xc1",   # pand xmm0, xmm1
             "or":  b"\x66\x0f\xeb\xc1",   # por xmm0, xmm1
             "xor": b"\x66\x0f\xef\xc1",   # pxor xmm0, xmm1
@@ -617,14 +619,16 @@ class X64CodeGenerator:
             "fmul": b"\xc5\xfd\x59\xc1",  # vmulpd ymm0, ymm0, ymm1
         }
         _AVX2_PACKED_32B_ALU_OPS: Dict[str, bytes] = {
-            "add":  b"\xc5\xfd\xfe\xc1",  # vpaddd ymm0, ymm0, ymm1
-            "sub":  b"\xc5\xfd\xfa\xc1",  # vpsubd ymm0, ymm0, ymm1
-            "and":  b"\xc5\xfd\xdb\xc1",  # vpand ymm0, ymm0, ymm1
-            "or":   b"\xc5\xfd\xeb\xc1",  # vpor ymm0, ymm0, ymm1
-            "xor":  b"\xc5\xfd\xef\xc1",  # vpxor ymm0, ymm0, ymm1
-            "fadd": b"\xc5\xfc\x58\xc1",  # vaddps ymm0, ymm0, ymm1
-            "fsub": b"\xc5\xfc\x5c\xc1",  # vsubps ymm0, ymm0, ymm1
-            "fmul": b"\xc5\xfc\x59\xc1",  # vmulps ymm0, ymm0, ymm1
+            "add":  b"\xc5\xfd\xfe\xc1",      # vpaddd ymm0, ymm0, ymm1
+            "sub":  b"\xc5\xfd\xfa\xc1",      # vpsubd ymm0, ymm0, ymm1
+            "mul":  b"\xc4\xe2\x7d\x40\xc1",  # vpmulld ymm0, ymm0, ymm1
+            "imul": b"\xc4\xe2\x7d\x40\xc1",  # vpmulld ymm0, ymm0, ymm1
+            "and":  b"\xc5\xfd\xdb\xc1",      # vpand ymm0, ymm0, ymm1
+            "or":   b"\xc5\xfd\xeb\xc1",      # vpor ymm0, ymm0, ymm1
+            "xor":  b"\xc5\xfd\xef\xc1",      # vpxor ymm0, ymm0, ymm1
+            "fadd": b"\xc5\xfc\x58\xc1",      # vaddps ymm0, ymm0, ymm1
+            "fsub": b"\xc5\xfc\x5c\xc1",      # vsubps ymm0, ymm0, ymm1
+            "fmul": b"\xc5\xfc\x59\xc1",      # vmulps ymm0, ymm0, ymm1
         }
         used_avx2_ymm = False
 
@@ -1127,6 +1131,36 @@ class X64CodeGenerator:
                                         buf.record_line(oct_sts[-1].source_line)
                                         inst_idx += 7
                                         continue
+
+                            # General 256-bit AVX2 pack-and-store for 8 contiguous 32-bit stores
+                            for half_idx, v_chunk in enumerate((vals_o[:4], vals_o[4:])):
+                                resolve_operand_to_reg(v_chunk[0], "rax")
+                                if width == "f32":
+                                    buf.emit(_x64_movq_xmm_r64(half_idx, "rax"))
+                                    buf.emit(b"\xf2\x0f\x5a\xc0" if half_idx == 0 else b"\xf2\x0f\x5a\xc9")
+                                else:
+                                    buf.emit(b"\xc5\xf9\x6e\xc0" if half_idx == 0 else b"\xc5\xf9\x6e\xc8")
+                                for sub_ln in range(1, 4):
+                                    resolve_operand_to_reg(v_chunk[sub_ln], "rax")
+                                    if width == "f32":
+                                        buf.emit(_x64_movq_xmm_r64(2, "rax"))
+                                        buf.emit(b"\xf2\x0f\x5a\xd2")        # cvtsd2ss xmm2, xmm2
+                                        buf.emit(b"\xc4\xc1\x79\x7e\xd3")    # vmovd r11d, xmm2
+                                    else:
+                                        buf.emit(b"\x49\x89\xc3")            # mov r11, rax
+                                    if half_idx == 0:
+                                        buf.emit(bytes([0xC4, 0xC3, 0x79, 0x22, 0xC3, sub_ln]))
+                                    else:
+                                        buf.emit(bytes([0xC4, 0xC3, 0x71, 0x22, 0xCB, sub_ln]))
+                            buf.emit(b"\xc4\xe3\x7d\x18\xc1\x01")            # vinserti128 ymm0, ymm0, xmm1, 1
+                            resolve_operand_to_reg(inst.operands[0], "r11")
+                            resolve_operand_to_reg(inst.operands[1], "rcx")
+                            buf.emit(b"\x49\x01\xcb")                        # add r11, rcx
+                            buf.emit(b"\xc4\xc1\x7e\x7f\x03")                # vmovdqu ymmword ptr [r11], ymm0
+                            used_avx2_ymm = True
+                            buf.record_line(oct_sts[-1].source_line)
+                            inst_idx += 7
+                            continue
 
                     if width in ("i32", "u32", "f32") and inst_idx + 2 < len(block.instructions):
                         st1 = block.instructions[inst_idx]
