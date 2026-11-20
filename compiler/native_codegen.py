@@ -616,6 +616,16 @@ class X64CodeGenerator:
             "fsub": b"\xc5\xfd\x5c\xc1",  # vsubpd ymm0, ymm0, ymm1
             "fmul": b"\xc5\xfd\x59\xc1",  # vmulpd ymm0, ymm0, ymm1
         }
+        _AVX2_PACKED_32B_ALU_OPS: Dict[str, bytes] = {
+            "add":  b"\xc5\xfd\xfe\xc1",  # vpaddd ymm0, ymm0, ymm1
+            "sub":  b"\xc5\xfd\xfa\xc1",  # vpsubd ymm0, ymm0, ymm1
+            "and":  b"\xc5\xfd\xdb\xc1",  # vpand ymm0, ymm0, ymm1
+            "or":   b"\xc5\xfd\xeb\xc1",  # vpor ymm0, ymm0, ymm1
+            "xor":  b"\xc5\xfd\xef\xc1",  # vpxor ymm0, ymm0, ymm1
+            "fadd": b"\xc5\xfc\x58\xc1",  # vaddps ymm0, ymm0, ymm1
+            "fsub": b"\xc5\xfc\x5c\xc1",  # vsubps ymm0, ymm0, ymm1
+            "fmul": b"\xc5\xfc\x59\xc1",  # vmulps ymm0, ymm0, ymm1
+        }
         used_avx2_ymm = False
 
         # --- Emit Basic Blocks ---
@@ -629,6 +639,7 @@ class X64CodeGenerator:
                     blk_def_map[b_ins.result] = b_ins
                     if b_ins.opcode == "const" and b_ins.operands and isinstance(b_ins.operands[0], int) and not isinstance(b_ins.operands[0], bool):
                         blk_const_int[b_ins.result] = int(b_ins.operands[0])
+                        blk_add_const[b_ins.result] = (None, int(b_ins.operands[0]))
                     elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
                         op_a, op_b = b_ins.operands[0], b_ins.operands[1]
                         ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else blk_const_int.get(op_a)
@@ -658,6 +669,14 @@ class X64CodeGenerator:
                 b2, d2 = blk_add_const.get(off2, (off2, 0))
                 b3, d3 = blk_add_const.get(off3, (off3, 0))
                 return b0 == b1 == b2 == b3 and (d1 - d0) == 4 and (d2 - d0) == 8 and (d3 - d0) == 12
+
+            def _are_contiguous_4b_oct(offs: List[Any]) -> bool:
+                b0, d0 = blk_add_const.get(offs[0], (offs[0], 0))
+                for k_o in range(1, 8):
+                    bk, dk = blk_add_const.get(offs[k_o], (offs[k_o], 0))
+                    if bk != b0 or (dk - d0) != 4 * k_o:
+                        return False
+                return True
 
             inst_idx = 0
             while inst_idx < len(block.instructions):
@@ -976,6 +995,25 @@ class X64CodeGenerator:
                                     inst_idx += 3
                                     continue
 
+                            # General 256-bit AVX2 pack-and-store for 4 contiguous 64-bit stores
+                            resolve_operand_to_reg(vals_q[0], "rax")
+                            buf.emit(b"\xc4\xe1\xf9\x6e\xc0")            # vmovq xmm0, rax
+                            resolve_operand_to_reg(vals_q[1], "r11")
+                            buf.emit(b"\xc4\xc3\xf9\x22\xc3\x01")        # vpinsrq xmm0, xmm0, r11, 1
+                            resolve_operand_to_reg(vals_q[2], "rax")
+                            buf.emit(b"\xc4\xe1\xf9\x6e\xc8")            # vmovq xmm1, rax
+                            resolve_operand_to_reg(vals_q[3], "r11")
+                            buf.emit(b"\xc4\xc3\xf1\x22\xcb\x01")        # vpinsrq xmm1, xmm1, r11, 1
+                            buf.emit(b"\xc4\xe3\x7d\x18\xc1\x01")        # vinserti128 ymm0, ymm0, xmm1, 1
+                            resolve_operand_to_reg(inst.operands[0], "r11")
+                            resolve_operand_to_reg(inst.operands[1], "rcx")
+                            buf.emit(b"\x49\x01\xcb")                    # add r11, rcx
+                            buf.emit(b"\xc4\xc1\x7e\x7f\x03")            # vmovdqu ymmword ptr [r11], ymm0
+                            used_avx2_ymm = True
+                            buf.record_line(st3.source_line)
+                            inst_idx += 3
+                            continue
+
                     if width in ("i64", "u64", "f64") and inst_idx < len(block.instructions):
                         nxt_st = block.instructions[inst_idx]
                         nxt_w = str(nxt_st.operands[3]) if (nxt_st.opcode.lower() == "store_off" and len(nxt_st.operands) >= 4) else ""
@@ -1045,6 +1083,50 @@ class X64CodeGenerator:
                             buf.record_line(nxt_st.source_line)
                             inst_idx += 1
                             continue
+
+                    if self.enable_avx2 and width in ("i32", "u32", "f32") and inst_idx + 6 < len(block.instructions):
+                        oct_sts = [inst] + [block.instructions[inst_idx + k_s] for k_s in range(7)]
+                        if (
+                            all(s.opcode.lower() == "store_off" and len(s.operands) >= 4 and str(s.operands[3]) == width and s.operands[0] == inst.operands[0] for s in oct_sts[1:])
+                            and _are_contiguous_4b_oct([s.operands[1] for s in oct_sts])
+                        ):
+                            vals_o = [s.operands[2] for s in oct_sts]
+                            inss_o = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals_o]
+                            if all(
+                                x is not None
+                                and x.opcode.lower() == inss_o[0].opcode.lower()
+                                and x.opcode.lower() in _AVX2_PACKED_32B_ALU_OPS
+                                and len(x.operands) == 2
+                                for x in inss_o
+                            ):
+                                op_8x = inss_o[0].opcode.lower()
+                                is_f32_op = op_8x.startswith("f")
+                                if (width == "f32" and is_f32_op) or (width in ("i32", "u32") and not is_f32_op):
+                                    lds_a = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss_o]
+                                    lds_b = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss_o]
+                                    if (
+                                        all(la is not None and la.opcode.lower() == "load_off" and str(la.operands[2]) == width and la.operands[0] == lds_a[0].operands[0] for la in lds_a)
+                                        and all(lb is not None and lb.opcode.lower() == "load_off" and str(lb.operands[2]) == width and lb.operands[0] == lds_b[0].operands[0] for lb in lds_b)
+                                        and _are_contiguous_4b_oct([la.operands[1] for la in lds_a])
+                                        and _are_contiguous_4b_oct([lb.operands[1] for lb in lds_b])
+                                    ):
+                                        resolve_operand_to_reg(lds_a[0].operands[0], "r11")
+                                        resolve_operand_to_reg(lds_a[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xc4\xc1\x7e\x6f\x03")    # vmovdqu ymm0, ymmword ptr [r11]
+                                        resolve_operand_to_reg(lds_b[0].operands[0], "r11")
+                                        resolve_operand_to_reg(lds_b[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xc4\xc1\x7e\x6f\x0b")    # vmovdqu ymm1, ymmword ptr [r11]
+                                        buf.emit(_AVX2_PACKED_32B_ALU_OPS[op_8x])
+                                        resolve_operand_to_reg(inst.operands[0], "r11")
+                                        resolve_operand_to_reg(inst.operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xc4\xc1\x7e\x7f\x03")    # vmovdqu ymmword ptr [r11], ymm0
+                                        used_avx2_ymm = True
+                                        buf.record_line(oct_sts[-1].source_line)
+                                        inst_idx += 7
+                                        continue
 
                     if width in ("i32", "u32", "f32") and inst_idx + 2 < len(block.instructions):
                         st1 = block.instructions[inst_idx]
@@ -1669,6 +1751,7 @@ class Arm64CodeGenerator:
                     blk_def_map[b_ins.result] = b_ins
                     if b_ins.opcode == "const" and b_ins.operands and isinstance(b_ins.operands[0], int) and not isinstance(b_ins.operands[0], bool):
                         blk_const_int[b_ins.result] = int(b_ins.operands[0])
+                        blk_add_const[b_ins.result] = (None, int(b_ins.operands[0]))
                     elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
                         op_a, op_b = b_ins.operands[0], b_ins.operands[1]
                         ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else blk_const_int.get(op_a)
@@ -1698,6 +1781,14 @@ class Arm64CodeGenerator:
                 b2, d2 = blk_add_const.get(off2, (off2, 0))
                 b3, d3 = blk_add_const.get(off3, (off3, 0))
                 return b0 == b1 == b2 == b3 and (d1 - d0) == 4 and (d2 - d0) == 8 and (d3 - d0) == 12
+
+            def _are_contiguous_4b_oct(offs: List[Any]) -> bool:
+                b0, d0 = blk_add_const.get(offs[0], (offs[0], 0))
+                for k_o in range(1, 8):
+                    bk, dk = blk_add_const.get(offs[k_o], (offs[k_o], 0))
+                    if bk != b0 or (dk - d0) != 4 * k_o:
+                        return False
+                return True
 
             inst_idx = 0
             while inst_idx < len(block.instructions):
