@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from compiler.ssa_ir import BasicBlock, SSAFunction, SSAInstruction, SSAVar, TERMINATOR_OPCODES
@@ -318,11 +319,12 @@ class GCCBackend:
 
                 elif op == "alloca":
                     sz = ops[0] if ops else "64"
-                    arr_n = next_aux("stk")
-                    lines.append(f"    uint8_t {arr_n}[(size_t)({sz})];")
+                    ptr_expr = f"(int64_t)(uintptr_t)__builtin_alloca((size_t)({sz}))"
                     if has_res:
-                        lines.append(f"    {lhs} = (int64_t)(uintptr_t){arr_n};")
+                        lines.append(f"    {lhs} = {ptr_expr};")
                         last_val = lhs
+                    else:
+                        lines.append(f"    (void){ptr_expr};")
 
                 elif op in ("add", "sub", "mul", "imul"):
                     c_op = {"add": "+", "sub": "-", "mul": "*", "imul": "*"}[op]
@@ -617,7 +619,7 @@ class GCCBackend:
             else:
                 cmd = [self._gcc_bin] + flags + [c_file, "-o", out_file]
 
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
             if r.returncode != 0:
                 raise RuntimeError(f"GCC compilation failed (rc={r.returncode}):\n{r.stderr}\n--- C Source ---\n{src_c}")
 
@@ -744,22 +746,25 @@ class GCCBackend:
             flags = self._gcc_flags()
             if self._mode == "wsl":
                 w_c = _to_wsl_path(c_path)
-                w_e = "/tmp/omni_gcc_harness"
+                w_e = f"/tmp/omni_gcc_{os.getpid()}_{uuid.uuid4().hex[:10]}"
                 w_in = _to_wsl_path(in_path)
                 w_out = _to_wsl_path(out_path)
                 comp_cmd = ["wsl", "/usr/bin/gcc"] + flags + [w_c, "-o", w_e, "-lm"]
-                rc = subprocess.run(comp_cmd, capture_output=True, text=True, timeout=60)
+                rc = subprocess.run(comp_cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
                 if rc.returncode != 0:
                     raise RuntimeError(f"GCC harness compilation failed:\n{rc.stderr}")
-                rr = subprocess.run(["wsl", w_e, w_in, w_out], capture_output=True, text=True, timeout=30)
-                if rr.returncode != 0:
-                    raise RuntimeError(f"GCC harness execution failed (rc={rr.returncode}): {rr.stderr}")
+                try:
+                    rr = subprocess.run(["wsl", w_e, w_in, w_out], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+                    if rr.returncode != 0:
+                        raise RuntimeError(f"GCC harness execution failed (rc={rr.returncode}): {rr.stderr}")
+                finally:
+                    subprocess.run(["wsl", "rm", "-f", w_e], capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
             else:
                 comp_cmd = [self._gcc_bin] + flags + [c_path, "-o", exe_path, "-lm"]
-                rc = subprocess.run(comp_cmd, capture_output=True, text=True, timeout=60)
+                rc = subprocess.run(comp_cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
                 if rc.returncode != 0:
                     raise RuntimeError(f"GCC harness compilation failed:\n{rc.stderr}")
-                rr = subprocess.run([exe_path, in_path, out_path], capture_output=True, text=True, timeout=30)
+                rr = subprocess.run([exe_path, in_path, out_path], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
                 if rr.returncode != 0:
                     raise RuntimeError(f"GCC harness execution failed (rc={rr.returncode}): {rr.stderr}")
 

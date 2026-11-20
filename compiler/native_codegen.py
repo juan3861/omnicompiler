@@ -16,7 +16,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Set
 
-from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar
+from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar, analyze_ssa_constant_offsets, is_contiguous_stride
 from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator, IteratedRegisterCoalescingAllocator
 
 
@@ -631,56 +631,28 @@ class X64CodeGenerator:
             "fmul": b"\xc5\xfc\x59\xc1",      # vmulps ymm0, ymm0, ymm1
         }
         used_avx2_ymm = False
+        fn_add_const = analyze_ssa_constant_offsets(fn)
 
         # --- Emit Basic Blocks ---
         for idx_b, block in enumerate(fn.blocks):
             buf.mark(f".L_bb_{block.name}")
-            blk_const_int: Dict[SSAVar, int] = {}
-            blk_add_const: Dict[Any, Tuple[Any, int]] = {}
-            blk_def_map: Dict[SSAVar, SSAInstruction] = {}
-            for b_ins in block.instructions:
-                if isinstance(b_ins.result, SSAVar):
-                    blk_def_map[b_ins.result] = b_ins
-                    if b_ins.opcode == "const" and b_ins.operands and isinstance(b_ins.operands[0], int) and not isinstance(b_ins.operands[0], bool):
-                        blk_const_int[b_ins.result] = int(b_ins.operands[0])
-                        blk_add_const[b_ins.result] = (None, int(b_ins.operands[0]))
-                    elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
-                        op_a, op_b = b_ins.operands[0], b_ins.operands[1]
-                        ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else blk_const_int.get(op_a)
-                        cb = op_b if (isinstance(op_b, int) and not isinstance(op_b, bool)) else blk_const_int.get(op_b)
-                        if cb is not None:
-                            base_v, prev_off = blk_add_const.get(op_a, (op_a, 0))
-                            blk_add_const[b_ins.result] = (base_v, prev_off + int(cb))
-                        elif ca is not None:
-                            base_v, prev_off = blk_add_const.get(op_b, (op_b, 0))
-                            blk_add_const[b_ins.result] = (base_v, prev_off + int(ca))
+            blk_def_map: Dict[SSAVar, SSAInstruction] = {
+                b_ins.result: b_ins
+                for b_ins in block.instructions
+                if isinstance(b_ins.result, SSAVar)
+            }
 
             def _are_contiguous_8b_offsets(off0: Any, off1: Any) -> bool:
-                b0, d0 = blk_add_const.get(off0, (off0, 0))
-                b1, d1 = blk_add_const.get(off1, (off1, 0))
-                return b0 == b1 and (d1 - d0) == 8
+                return is_contiguous_stride(fn_add_const, [off0, off1], 8)
 
             def _are_contiguous_8b_quad(off0: Any, off1: Any, off2: Any, off3: Any) -> bool:
-                b0, d0 = blk_add_const.get(off0, (off0, 0))
-                b1, d1 = blk_add_const.get(off1, (off1, 0))
-                b2, d2 = blk_add_const.get(off2, (off2, 0))
-                b3, d3 = blk_add_const.get(off3, (off3, 0))
-                return b0 == b1 == b2 == b3 and (d1 - d0) == 8 and (d2 - d0) == 16 and (d3 - d0) == 24
+                return is_contiguous_stride(fn_add_const, [off0, off1, off2, off3], 8)
 
             def _are_contiguous_4b_quad(off0: Any, off1: Any, off2: Any, off3: Any) -> bool:
-                b0, d0 = blk_add_const.get(off0, (off0, 0))
-                b1, d1 = blk_add_const.get(off1, (off1, 0))
-                b2, d2 = blk_add_const.get(off2, (off2, 0))
-                b3, d3 = blk_add_const.get(off3, (off3, 0))
-                return b0 == b1 == b2 == b3 and (d1 - d0) == 4 and (d2 - d0) == 8 and (d3 - d0) == 12
+                return is_contiguous_stride(fn_add_const, [off0, off1, off2, off3], 4)
 
             def _are_contiguous_4b_oct(offs: List[Any]) -> bool:
-                b0, d0 = blk_add_const.get(offs[0], (offs[0], 0))
-                for k_o in range(1, 8):
-                    bk, dk = blk_add_const.get(offs[k_o], (offs[k_o], 0))
-                    if bk != b0 or (dk - d0) != 4 * k_o:
-                        return False
-                return True
+                return is_contiguous_stride(fn_add_const, offs, 4)
 
             inst_idx = 0
             while inst_idx < len(block.instructions):
@@ -1775,54 +1747,27 @@ class Arm64CodeGenerator:
             "fmul": 0x6E21DC00,  # FMUL V0.4S, V0.4S, V1.4S
         }
 
+        fn_add_const_arm = analyze_ssa_constant_offsets(fn)
+
         for block in fn.blocks:
             mark(f".L_bb_{block.name}")
-            blk_const_int: Dict[SSAVar, int] = {}
-            blk_add_const: Dict[Any, Tuple[Any, int]] = {}
-            blk_def_map: Dict[SSAVar, SSAInstruction] = {}
-            for b_ins in block.instructions:
-                if isinstance(b_ins.result, SSAVar):
-                    blk_def_map[b_ins.result] = b_ins
-                    if b_ins.opcode == "const" and b_ins.operands and isinstance(b_ins.operands[0], int) and not isinstance(b_ins.operands[0], bool):
-                        blk_const_int[b_ins.result] = int(b_ins.operands[0])
-                        blk_add_const[b_ins.result] = (None, int(b_ins.operands[0]))
-                    elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
-                        op_a, op_b = b_ins.operands[0], b_ins.operands[1]
-                        ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else blk_const_int.get(op_a)
-                        cb = op_b if (isinstance(op_b, int) and not isinstance(op_b, bool)) else blk_const_int.get(op_b)
-                        if cb is not None:
-                            base_v, prev_off = blk_add_const.get(op_a, (op_a, 0))
-                            blk_add_const[b_ins.result] = (base_v, prev_off + int(cb))
-                        elif ca is not None:
-                            base_v, prev_off = blk_add_const.get(op_b, (op_b, 0))
-                            blk_add_const[b_ins.result] = (base_v, prev_off + int(ca))
+            blk_def_map: Dict[SSAVar, SSAInstruction] = {
+                b_ins.result: b_ins
+                for b_ins in block.instructions
+                if isinstance(b_ins.result, SSAVar)
+            }
 
             def _are_contiguous_8b_offsets(off0: Any, off1: Any) -> bool:
-                b0, d0 = blk_add_const.get(off0, (off0, 0))
-                b1, d1 = blk_add_const.get(off1, (off1, 0))
-                return b0 == b1 and (d1 - d0) == 8
+                return is_contiguous_stride(fn_add_const_arm, [off0, off1], 8)
 
             def _are_contiguous_8b_quad(off0: Any, off1: Any, off2: Any, off3: Any) -> bool:
-                b0, d0 = blk_add_const.get(off0, (off0, 0))
-                b1, d1 = blk_add_const.get(off1, (off1, 0))
-                b2, d2 = blk_add_const.get(off2, (off2, 0))
-                b3, d3 = blk_add_const.get(off3, (off3, 0))
-                return b0 == b1 == b2 == b3 and (d1 - d0) == 8 and (d2 - d0) == 16 and (d3 - d0) == 24
+                return is_contiguous_stride(fn_add_const_arm, [off0, off1, off2, off3], 8)
 
             def _are_contiguous_4b_quad(off0: Any, off1: Any, off2: Any, off3: Any) -> bool:
-                b0, d0 = blk_add_const.get(off0, (off0, 0))
-                b1, d1 = blk_add_const.get(off1, (off1, 0))
-                b2, d2 = blk_add_const.get(off2, (off2, 0))
-                b3, d3 = blk_add_const.get(off3, (off3, 0))
-                return b0 == b1 == b2 == b3 and (d1 - d0) == 4 and (d2 - d0) == 8 and (d3 - d0) == 12
+                return is_contiguous_stride(fn_add_const_arm, [off0, off1, off2, off3], 4)
 
             def _are_contiguous_4b_oct(offs: List[Any]) -> bool:
-                b0, d0 = blk_add_const.get(offs[0], (offs[0], 0))
-                for k_o in range(1, 8):
-                    bk, dk = blk_add_const.get(offs[k_o], (offs[k_o], 0))
-                    if bk != b0 or (dk - d0) != 4 * k_o:
-                        return False
-                return True
+                return is_contiguous_stride(fn_add_const_arm, offs, 4)
 
             inst_idx = 0
             while inst_idx < len(block.instructions):

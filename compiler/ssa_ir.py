@@ -212,6 +212,79 @@ class SSAFunction:
         return "\n".join(lines)
 
 
+def analyze_ssa_constant_offsets(fn: "SSAFunction") -> Dict[Any, Tuple[Any, int]]:
+    """
+    Computes function-wide affine `(base_var_or_None, const_offset)` pairs across all SSA
+    blocks so LICM-hoisted preheader constants and GVN shares preserve SIMD stride fusion.
+    """
+    const_int: Dict[Any, int] = {}
+    add_const: Dict[Any, Tuple[Any, int]] = {}
+    for _pass in range(2):
+        for blk in fn.blocks:
+            for b_ins in blk.instructions:
+                if not isinstance(b_ins.result, SSAVar):
+                    continue
+                if (
+                    b_ins.opcode == "const"
+                    and b_ins.operands
+                    and isinstance(b_ins.operands[0], int)
+                    and not isinstance(b_ins.operands[0], bool)
+                ):
+                    cval = int(b_ins.operands[0])
+                    const_int[b_ins.result] = cval
+                    add_const[b_ins.result] = (None, cval)
+                elif b_ins.opcode == "mov" and b_ins.operands:
+                    src_op = b_ins.operands[0]
+                    if isinstance(src_op, int) and not isinstance(src_op, bool):
+                        cval = int(src_op)
+                        const_int[b_ins.result] = cval
+                        add_const[b_ins.result] = (None, cval)
+                    elif src_op in const_int:
+                        const_int[b_ins.result] = const_int[src_op]
+                        add_const[b_ins.result] = (None, const_int[src_op])
+                    elif src_op in add_const:
+                        add_const[b_ins.result] = add_const[src_op]
+                elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
+                    op_a, op_b = b_ins.operands[0], b_ins.operands[1]
+                    ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else const_int.get(op_a)
+                    cb = op_b if (isinstance(op_b, int) and not isinstance(op_b, bool)) else const_int.get(op_b)
+                    if cb is not None:
+                        base_v, prev_off = add_const.get(op_a, (op_a, 0))
+                        if base_v is None:
+                            cval = prev_off + int(cb)
+                            const_int[b_ins.result] = cval
+                            add_const[b_ins.result] = (None, cval)
+                        else:
+                            add_const[b_ins.result] = (base_v, prev_off + int(cb))
+                    elif ca is not None:
+                        base_v, prev_off = add_const.get(op_b, (op_b, 0))
+                        if base_v is None:
+                            cval = prev_off + int(ca)
+                            const_int[b_ins.result] = cval
+                            add_const[b_ins.result] = (None, cval)
+                        else:
+                            add_const[b_ins.result] = (base_v, prev_off + int(ca))
+    return add_const
+
+
+def is_contiguous_stride(add_const: Dict[Any, Tuple[Any, int]], offsets: List[Any], elem_bytes: int) -> bool:
+    """Returns True when `offsets` form `base + d0, base + d0 + elem_bytes, ...`."""
+    if not offsets:
+        return False
+
+    def _resolve(off: Any) -> Tuple[Any, int]:
+        if isinstance(off, int) and not isinstance(off, bool):
+            return (None, int(off))
+        return add_const.get(off, (off, 0))
+
+    b0, d0 = _resolve(offsets[0])
+    for idx_o in range(1, len(offsets)):
+        bk, dk = _resolve(offsets[idx_o])
+        if bk != b0 or (dk - d0) != elem_bytes * idx_o:
+            return False
+    return True
+
+
 class AstToSsaLowering:
     """
     Lowers Python AST expressions and multi-block functions into Omni-SSA IR

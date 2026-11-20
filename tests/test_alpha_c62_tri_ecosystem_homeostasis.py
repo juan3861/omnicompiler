@@ -205,10 +205,12 @@ def homeo_kernel(t: HomeoState, n: int) -> int:
             expected_engines.add("llvm")
         if router.gcc_backend.is_available:
             expected_engines.add("gcc")
+        if router.wasm_backend.is_available:
+            expected_engines.add("wasm")
         self.assertIn("native", engines)
         self.assertEqual(set(engines), expected_engines)
         if sys.platform.startswith("linux"):
-            self.assertEqual(expected_engines, {"native", "llvm", "gcc"})
+            self.assertEqual(expected_engines, {"native", "llvm", "gcc", "wasm"})
 
         arena = bytearray(64 * 8 * 3)
         for k in range(23):

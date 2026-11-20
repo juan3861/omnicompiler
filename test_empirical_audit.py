@@ -129,7 +129,8 @@ def main():
     packager = PackagerEngine()
     release_dir = res["release"]["package_dir"]
     main_py = os.path.join(release_dir, "app", "main.py")
-    orig_content = open(main_py, "r", encoding="utf-8").read()
+    with open(main_py, "r", encoding="utf-8") as _mf:
+        orig_content = _mf.read()
     
     # Simulate tampering
     try:
@@ -253,7 +254,8 @@ def main():
             print("FAILED: Unreferenced toxic file legacy_bomb.py was not pruned:", repo_slice)
             sys.exit(10)
 
-        sliced_helper = open(os.path.join(comp_dir, "helper_mod.py"), "r", encoding="utf-8").read()
+        with open(os.path.join(comp_dir, "helper_mod.py"), "r", encoding="utf-8") as _hf:
+            sliced_helper = _hf.read()
         if "nonexistent_cuda_kernel_99" in sliced_helper or "unused_helper_bomb" in sliced_helper:
             print("FAILED: Cross-file slicer did not slice helper_mod.py:", sliced_helper)
             sys.exit(10)

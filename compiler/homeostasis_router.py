@@ -1,10 +1,10 @@
 """
-OmniCompiler Adaptive Homeostasis Router & Tri-Ecosystem Differential Oracle (`homeostasis_router.py`).
-Connects all three compiler ecosystems under canonical `Omni-SSA` + Z3 verification:
+OmniCompiler Adaptive Homeostasis Router & Quad-Ecosystem Differential Oracle (`homeostasis_router.py`).
+Connects all four compiler/runtime ecosystems under canonical `Omni-SSA` + Z3 verification:
 1. OmniCompiler Native (`X64CodeGenerator` / `NativeJitCompiler`, AVX2/SSE4.1/SSE2/ARM64 NEON)
 2. LLVM 20.1.8 O3 (`LLVMBackend` via `llvmlite` PassBuilder)
 3. GNU GCC O3 (`GCCBackend` via `/usr/bin/gcc -O3` GIMPLE/RTL pipeline)
-(plus optional WebAssembly `v128` via Wasmtime)
+4. WebAssembly `v128` SIMD (`WasmBackend` via Bytecode Alliance Wasmtime + linear-memory isolation)
 
 Enforces bit-exact differential consensus and automatically isolates any diverging engine.
 """
@@ -68,7 +68,29 @@ class HomeostasisRouter:
             engines.append("llvm")
         if self.gcc_backend.is_available:
             engines.append("gcc")
+        if self.wasm_backend.is_available:
+            engines.append("wasm")
         return engines
+
+    @staticmethod
+    def self_contained_wasm_subset(ssa_funcs: List[SSAFunction]) -> List[SSAFunction]:
+        """Fixed-point closure of functions having zero unresolved external `call`s (safe for WASM)."""
+        wasm_set = {f.name for f in ssa_funcs}
+        changed = True
+        while changed:
+            changed = False
+            for f in ssa_funcs:
+                if f.name not in wasm_set:
+                    continue
+                for b in f.blocks:
+                    if any(
+                        ins.opcode.lower() == "call" and ins.operands and str(ins.operands[0]) not in wasm_set
+                        for ins in b.instructions
+                    ):
+                        wasm_set.remove(f.name)
+                        changed = True
+                        break
+        return [f for f in ssa_funcs if f.name in wasm_set]
 
     @staticmethod
     def _values_equal(a: Any, b: Any, is_fp: bool, tol: float = 1e-6) -> bool:
@@ -218,6 +240,77 @@ class HomeostasisRouter:
                 elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
             )
 
+    def _run_wasm(
+        self,
+        ssa_funcs: List[SSAFunction],
+        entry_fn: SSAFunction,
+        args: List[Any],
+        memory_regions: Dict[int, bytes],
+    ) -> EngineExecutionResult:
+        t0 = time.perf_counter()
+        if not self.wasm_backend.is_available:
+            return EngineExecutionResult(engine="wasm", success=False, error="Wasmtime unavailable")
+        wasm_subset = self.self_contained_wasm_subset(ssa_funcs)
+        if not any(f.name == entry_fn.name for f in wasm_subset):
+            return EngineExecutionResult(engine="wasm", success=False, error="Entry depends on external host call")
+        try:
+            ret_val, snaps, simd_stats = self.wasm_backend.run_ssa_with_memory(
+                wasm_subset, entry_fn.name, args=args, memory_regions=memory_regions, fuel_budget=50_000_000
+            )
+            return EngineExecutionResult(
+                engine="wasm",
+                success=True,
+                return_value=ret_val,
+                memory_snapshots=snaps,
+                elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+                simd_stats=simd_stats,
+            )
+        except Exception as e:
+            return EngineExecutionResult(
+                engine="wasm",
+                success=False,
+                error=str(e),
+                elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 3),
+            )
+
+    def inspect_ecosystem_telemetry(self, ssa_funcs: List[SSAFunction]) -> Dict[str, Any]:
+        """Collects optimization & SIMD instruction telemetry across active LLVM, GCC, and WASM backends."""
+        telemetry: Dict[str, Any] = {}
+        if not ssa_funcs:
+            return telemetry
+
+        if self.llvm_backend.is_available:
+            try:
+                ir_str = (
+                    self.llvm_backend.ssa_module_to_llvm_ir(ssa_funcs)
+                    if len(ssa_funcs) > 1
+                    else self.llvm_backend.ssa_to_llvm_ir(ssa_funcs[0])
+                )
+                mod = self.llvm_backend.compile_ir(ir_str, optimize=True)
+                telemetry["llvm"] = self.llvm_backend.inspect_optimization_stats(mod)
+            except Exception as exc:
+                telemetry["llvm"] = {"error": str(exc)}
+
+        if self.gcc_backend.is_available:
+            try:
+                asm_txt = self.gcc_backend.emit_assembly(ssa_funcs)
+                telemetry["gcc"] = self.gcc_backend.inspect_optimization_stats(asm_txt)
+            except Exception as exc:
+                telemetry["gcc"] = {"error": str(exc)}
+
+        wasm_subset = self.self_contained_wasm_subset(ssa_funcs)
+        if self.wasm_backend.is_available and wasm_subset:
+            try:
+                wat_txt = self.wasm_backend.ssa_module_to_wat(wasm_subset)
+                wasm_bin = self.wasm_backend.wat_to_wasm(wat_txt)
+                stats = self.wasm_backend.inspect_optimization_stats(wat_txt)
+                stats["wasm_binary_bytes"] = len(wasm_bin)
+                telemetry["wasm"] = stats
+            except Exception as exc:
+                telemetry["wasm"] = {"error": str(exc)}
+
+        return telemetry
+
     def execute_differential(
         self,
         ssa_funcs: List[SSAFunction],
@@ -254,11 +347,18 @@ class HomeostasisRouter:
                     results_by_engine={"native": nat_res},
                 )
 
-        target_engines = list(engines) if engines is not None else self.available_engines()
+        if engines is not None:
+            target_engines = list(engines)
+        else:
+            target_engines = self.available_engines()
+            wasm_subset = self.self_contained_wasm_subset(ssa_funcs)
+            if not any(f.name == entry_name for f in wasm_subset):
+                target_engines = [e for e in target_engines if e != "wasm"]
         executors: Dict[str, Callable[..., EngineExecutionResult]] = {
             "native": self._run_native,
             "llvm": self._run_llvm,
             "gcc": self._run_gcc,
+            "wasm": self._run_wasm,
         }
         if custom_executors:
             for k, fn_exec in custom_executors.items():

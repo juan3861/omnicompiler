@@ -15,7 +15,7 @@ import re
 import struct
 from typing import List, Dict, Any, Optional, Tuple, Union
 
-from compiler.ssa_ir import SSAVar, SSAFunction
+from compiler.ssa_ir import SSAVar, SSAFunction, analyze_ssa_constant_offsets, is_contiguous_stride
 
 try:
     import wasmtime
@@ -272,10 +272,20 @@ class WasmBackend:
                     local_types[v_n] = _wty(inst.result.var_type)
 
         is_multiblock = len(ssa_func.blocks) > 1
+        has_alloca = any(
+            ins.opcode.lower() == "alloca"
+            for b in ssa_func.blocks
+            for ins in b.instructions
+        )
         if is_multiblock:
             wat_lines.append("    (local $__bb i32)")
+        if has_alloca:
+            wat_lines.append("    (local $__sp_save i32)")
         for l_name in sorted(var_locals | phi_tmps):
             wat_lines.append(f"    (local ${l_name} {local_types.get(l_name, 'i64')})")
+        if has_alloca:
+            wat_lines.append("    global.get $__omni_sp")
+            wat_lines.append("    local.set $__sp_save")
 
         def emit_operand(op: Any) -> str:
             if isinstance(op, SSAVar):
@@ -359,37 +369,20 @@ class WasmBackend:
             "fdiv": "f32x4.div",
         }
 
+        fn_add_const = analyze_ssa_constant_offsets(ssa_func)
+
         def emit_inst_sequence(block, indent: str):
-            blk_const_int: Dict[SSAVar, int] = {}
-            blk_add_const: Dict[Any, Tuple[Any, int]] = {}
-            blk_def_map: Dict[SSAVar, Any] = {}
-            for b_ins in block.instructions:
-                if isinstance(b_ins.result, SSAVar):
-                    blk_def_map[b_ins.result] = b_ins
-                    if b_ins.opcode == "const" and b_ins.operands and isinstance(b_ins.operands[0], int) and not isinstance(b_ins.operands[0], bool):
-                        blk_const_int[b_ins.result] = int(b_ins.operands[0])
-                    elif b_ins.opcode == "add" and len(b_ins.operands) == 2:
-                        op_a, op_b = b_ins.operands[0], b_ins.operands[1]
-                        ca = op_a if (isinstance(op_a, int) and not isinstance(op_a, bool)) else blk_const_int.get(op_a)
-                        cb = op_b if (isinstance(op_b, int) and not isinstance(op_b, bool)) else blk_const_int.get(op_b)
-                        if cb is not None:
-                            base_v, prev_off = blk_add_const.get(op_a, (op_a, 0))
-                            blk_add_const[b_ins.result] = (base_v, prev_off + int(cb))
-                        elif ca is not None:
-                            base_v, prev_off = blk_add_const.get(op_b, (op_b, 0))
-                            blk_add_const[b_ins.result] = (base_v, prev_off + int(ca))
+            blk_def_map: Dict[SSAVar, Any] = {
+                b_ins.result: b_ins
+                for b_ins in block.instructions
+                if isinstance(b_ins.result, SSAVar)
+            }
 
             def _are_contiguous_8b_offsets(off0: Any, off1: Any) -> bool:
-                b0, d0 = blk_add_const.get(off0, (off0, 0))
-                b1, d1 = blk_add_const.get(off1, (off1, 0))
-                return b0 == b1 and (d1 - d0) == 8
+                return is_contiguous_stride(fn_add_const, [off0, off1], 8)
 
             def _are_contiguous_4b_quad(off0: Any, off1: Any, off2: Any, off3: Any) -> bool:
-                b0, d0 = blk_add_const.get(off0, (off0, 0))
-                b1, d1 = blk_add_const.get(off1, (off1, 0))
-                b2, d2 = blk_add_const.get(off2, (off2, 0))
-                b3, d3 = blk_add_const.get(off3, (off3, 0))
-                return b0 == b1 == b2 == b3 and (d1 - d0) == 4 and (d2 - d0) == 8 and (d3 - d0) == 12
+                return is_contiguous_stride(fn_add_const, [off0, off1, off2, off3], 4)
 
             inst_idx = 0
             while inst_idx < len(block.instructions):
@@ -425,6 +418,20 @@ class WasmBackend:
                     wat_lines.append(f"{indent}i64.eqz")
                     wat_lines.append(f"{indent}i64.extend_i32_u")
                     set_result(inst.result, indent)
+                elif opcode == "alloca":
+                    sz_op = inst.operands[0] if inst.operands else 64
+                    wat_lines.append(f"{indent}global.get $__omni_sp")
+                    wat_lines.append(f"{indent}i64.extend_i32_u")
+                    set_result(inst.result, indent)
+                    wat_lines.append(f"{indent}global.get $__omni_sp")
+                    wat_lines.append(f"{indent}{emit_operand(sz_op)}")
+                    wat_lines.append(f"{indent}i32.wrap_i64")
+                    wat_lines.append(f"{indent}i32.const 15")
+                    wat_lines.append(f"{indent}i32.add")
+                    wat_lines.append(f"{indent}i32.const -16")
+                    wat_lines.append(f"{indent}i32.and")
+                    wat_lines.append(f"{indent}i32.add")
+                    wat_lines.append(f"{indent}global.set $__omni_sp")
                 elif opcode in self.WASM_BINOP_MAP:
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
                     wat_lines.append(f"{indent}{emit_operand(inst.operands[1])}")
@@ -719,6 +726,9 @@ class WasmBackend:
                     wat_lines.append(f"{indent}  )")
                     wat_lines.append(f"{indent})")
                 elif opcode == "ret":
+                    if has_alloca:
+                        wat_lines.append(f"{indent}local.get $__sp_save")
+                        wat_lines.append(f"{indent}global.set $__omni_sp")
                     if inst.operands:
                         wat_lines.append(f"{indent}{emit_operand(inst.operands[0])}")
                     else:
@@ -729,6 +739,9 @@ class WasmBackend:
             if ssa_func.blocks:
                 emit_inst_sequence(ssa_func.blocks[0], "    ")
             if not any("return" in ln for ln in wat_lines):
+                if has_alloca:
+                    wat_lines.append("    local.get $__sp_save")
+                    wat_lines.append("    global.set $__omni_sp")
                 if var_locals:
                     wat_lines.append(f"    local.get ${sorted(var_locals)[-1]}")
                 else:
@@ -747,32 +760,138 @@ class WasmBackend:
                 wat_lines.append(f"        )")
                 wat_lines.append(f"      )")
             wat_lines.append("    )")
+            if has_alloca:
+                wat_lines.append("    local.get $__sp_save")
+                wat_lines.append("    global.set $__omni_sp")
             wat_lines.append(f"    {'f64.const 0.0' if fn_ret_wty == 'f64' else 'i64.const 0'}")
 
         wat_lines.append("  )")
         return "\n".join(wat_lines)
+
+    @staticmethod
+    def inspect_optimization_stats(wat_text: str) -> Dict[str, Any]:
+        """Counts WebAssembly 128-bit SIMD (`v128` / `i64x2` / `i32x4` / `f64x2` / `f32x4`) instructions in WAT."""
+        simd_hits = re.findall(r"\b((?:v128|i64x2|i32x4|f64x2|f32x4)\.[a-z0-9_]+)\b", wat_text)
+        return {
+            "simd_instruction_count": len(simd_hits),
+            "v128_instruction_count": len(simd_hits),
+            "sample_simd_mnemonics": sorted(set(simd_hits))[:16],
+            "wat_bytes": len(wat_text.encode("utf-8")),
+        }
+
+    def run_ssa_with_memory(
+        self,
+        ssa_funcs: List[SSAFunction],
+        entry_name: str,
+        args: Optional[List[Any]] = None,
+        memory_regions: Optional[Dict[int, bytes]] = None,
+        fuel_budget: Optional[int] = None,
+    ) -> Tuple[Any, Dict[int, bytes], Dict[str, Any]]:
+        """
+        Compiles `ssa_funcs` into WebAssembly (with 128-bit `v128` SIMD where eligible),
+        populates isolated linear-memory guest buffers matching virtual pointer args,
+        executes `entry_name` in Wasmtime, and returns `(return_value, memory_snapshots, simd_stats)`.
+        """
+        if not self.is_available:
+            raise RuntimeError("Wasmtime engine is not available.")
+
+        args = list(args or [])
+        mem_regions = dict(memory_regions or {})
+        entry_fn = next((f for f in ssa_funcs if f.name == entry_name), None)
+        if entry_fn is None:
+            raise ValueError(f"Entry function '{entry_name}' not found in ssa_funcs.")
+
+        wat_text = self.ssa_module_to_wat(ssa_funcs) if len(ssa_funcs) > 1 else self.ssa_to_wat(entry_fn)
+        stats = self.inspect_optimization_stats(wat_text)
+
+        if fuel_budget is not None and self._fuel_engine is not None:
+            eng = self._fuel_engine
+            store = Store(eng)
+            store.set_fuel(fuel_budget)
+        else:
+            eng = self._engine
+            store = Store(eng)
+
+        module = Module(eng, wat_text)
+        instance = Instance(store, module, [])
+        exports = instance.exports(store)
+        if entry_name not in exports:
+            raise ValueError(f"Exported function '{entry_name}' not found in compiled WASM module.")
+        memory = exports["memory"]
+
+        ordered_addrs = sorted(mem_regions.keys())
+        total_padded = sum((max(len(mem_regions[a]), 1) + 15) & ~15 for a in ordered_addrs)
+        # Keep guest buffers < 192 KiB safely disjoint from $alloca (196608) & .rodata (245760).
+        cursor = 4096 if total_padded <= 180224 else 327680
+        guest_addrs: Dict[int, int] = {}
+        for addr in ordered_addrs:
+            guest_addrs[addr] = cursor
+            cursor += (max(len(mem_regions[addr]), 1) + 15) & ~15
+
+        current_bytes = memory.data_len(store)
+        if cursor > current_bytes:
+            extra_pages = (cursor - current_bytes + 65535) // 65536
+            memory.grow(store, extra_pages)
+
+        for addr in ordered_addrs:
+            raw = mem_regions[addr]
+            if raw:
+                memory.write(store, raw, guest_addrs[addr])
+
+        wasm_args: List[Any] = []
+        for idx_a, val in enumerate(args):
+            p_name = entry_fn.params[idx_a] if idx_a < len(entry_fn.params) else ""
+            p_ty = entry_fn.param_types.get(p_name, "i64")
+            if p_ty in ("f64", "f32", "float", "double") or isinstance(val, float):
+                wasm_args.append(float(val))
+            else:
+                iv = int(val)
+                if iv in guest_addrs:
+                    wasm_args.append(guest_addrs[iv])
+                else:
+                    u = iv & 0xFFFFFFFFFFFFFFFF
+                    wasm_args.append(u - 0x10000000000000000 if (u & 0x8000000000000000) else u)
+
+        raw_ret = exports[entry_name](store, *wasm_args)
+        if fuel_budget is not None and self._fuel_engine is not None:
+            stats["fuel_consumed"] = fuel_budget - store.get_fuel()
+
+        ret_is_fp = getattr(entry_fn, "return_type", "i64") in ("f64", "f32", "float", "double")
+        if ret_is_fp:
+            ret_val: Any = float(raw_ret)
+        else:
+            u = int(raw_ret) & 0xFFFFFFFFFFFFFFFF
+            ret_val = u - 0x10000000000000000 if (u & 0x8000000000000000) else u
+
+        snaps = {
+            addr: bytes(memory.read(store, guest_addrs[addr], guest_addrs[addr] + len(mem_regions[addr])))
+            for addr in ordered_addrs
+        }
+        return ret_val, snaps, stats
 
     def ssa_to_wat(self, ssa_func: SSAFunction) -> str:
         """
         Lowers single-block AND arbitrary multi-block `SSAFunction` CFGs (loops, branches,
         Phi nodes, recursion) into structured WebAssembly Text (WAT) with Linear Memory.
         """
-        lut_map, data_lines = self._build_wat_rodata([ssa_func])
-        pages = 4 if data_lines else 2
-        parts = ["(module", f'  (memory (export "memory") {pages})']
-        parts.extend(data_lines)
-        parts.append(self._ssa_function_to_wat_func(ssa_func, lut_addr_map=lut_map))
-        parts.append(")")
-        return "\n".join(parts)
+        return self.ssa_module_to_wat([ssa_func])
 
     def ssa_module_to_wat(self, ssa_funcs: List[SSAFunction]) -> str:
         """Lowers multiple `SSAFunction`s into a unified multi-export WAT module."""
         lut_map, data_lines = self._build_wat_rodata(ssa_funcs)
-        pages = 4 if data_lines else 2
+        has_alloca = any(
+            ins.opcode.lower() == "alloca"
+            for fn in ssa_funcs
+            for b in fn.blocks
+            for ins in b.instructions
+        )
+        pages = 4 if (data_lines or has_alloca) else 2
         parts = [
             "(module",
             f'  (memory (export "memory") {pages})',
         ]
+        if has_alloca:
+            parts.append("  (global $__omni_sp (mut i32) (i32.const 196608))")
         parts.extend(data_lines)
         for fn in ssa_funcs:
             parts.append(self._ssa_function_to_wat_func(fn, lut_addr_map=lut_map))

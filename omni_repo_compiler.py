@@ -305,9 +305,11 @@ class OmniRepoCompiler:
         emit_debug_info: bool = True,
         backend: str = "native",
         speculative_targets: Optional[Dict[str, Tuple[int, str]]] = None,
+        homeostasis_policy: str = "consensus",
+        homeostasis_probes: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Executes the full 9-stage multi-repository compilation pipeline with real AST->SSA->Native/LLVM/WASM
+        Executes the full 9-stage multi-repository compilation pipeline with real AST->SSA->Native/LLVM/GCC/WASM
         code generation, cross-repository call linking, Unicorn silicon verification, and provenance signing.
         """
         # Fresh linker instance per compilation prevents cross-call module accumulation
@@ -317,6 +319,11 @@ class OmniRepoCompiler:
         if resolved_backend not in ("native", "llvm", "wasm", "gcc", "homeostasis"):
             raise ValueError(
                 f"Unsupported compiler backend '{backend}'. Expected 'native', 'llvm', 'gcc', 'wasm', or 'homeostasis'."
+            )
+        resolved_homeo_policy = homeostasis_policy.lower().strip()
+        if resolved_homeo_policy not in ("consensus", "throughput", "latency"):
+            raise ValueError(
+                f"Unsupported homeostasis_policy '{homeostasis_policy}'. Expected 'consensus', 'throughput', or 'latency'."
             )
 
         results: Dict[str, Any] = {"stages": {}}
@@ -1095,6 +1102,13 @@ class OmniRepoCompiler:
         backend_proofs_proven = 0
         backend_refuted = 0
         backend_verdicts: Dict[str, str] = {}
+        homeostasis_simd_telemetry: Dict[str, Any] = {}
+        homeostasis_diff_reports: List[Dict[str, Any]] = []
+        homeostasis_isolated_engines: Set[str] = set()
+        homeostasis_verified_probes = 0
+        homeostasis_wat_proofs = 0
+        homeostasis_throughput_winners: List[str] = []
+        homeostasis_emitter_used = "native"
         for m, obj_mod, stub_list in repo_order_objs:
             repo_ssas = [
                 ssa_program[fn_n]
@@ -1102,8 +1116,86 @@ class OmniRepoCompiler:
                 if owner == m.repo_name
             ]
             llvm_handled: Set[str] = set()
+            host_matches_target_os = (effective_os == ("windows" if sys.platform == "win32" else "linux"))
+            prefer_gcc_emitter = False
 
-            if resolved_backend == "gcc" and repo_ssas:
+            if resolved_backend == "homeostasis" and repo_ssas:
+                homeo_eligible = [
+                    s for s in repo_ssas
+                    if not any(
+                        inst.opcode == "call" and inst.operands and str(inst.operands[0]).startswith("omni_")
+                        for blk in s.blocks for inst in blk.instructions
+                    )
+                ]
+                if homeo_eligible:
+                    homeostasis_simd_telemetry[m.repo_name] = self.homeostasis.inspect_ecosystem_telemetry(homeo_eligible)
+                    wasm_self_contained = HomeostasisRouter.self_contained_wasm_subset(homeo_eligible)
+                    if self.wasm.is_available and wasm_self_contained:
+                        wat_src = self.wasm.ssa_module_to_wat(wasm_self_contained)
+                        for ws in wasm_self_contained:
+                            wbv = self.backend_validator.verify_ssa_to_wat(ws, wat_src, timeout_ms=400)
+                            if wbv["status"] == "REFUTED_COUNTEREXAMPLE":
+                                raise RuntimeError(
+                                    f"WASM backend lowering translation validation REFUTED for '{ws.name}': {wbv['counterexample']}"
+                                )
+                            if wbv["proven"]:
+                                homeostasis_wat_proofs += 1
+
+                    if homeostasis_probes:
+                        for hs in homeo_eligible:
+                            if hs.name not in homeostasis_probes:
+                                continue
+                            raw_probe_spec = homeostasis_probes[hs.name]
+                            probe_list = [raw_probe_spec] if isinstance(raw_probe_spec, (tuple, dict)) else list(raw_probe_spec)
+                            for probe_item in probe_list:
+                                if isinstance(probe_item, dict):
+                                    p_args = list(probe_item.get("args", []))
+                                    p_mem = dict(probe_item.get("memory_regions", {}))
+                                else:
+                                    p_args = list(probe_item[0]) if len(probe_item) > 0 else []
+                                    p_mem = dict(probe_item[1]) if len(probe_item) > 1 and probe_item[1] else {}
+                                rep = self.homeostasis.execute_differential(
+                                    homeo_eligible,
+                                    hs.name,
+                                    args=p_args,
+                                    memory_regions=p_mem,
+                                    policy=resolved_homeo_policy,
+                                )
+                                homeostasis_isolated_engines.update(rep.isolated_engines)
+                                homeostasis_verified_probes += 1
+                                homeostasis_diff_reports.append({
+                                    "function": hs.name,
+                                    "policy": resolved_homeo_policy,
+                                    "consensus_reached": rep.consensus_reached,
+                                    "selected_engine": rep.selected_engine,
+                                    "consensus_engines": list(rep.active_engines),
+                                    "isolated_engines": list(rep.isolated_engines),
+                                    "consensus_value": rep.consensus_value,
+                                    "elapsed_ms_by_engine": {
+                                        k: r.elapsed_ms for k, r in rep.results_by_engine.items() if r.success
+                                    },
+                                })
+                                if not rep.consensus_reached:
+                                    raise RuntimeError(
+                                        f"Homeostasis differential consensus FAILED for '{hs.name}': {rep.divergences}"
+                                    )
+                                if rep.selected_engine:
+                                    homeostasis_throughput_winners.append(rep.selected_engine)
+
+                    if (
+                        resolved_homeo_policy == "throughput"
+                        and effective_os == "linux"
+                        and self.gcc.is_available
+                        and "gcc" not in homeostasis_isolated_engines
+                        and (
+                            "gcc" in homeostasis_throughput_winners
+                            or not self.llvm.is_available
+                            or "llvm" in homeostasis_isolated_engines
+                        )
+                    ):
+                        prefer_gcc_emitter = True
+
+            if (resolved_backend == "gcc" or prefer_gcc_emitter) and repo_ssas:
                 gcc_eligible = [
                     s for s in repo_ssas
                     if not any(
@@ -1122,10 +1214,20 @@ class OmniRepoCompiler:
                             real_ast_compiled_count += 1
                             gcc_compiled_functions += 1
                             backend_verdicts[s.name] = "GCC_O3_COMPILED"
+                            if prefer_gcc_emitter:
+                                homeostasis_emitter_used = "gcc"
                     self.linker.add_module(gcc_obj_mod)
 
-            host_matches_target_os = (effective_os == ("windows" if sys.platform == "win32" else "linux"))
-            if (resolved_backend == "llvm" or (resolved_backend == "homeostasis" and self.llvm.is_available and host_matches_target_os)) and repo_ssas:
+            if (
+                resolved_backend == "llvm"
+                or (
+                    resolved_backend == "homeostasis"
+                    and not prefer_gcc_emitter
+                    and self.llvm.is_available
+                    and host_matches_target_os
+                    and "llvm" not in homeostasis_isolated_engines
+                )
+            ) and repo_ssas:
                 if not self.llvm.is_available:
                     raise RuntimeError("LLVM backend selected, but llvmlite/LLVM is unavailable.")
                 llvm_eligible = [
@@ -1239,13 +1341,24 @@ class OmniRepoCompiler:
             "verdicts": backend_verdicts,
         }
         if resolved_backend == "homeostasis":
+            if homeostasis_emitter_used == "native" and llvm_compiled_functions > 0:
+                homeostasis_emitter_used = "llvm"
+            elif homeostasis_emitter_used == "native" and gcc_compiled_functions > 0:
+                homeostasis_emitter_used = "gcc"
             results["stages"]["homeostasis"] = {
-                "policy": "consensus",
+                "policy": resolved_homeo_policy,
                 "available_engines": self.homeostasis.available_engines(),
                 "llvm_available": self.llvm.is_available,
                 "gcc_available": self.gcc.is_available,
+                "wasm_available": self.wasm.is_available,
                 "native_available": True,
-                "binary_emitter_engine": "llvm" if llvm_compiled_functions > 0 else "native",
+                "simd_telemetry_by_engine": homeostasis_simd_telemetry,
+                "wat_translation_proofs": homeostasis_wat_proofs,
+                "differential_consensus_reports": homeostasis_diff_reports,
+                "verified_probe_count": homeostasis_verified_probes,
+                "isolated_engines": sorted(homeostasis_isolated_engines),
+                "consensus_all_passed": all(r["consensus_reached"] for r in homeostasis_diff_reports) if homeostasis_diff_reports else True,
+                "binary_emitter_engine": homeostasis_emitter_used,
             }
 
         vla_simd_metadata = None
