@@ -183,10 +183,12 @@ class OmniRepoCompiler:
         self.llvm = LLVMBackend(opt_level=3)
         self.gcc = GCCBackend(opt_level=3)
         self.wasm = WasmBackend()
+        homeo_db_path = f"{db_path}.homeostasis_pgo.db" if (db_path and db_path != ":memory:") else ":memory:"
         self.homeostasis = HomeostasisRouter(
             llvm_backend=self.llvm,
             gcc_backend=self.gcc,
             wasm_backend=self.wasm,
+            profile_db_path=homeo_db_path,
         )
         self.smt_verifier = SmtRefinementVerifier(bit_width=64)
         self.biabduction = BiAbductionVerifier()
@@ -217,6 +219,8 @@ class OmniRepoCompiler:
             self._disk_cache.close()
         if getattr(self, "cpg", None) is not None:
             self.cpg.close()
+        if getattr(self, "homeostasis", None) is not None:
+            self.homeostasis.close()
 
     def _salsa_parse_file(self, norm_path: str) -> Optional[_CachedAstPayload]:
         self._salsa_misses += 1
@@ -1112,6 +1116,8 @@ class OmniRepoCompiler:
         homeostasis_verified_probes = 0
         homeostasis_wat_proofs = 0
         homeostasis_throughput_winners: List[str] = []
+        homeostasis_pgo_rec: Optional[str] = None
+        homeostasis_pgo_sig: Optional[str] = None
         homeostasis_emitter_used = "native"
         for m, obj_mod, stub_list in repo_order_objs:
             repo_ssas = [
@@ -1186,6 +1192,21 @@ class OmniRepoCompiler:
                                 if rep.selected_engine:
                                     homeostasis_throughput_winners.append(rep.selected_engine)
 
+                    pgo_cands: List[str] = ["native"]
+                    if self.llvm.is_available and host_matches_target_os and "llvm" not in homeostasis_isolated_engines:
+                        pgo_cands.append("llvm")
+                    if (
+                        ((effective_os == "linux" and self.gcc.supports_elf64)
+                         or (effective_os == "windows" and self.gcc.supports_windows_coff))
+                        and "gcc" not in homeostasis_isolated_engines
+                    ):
+                        pgo_cands.append("gcc")
+                    pgo_best, pgo_meta = self.homeostasis.recommend_engine(
+                        homeo_eligible, candidate_engines=pgo_cands, policy=resolved_homeo_policy
+                    )
+                    homeostasis_pgo_rec = pgo_best
+                    homeostasis_pgo_sig = pgo_meta.get("profile_signature")
+
                     if (
                         resolved_homeo_policy == "throughput"
                         and "gcc" not in homeostasis_isolated_engines
@@ -1195,6 +1216,7 @@ class OmniRepoCompiler:
                         )
                         and (
                             "gcc" in homeostasis_throughput_winners
+                            or pgo_best == "gcc"
                             or not self.llvm.is_available
                             or "llvm" in homeostasis_isolated_engines
                         )
@@ -1374,6 +1396,8 @@ class OmniRepoCompiler:
                 "verified_probe_count": homeostasis_verified_probes,
                 "isolated_engines": sorted(homeostasis_isolated_engines),
                 "consensus_all_passed": all(r["consensus_reached"] for r in homeostasis_diff_reports) if homeostasis_diff_reports else True,
+                "pgo_profile_signature": homeostasis_pgo_sig,
+                "pgo_recommended_engine": homeostasis_pgo_rec,
                 "binary_emitter_engine": homeostasis_emitter_used,
             }
 
@@ -1666,6 +1690,7 @@ def main():
     parser.add_argument("--target-os", choices=["windows", "linux", "macos"], help="Target operating system")
     parser.add_argument("--arch", choices=["x86_64", "arm64"], default="x86_64", help="Target architecture")
     parser.add_argument("--backend", choices=["native", "llvm", "gcc", "wasm", "homeostasis"], default="native", help="Codegen backend")
+    parser.add_argument("--homeostasis-policy", choices=["consensus", "throughput", "latency"], default="consensus", help="Homeostasis routing policy")
     parser.add_argument("--entry", default="omni_main", help="Exported entrypoint name")
     parser.add_argument("--export-all", action="store_true", help="Retain and export all functions across repositories")
     parser.add_argument("--audit-nonce", default="NONCE-C5-20261023-OMNI01", help="Audit nonce for provenance ledger")
@@ -1674,17 +1699,21 @@ def main():
     repo_list = [p.strip() for p in args.repos.split(",")]
 
     compiler = OmniRepoCompiler()
-    res = compiler.compile_repositories(
-        repo_paths=repo_list,
-        output_path=args.output,
-        target_format=args.format,
-        entry_export=args.entry,
-        target_os=args.target_os,
-        target_arch=args.arch,
-        audit_nonce=args.audit_nonce,
-        export_all=args.export_all,
-        backend=args.backend,
-    )
+    try:
+        res = compiler.compile_repositories(
+            repo_paths=repo_list,
+            output_path=args.output,
+            target_format=args.format,
+            entry_export=args.entry,
+            target_os=args.target_os,
+            target_arch=args.arch,
+            audit_nonce=args.audit_nonce,
+            export_all=args.export_all,
+            backend=args.backend,
+            homeostasis_policy=args.homeostasis_policy,
+        )
+    finally:
+        compiler.close()
 
     print(f"[+] OmniCompiler multi-repo compilation complete: {res['stages']['emission']['artifact_path']}")
 

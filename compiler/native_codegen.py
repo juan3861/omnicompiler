@@ -391,6 +391,68 @@ def _host_supports_avx2() -> bool:
     return bool(detect_host_simd_features().get("avx2", False))
 
 
+def _match_contiguous_fma_sources(
+    vals: List[Any],
+    blk_def_map: Dict[SSAVar, SSAInstruction],
+    expected_width: str,
+    fn_add_const: Dict[Any, Tuple[Any, int]],
+    elem_bytes: int,
+) -> Optional[Tuple[SSAInstruction, SSAInstruction, SSAInstruction]]:
+    """Matches `a[i] * b[i] + c[i]` (or `c[i] + a[i] * b[i]`) across `len(vals)` contiguous lanes."""
+    inss = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals]
+    if not all(x is not None and x.opcode.lower() == "fadd" and len(x.operands) == 2 for x in inss):
+        return None
+    mul_l = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss]  # type: ignore[union-attr]
+    mul_r = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss]  # type: ignore[union-attr]
+    if all(m is not None and m.opcode.lower() == "fmul" and len(m.operands) == 2 for m in mul_l):
+        muls, add_ops = mul_l, [x.operands[1] for x in inss]  # type: ignore[union-attr]
+    elif all(m is not None and m.opcode.lower() == "fmul" and len(m.operands) == 2 for m in mul_r):
+        muls, add_ops = mul_r, [x.operands[0] for x in inss]  # type: ignore[union-attr]
+    else:
+        return None
+    lda = [blk_def_map.get(m.operands[0]) if isinstance(m.operands[0], SSAVar) else None for m in muls]  # type: ignore[union-attr]
+    ldb = [blk_def_map.get(m.operands[1]) if isinstance(m.operands[1], SSAVar) else None for m in muls]  # type: ignore[union-attr]
+    ldc = [blk_def_map.get(c) if isinstance(c, SSAVar) else None for c in add_ops]
+    for grp in (lda, ldb, ldc):
+        if not all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) == expected_width for x in grp):
+            return None
+        if len({x.operands[0] for x in grp}) != 1:  # type: ignore[union-attr]
+            return None
+        if not is_contiguous_stride(fn_add_const, [x.operands[1] for x in grp], elem_bytes):  # type: ignore[union-attr]
+            return None
+    return lda[0], ldb[0], ldc[0]  # type: ignore[return-value]
+
+
+def _match_contiguous_binary_alu_sources(
+    vals: List[Any],
+    blk_def_map: Dict[SSAVar, SSAInstruction],
+    op_table: Dict[str, bytes],
+    allowed_widths: Tuple[str, ...],
+    fn_add_const: Dict[Any, Tuple[Any, int]],
+    elem_bytes: int,
+) -> Optional[Tuple[str, SSAInstruction, SSAInstruction]]:
+    """Matches uniform binary ALU (`add`/`sub`/`mul`/bitwise/`f*`) fed by two contiguous load streams."""
+    inss = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals]
+    if not all(x is not None and len(x.operands) == 2 for x in inss):
+        return None
+    ops_set = {x.opcode.lower() for x in inss}  # type: ignore[union-attr]
+    if len(ops_set) != 1:
+        return None
+    op_name = next(iter(ops_set))
+    if op_name not in op_table:
+        return None
+    lda = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss]  # type: ignore[union-attr]
+    ldb = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss]  # type: ignore[union-attr]
+    for grp in (lda, ldb):
+        if not all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) in allowed_widths for x in grp):
+            return None
+        if len({str(x.operands[2]) for x in grp}) != 1 or len({x.operands[0] for x in grp}) != 1:  # type: ignore[union-attr]
+            return None
+        if not is_contiguous_stride(fn_add_const, [x.operands[1] for x in grp], elem_bytes):  # type: ignore[union-attr]
+            return None
+    return op_name, lda[0], ldb[0]  # type: ignore[return-value]
+
+
 class X64CodeGenerator:
     """Compiles an Omni-SSA `SSAFunction` into native x86-64 machine code."""
 
@@ -403,7 +465,14 @@ class X64CodeGenerator:
         "cmp_ge": 0x9D,
     }
 
-    def __init__(self, target_os: Optional[str] = None, enable_avx2: Optional[bool] = None, enable_fma: Optional[bool] = None):
+    def __init__(
+        self,
+        target_os: Optional[str] = None,
+        enable_avx2: Optional[bool] = None,
+        enable_fma: Optional[bool] = None,
+        enable_avx512: Optional[bool] = None,
+        enable_avx512dq: Optional[bool] = None,
+    ):
         if target_os is None:
             self.is_windows = sys.platform == "win32"
         else:
@@ -414,6 +483,8 @@ class X64CodeGenerator:
         self.host_simd = detect_host_simd_features()
         self.enable_avx2 = bool(self.host_simd.get("avx2", False)) if enable_avx2 is None else bool(enable_avx2)
         self.enable_fma = (bool(self.host_simd.get("fma", False)) if enable_fma is None else bool(enable_fma)) and self.enable_avx2
+        self.enable_avx512 = (bool(self.host_simd.get("avx512f", False)) if enable_avx512 is None else bool(enable_avx512)) and self.enable_avx2
+        self.enable_avx512dq = (bool(self.host_simd.get("avx512dq", False)) if enable_avx512dq is None else bool(enable_avx512dq)) and self.enable_avx512
 
     def compile_function(self, fn: SSAFunction) -> CompiledFunctionArtifact:
         has_calls = any(
@@ -711,6 +782,19 @@ class X64CodeGenerator:
             "fsub": b"\xc5\xfd\x5c\xc1",  # vsubpd ymm0, ymm0, ymm1
             "fmul": b"\xc5\xfd\x59\xc1",  # vmulpd ymm0, ymm0, ymm1
         }
+        _AVX512_PACKED_64B_ALU_OPS: Dict[str, bytes] = {
+            "add":  b"\x62\xf1\xfd\x48\xd4\xc1",  # vpaddq zmm0, zmm0, zmm1
+            "sub":  b"\x62\xf1\xfd\x48\xfb\xc1",  # vpsubq zmm0, zmm0, zmm1
+            "and":  b"\x62\xf1\xfd\x48\xdb\xc1",  # vpandq zmm0, zmm0, zmm1
+            "or":   b"\x62\xf1\xfd\x48\xeb\xc1",  # vporq  zmm0, zmm0, zmm1
+            "xor":  b"\x62\xf1\xfd\x48\xef\xc1",  # vpxorq zmm0, zmm0, zmm1
+            "fadd": b"\x62\xf1\xfd\x48\x58\xc1",  # vaddpd zmm0, zmm0, zmm1
+            "fsub": b"\x62\xf1\xfd\x48\x5c\xc1",  # vsubpd zmm0, zmm0, zmm1
+            "fmul": b"\x62\xf1\xfd\x48\x59\xc1",  # vmulpd zmm0, zmm0, zmm1
+        }
+        if self.enable_avx512dq:
+            _AVX512_PACKED_64B_ALU_OPS["mul"] = b"\x62\xf2\xfd\x48\x40\xc1"   # vpmullq zmm0, zmm0, zmm1
+            _AVX512_PACKED_64B_ALU_OPS["imul"] = b"\x62\xf2\xfd\x48\x40\xc1"  # vpmullq zmm0, zmm0, zmm1
         _AVX2_PACKED_32B_ALU_OPS: Dict[str, bytes] = {
             "add":  b"\xc5\xfd\xfe\xc1",      # vpaddd ymm0, ymm0, ymm1
             "sub":  b"\xc5\xfd\xfa\xc1",      # vpsubd ymm0, ymm0, ymm1
@@ -1013,6 +1097,56 @@ class X64CodeGenerator:
 
                 elif op == "store_off":
                     width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                    def _emit_addr_r11_rcx(base_op: Any, off_op: Any) -> None:
+                        resolve_operand_to_reg(base_op, "r11")
+                        resolve_operand_to_reg(off_op, "rcx")
+                        buf.emit(b"\x49\x01\xcb")  # add r11, rcx
+
+                    # 512-bit AVX-512 EVEX path for 8 contiguous 64-bit stores
+                    if self.enable_avx512 and width in ("i64", "u64", "f64") and inst_idx + 6 < len(block.instructions):
+                        oct64_sts = [inst] + [block.instructions[inst_idx + k_s] for k_s in range(7)]
+                        if (
+                            all(s.opcode.lower() == "store_off" and len(s.operands) >= 4 and str(s.operands[3]) == width and s.operands[0] == inst.operands[0] for s in oct64_sts[1:])
+                            and is_contiguous_stride(fn_add_const, [s.operands[1] for s in oct64_sts], 8)
+                        ):
+                            vals_z = [s.operands[2] for s in oct64_sts]
+                            z_fma = (
+                                _match_contiguous_fma_sources(vals_z, blk_def_map, "f64", fn_add_const, 8)
+                                if (self.enable_fma and width == "f64")
+                                else None
+                            )
+                            if z_fma is not None:
+                                lda0, ldb0, ldc0 = z_fma
+                                _emit_addr_r11_rcx(lda0.operands[0], lda0.operands[1])
+                                buf.emit(b"\x62\xd1\xfe\x48\x6f\x03")    # vmovdqu64 zmm0, [r11]
+                                _emit_addr_r11_rcx(ldb0.operands[0], ldb0.operands[1])
+                                buf.emit(b"\x62\xd1\xfe\x48\x6f\x0b")    # vmovdqu64 zmm1, [r11]
+                                _emit_addr_r11_rcx(ldc0.operands[0], ldc0.operands[1])
+                                buf.emit(b"\x62\xd1\xfe\x48\x6f\x13")    # vmovdqu64 zmm2, [r11]
+                                buf.emit(b"\x62\xf2\xf5\x48\xa8\xc2")    # vfmadd213pd zmm0, zmm1, zmm2
+                                _emit_addr_r11_rcx(inst.operands[0], inst.operands[1])
+                                buf.emit(b"\x62\xd1\xfe\x48\x7f\x03")    # vmovdqu64 [r11], zmm0
+                                used_avx2_ymm = True
+                                buf.record_line(oct64_sts[-1].source_line)
+                                inst_idx += 7
+                                continue
+                            z_bin = _match_contiguous_binary_alu_sources(
+                                vals_z, blk_def_map, _AVX512_PACKED_64B_ALU_OPS, ("i64", "u64", "f64"), fn_add_const, 8
+                            )
+                            if z_bin is not None:
+                                op_z, lda0, ldb0 = z_bin
+                                _emit_addr_r11_rcx(lda0.operands[0], lda0.operands[1])
+                                buf.emit(b"\x62\xd1\xfe\x48\x6f\x03")    # vmovdqu64 zmm0, [r11]
+                                _emit_addr_r11_rcx(ldb0.operands[0], ldb0.operands[1])
+                                buf.emit(b"\x62\xd1\xfe\x48\x6f\x0b")    # vmovdqu64 zmm1, [r11]
+                                buf.emit(_AVX512_PACKED_64B_ALU_OPS[op_z])
+                                _emit_addr_r11_rcx(inst.operands[0], inst.operands[1])
+                                buf.emit(b"\x62\xd1\xfe\x48\x7f\x03")    # vmovdqu64 [r11], zmm0
+                                used_avx2_ymm = True
+                                buf.record_line(oct64_sts[-1].source_line)
+                                inst_idx += 7
+                                continue
+
                     if self.enable_avx2 and width in ("i64", "u64", "f64") and inst_idx + 2 < len(block.instructions):
                         st1 = block.instructions[inst_idx]
                         st2 = block.instructions[inst_idx + 1]
@@ -1025,92 +1159,43 @@ class X64CodeGenerator:
                             and _are_contiguous_8b_quad(inst.operands[1], st1.operands[1], st2.operands[1], st3.operands[1])
                         ):
                             vals_q = [inst.operands[2], st1.operands[2], st2.operands[2], st3.operands[2]]
-                            inss_q = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals_q]
-                            if self.enable_fma and width == "f64" and all(
-                                x is not None and x.opcode.lower() == "fadd" and len(x.operands) == 2 for x in inss_q
-                            ):
-                                mul_left = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss_q]
-                                mul_right = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss_q]
-                                if all(m is not None and m.opcode.lower() == "fmul" and len(m.operands) == 2 for m in mul_left):
-                                    muls_f, add_ops = mul_left, [x.operands[1] for x in inss_q]
-                                elif all(m is not None and m.opcode.lower() == "fmul" and len(m.operands) == 2 for m in mul_right):
-                                    muls_f, add_ops = mul_right, [x.operands[0] for x in inss_q]
-                                else:
-                                    muls_f, add_ops = [], []
-                                if muls_f:
-                                    lda_f = [blk_def_map.get(m.operands[0]) if isinstance(m.operands[0], SSAVar) else None for m in muls_f]
-                                    ldb_f = [blk_def_map.get(m.operands[1]) if isinstance(m.operands[1], SSAVar) else None for m in muls_f]
-                                    ldc_f = [blk_def_map.get(c) if isinstance(c, SSAVar) else None for c in add_ops]
-                                    if (
-                                        all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) == "f64" for x in lda_f)
-                                        and all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) == "f64" for x in ldb_f)
-                                        and all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) == "f64" for x in ldc_f)
-                                        and len({x.operands[0] for x in lda_f}) == 1
-                                        and len({x.operands[0] for x in ldb_f}) == 1
-                                        and len({x.operands[0] for x in ldc_f}) == 1
-                                        and _are_contiguous_8b_quad(lda_f[0].operands[1], lda_f[1].operands[1], lda_f[2].operands[1], lda_f[3].operands[1])
-                                        and _are_contiguous_8b_quad(ldb_f[0].operands[1], ldb_f[1].operands[1], ldb_f[2].operands[1], ldb_f[3].operands[1])
-                                        and _are_contiguous_8b_quad(ldc_f[0].operands[1], ldc_f[1].operands[1], ldc_f[2].operands[1], ldc_f[3].operands[1])
-                                    ):
-                                        resolve_operand_to_reg(lda_f[0].operands[0], "r11")
-                                        resolve_operand_to_reg(lda_f[0].operands[1], "rcx")
-                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
-                                        buf.emit(b"\xc4\xc1\x7e\x6f\x03")    # vmovdqu ymm0, [r11]
-                                        resolve_operand_to_reg(ldb_f[0].operands[0], "r11")
-                                        resolve_operand_to_reg(ldb_f[0].operands[1], "rcx")
-                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
-                                        buf.emit(b"\xc4\xc1\x7e\x6f\x0b")    # vmovdqu ymm1, [r11]
-                                        resolve_operand_to_reg(ldc_f[0].operands[0], "r11")
-                                        resolve_operand_to_reg(ldc_f[0].operands[1], "rcx")
-                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
-                                        buf.emit(b"\xc4\xc1\x7e\x6f\x13")    # vmovdqu ymm2, [r11]
-                                        buf.emit(b"\xc4\xe2\xf5\xa8\xc2")    # vfmadd213pd ymm0, ymm1, ymm2
-                                        resolve_operand_to_reg(inst.operands[0], "r11")
-                                        resolve_operand_to_reg(inst.operands[1], "rcx")
-                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
-                                        buf.emit(b"\xc4\xc1\x7e\x7f\x03")    # vmovdqu [r11], ymm0
-                                        used_avx2_ymm = True
-                                        buf.record_line(st3.source_line)
-                                        inst_idx += 3
-                                        continue
+                            y_fma = (
+                                _match_contiguous_fma_sources(vals_q, blk_def_map, "f64", fn_add_const, 8)
+                                if (self.enable_fma and width == "f64")
+                                else None
+                            )
+                            if y_fma is not None:
+                                lda0, ldb0, ldc0 = y_fma
+                                _emit_addr_r11_rcx(lda0.operands[0], lda0.operands[1])
+                                buf.emit(b"\xc4\xc1\x7e\x6f\x03")    # vmovdqu ymm0, [r11]
+                                _emit_addr_r11_rcx(ldb0.operands[0], ldb0.operands[1])
+                                buf.emit(b"\xc4\xc1\x7e\x6f\x0b")    # vmovdqu ymm1, [r11]
+                                _emit_addr_r11_rcx(ldc0.operands[0], ldc0.operands[1])
+                                buf.emit(b"\xc4\xc1\x7e\x6f\x13")    # vmovdqu ymm2, [r11]
+                                buf.emit(b"\xc4\xe2\xf5\xa8\xc2")    # vfmadd213pd ymm0, ymm1, ymm2
+                                _emit_addr_r11_rcx(inst.operands[0], inst.operands[1])
+                                buf.emit(b"\xc4\xc1\x7e\x7f\x03")    # vmovdqu [r11], ymm0
+                                used_avx2_ymm = True
+                                buf.record_line(st3.source_line)
+                                inst_idx += 3
+                                continue
 
-                            if (
-                                all(x is not None for x in inss_q)
-                                and len({x.opcode.lower() for x in inss_q}) == 1
-                                and inss_q[0].opcode.lower() in _AVX2_PACKED_64B_ALU_OPS
-                                and all(len(x.operands) == 2 for x in inss_q)
-                            ):
-                                a_ops = [x.operands[0] for x in inss_q]
-                                b_ops = [x.operands[1] for x in inss_q]
-                                lda = [blk_def_map.get(a) if isinstance(a, SSAVar) else None for a in a_ops]
-                                ldb = [blk_def_map.get(b) if isinstance(b, SSAVar) else None for b in b_ops]
-                                if (
-                                    all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) in ("i64", "u64", "f64") for x in lda)
-                                    and all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) in ("i64", "u64", "f64") for x in ldb)
-                                    and len({str(x.operands[2]) for x in lda}) == 1
-                                    and len({str(x.operands[2]) for x in ldb}) == 1
-                                    and len({x.operands[0] for x in lda}) == 1
-                                    and len({x.operands[0] for x in ldb}) == 1
-                                    and _are_contiguous_8b_quad(lda[0].operands[1], lda[1].operands[1], lda[2].operands[1], lda[3].operands[1])
-                                    and _are_contiguous_8b_quad(ldb[0].operands[1], ldb[1].operands[1], ldb[2].operands[1], ldb[3].operands[1])
-                                ):
-                                    resolve_operand_to_reg(lda[0].operands[0], "r11")
-                                    resolve_operand_to_reg(lda[0].operands[1], "rcx")
-                                    buf.emit(b"\x49\x01\xcb")            # add r11, rcx
-                                    buf.emit(b"\xc4\xc1\x7e\x6f\x03")    # vmovdqu ymm0, ymmword ptr [r11]
-                                    resolve_operand_to_reg(ldb[0].operands[0], "r11")
-                                    resolve_operand_to_reg(ldb[0].operands[1], "rcx")
-                                    buf.emit(b"\x49\x01\xcb")            # add r11, rcx
-                                    buf.emit(b"\xc4\xc1\x7e\x6f\x0b")    # vmovdqu ymm1, ymmword ptr [r11]
-                                    buf.emit(_AVX2_PACKED_64B_ALU_OPS[inss_q[0].opcode.lower()])
-                                    resolve_operand_to_reg(inst.operands[0], "r11")
-                                    resolve_operand_to_reg(inst.operands[1], "rcx")
-                                    buf.emit(b"\x49\x01\xcb")            # add r11, rcx
-                                    buf.emit(b"\xc4\xc1\x7e\x7f\x03")    # vmovdqu ymmword ptr [r11], ymm0
-                                    used_avx2_ymm = True
-                                    buf.record_line(st3.source_line)
-                                    inst_idx += 3
-                                    continue
+                            y_bin = _match_contiguous_binary_alu_sources(
+                                vals_q, blk_def_map, _AVX2_PACKED_64B_ALU_OPS, ("i64", "u64", "f64"), fn_add_const, 8
+                            )
+                            if y_bin is not None:
+                                op_y, lda0, ldb0 = y_bin
+                                _emit_addr_r11_rcx(lda0.operands[0], lda0.operands[1])
+                                buf.emit(b"\xc4\xc1\x7e\x6f\x03")    # vmovdqu ymm0, ymmword ptr [r11]
+                                _emit_addr_r11_rcx(ldb0.operands[0], ldb0.operands[1])
+                                buf.emit(b"\xc4\xc1\x7e\x6f\x0b")    # vmovdqu ymm1, ymmword ptr [r11]
+                                buf.emit(_AVX2_PACKED_64B_ALU_OPS[op_y])
+                                _emit_addr_r11_rcx(inst.operands[0], inst.operands[1])
+                                buf.emit(b"\xc4\xc1\x7e\x7f\x03")    # vmovdqu ymmword ptr [r11], ymm0
+                                used_avx2_ymm = True
+                                buf.record_line(st3.source_line)
+                                inst_idx += 3
+                                continue
 
                             # General 256-bit AVX2 pack-and-store for 4 contiguous 64-bit stores
                             resolve_operand_to_reg(vals_q[0], "rax")
@@ -1122,9 +1207,7 @@ class X64CodeGenerator:
                             resolve_operand_to_reg(vals_q[3], "r11")
                             buf.emit(b"\xc4\xc3\xf1\x22\xcb\x01")        # vpinsrq xmm1, xmm1, r11, 1
                             buf.emit(b"\xc4\xe3\x7d\x18\xc1\x01")        # vinserti128 ymm0, ymm0, xmm1, 1
-                            resolve_operand_to_reg(inst.operands[0], "r11")
-                            resolve_operand_to_reg(inst.operands[1], "rcx")
-                            buf.emit(b"\x49\x01\xcb")                    # add r11, rcx
+                            _emit_addr_r11_rcx(inst.operands[0], inst.operands[1])
                             buf.emit(b"\xc4\xc1\x7e\x7f\x03")            # vmovdqu ymmword ptr [r11], ymm0
                             used_avx2_ymm = True
                             buf.record_line(st3.source_line)
@@ -1900,6 +1983,61 @@ class X64CodeGenerator:
 
         buf.mark(".L_zfma_done")
         buf.emit(_x64_mov_ri("rax", 1))
+        buf.emit(b"\xc3")
+        return buf.finalize()
+
+    def emit_avx2_fma_dot_pd(self) -> bytes:
+        """
+        Emits 256-bit AVX2+FMA horizontal dot-product reduction kernel:
+          double avx2_fma_dot_pd(const double* a, const double* b, int64_t count)
+        Accumulates sum_{i=0}^{count-1} a[i]*b[i] via `vfmadd231pd ymm2, ymm0, ymm1` + horizontal collapse.
+        """
+        buf = X64LabelBuffer()
+        if self.is_windows:
+            buf.emit(_x64_mov_rr("r10", "rcx"))
+            buf.emit(_x64_mov_rr("r11", "rdx"))
+            buf.emit(_x64_mov_rr("rax", "r8"))
+        else:
+            buf.emit(_x64_mov_rr("r10", "rdi"))
+            buf.emit(_x64_mov_rr("r11", "rsi"))
+            buf.emit(_x64_mov_rr("rax", "rdx"))
+
+        buf.emit(b"\xc5\xed\x57\xd2")              # vxorpd ymm2, ymm2, ymm2
+
+        buf.mark(".L_dotf_vec")
+        buf.emit(b"\x48\x83\xf8\x04")              # cmp rax, 4
+        buf.emit(b"\x0f\x8c\x00\x00\x00\x00")
+        buf.fixups.append((len(buf.code) - 4, ".L_dotf_reduce"))
+
+        buf.emit(b"\xc4\xc1\x7d\x10\x02")          # vmovupd ymm0, [r10]
+        buf.emit(b"\xc4\xc1\x7d\x10\x0b")          # vmovupd ymm1, [r11]
+        buf.emit(b"\xc4\xe2\xfd\xb8\xd1")          # vfmadd231pd ymm2, ymm0, ymm1
+        buf.emit(b"\x49\x83\xc2\x20")              # add r10, 32
+        buf.emit(b"\x49\x83\xc3\x20")              # add r11, 32
+        buf.emit(b"\x48\x83\xe8\x04")              # sub rax, 4
+        buf.jmp(".L_dotf_vec")
+
+        buf.mark(".L_dotf_reduce")
+        buf.emit(b"\xc4\xe3\x7d\x19\xd0\x00")      # vextractf128 xmm0, ymm2, 0
+        buf.emit(b"\xc4\xe3\x7d\x19\xd1\x01")      # vextractf128 xmm1, ymm2, 1
+        buf.emit(b"\xc5\xf9\x58\xc1")              # vaddpd xmm0, xmm0, xmm1
+        buf.emit(b"\xc5\xf9\x7c\xc0")              # vhaddpd xmm0, xmm0, xmm0
+        buf.emit(b"\xc5\xf8\x77")                  # vzeroupper
+
+        buf.mark(".L_dotf_tail")
+        buf.emit(_x64_test_rr("rax"))
+        buf.emit(b"\x0f\x8e\x00\x00\x00\x00")
+        buf.fixups.append((len(buf.code) - 4, ".L_dotf_done"))
+
+        buf.emit(b"\xc4\xc1\x7b\x10\x0a")          # vmovsd xmm1, [r10]
+        buf.emit(b"\xc4\xc1\x7b\x10\x1b")          # vmovsd xmm3, [r11]
+        buf.emit(b"\xc4\xe2\xf1\xb9\xc3")          # vfmadd231sd xmm0, xmm1, xmm3
+        buf.emit(b"\x49\x83\xc2\x08")
+        buf.emit(b"\x49\x83\xc3\x08")
+        buf.emit(b"\x48\xff\xc8")
+        buf.jmp(".L_dotf_tail")
+
+        buf.mark(".L_dotf_done")
         buf.emit(b"\xc3")
         return buf.finalize()
 

@@ -14,6 +14,9 @@ Performs strict, physical, end-to-end empirical verification of Repository Compi
 
 import sys
 import os
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 import subprocess
 import json
 import sqlite3

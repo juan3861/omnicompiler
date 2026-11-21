@@ -1,29 +1,56 @@
 {
-  "timestamp": "2026-11-02T05:00:11Z",
+  "timestamp": "2026-11-21T15:41:55Z",
   "parsing": {
     "tree_sitter": {
-      "time_sec": 0.019820399989839643,
+      "time_sec": 0.020514300000286312,
       "symbols_extracted": 400
     },
     "regex": {
-      "time_sec": 0.0006871999939903617,
+      "time_sec": 0.0006685999996989267,
       "symbols_extracted": 400
     }
   },
   "execution": {
     "llvm_o3_jit": {
-      "time_sec": 6.499991286545992e-06,
+      "time_sec": 3.6999999792897142e-06,
       "result": 4999950000,
       "iterations": 100000
     },
     "wasmtime_sandbox": {
-      "time_sec": 0.008700900012627244,
+      "time_sec": 0.007244300000820658,
+      "result": 4999950000,
+      "iterations": 100000
+    },
+    "omni_native_jit": {
+      "time_sec": 0.00016510000023117755,
+      "result": 4999950000,
+      "iterations": 100000
+    },
+    "gcc_o3": {
+      "time_sec": 1.5195580999998128,
       "result": 4999950000,
       "iterations": 100000
     }
   },
+  "homeostasis_quad": {
+    "host_simd_tier": "AVX2_FMA",
+    "consensus_reached": true,
+    "active_engines": [
+      "native",
+      "llvm",
+      "gcc",
+      "wasm"
+    ],
+    "selected_engine": "wasm",
+    "elapsed_ms_by_engine": {
+      "native": 24.711,
+      "llvm": 45.287,
+      "gcc": 2001.377,
+      "wasm": 7.143
+    }
+  },
   "safety_and_audit": {
-    "unicorn_preflight_latency_ms": 2.261949999956414,
-    "formal_audit_latency_ms": 0.6348830001661554
+    "unicorn_preflight_latency_ms": 1.5911940000114555,
+    "formal_audit_latency_ms": 0.6966840000040975
   }
 }

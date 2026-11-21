@@ -19,7 +19,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from slicer.tree_sitter_polyglot import TreeSitterPolyglotEngine
 from orchestrator.repo_manifest_ingestor import RepoManifestIngestor
+from compiler.gcc_backend import GCCBackend
+from compiler.homeostasis_router import HomeostasisRouter
 from compiler.llvm_backend import LLVMBackend
+from compiler.native_codegen import detect_host_simd_features
+from compiler.native_jit import NativeJitCompiler
+from compiler.ssa_ir import AstToSsaLowering
 from compiler.wasm_backend import WasmBackend
 from validation.silicon_safety_sandbox import SiliconSafetySandbox
 from validation.binary_structure_auditor import BinaryStructureAuditor
@@ -117,7 +122,84 @@ def benchmark_execution():
         dt_wasm = time.perf_counter() - t0
         results["wasmtime_sandbox"] = {"time_sec": dt_wasm, "result": wval, "iterations": N}
 
+    # 3. Omni Native x86-64 JIT
+    try:
+        jit = NativeJitCompiler()
+        import ast
+        src = "def loop_calc(n: int) -> int:\n    i = 0\n    acc = 0\n    while i < n:\n        acc += i\n        i += 1\n    return acc\n"
+        ssa_fn = AstToSsaLowering().lower_function_def(ast.parse(src).body[0])
+        native_fn, mem, _ = jit.compile_ssa(ssa_fn)
+        try:
+            t0 = time.perf_counter()
+            nval = native_fn(N)
+            dt_nat = time.perf_counter() - t0
+        finally:
+            mem.free()
+        results["omni_native_jit"] = {"time_sec": dt_nat, "result": nval, "iterations": N}
+    except Exception as exc:
+        results["omni_native_jit"] = {"error": str(exc)}
+
+    # 4. GNU GCC O3 (when available)
+    gcc = GCCBackend(opt_level=3)
+    if gcc.is_available:
+        import ast
+        src = "def loop_calc(n: int) -> int:\n    i = 0\n    acc = 0\n    while i < n:\n        acc += i\n        i += 1\n    return acc\n"
+        ssa_fn = AstToSsaLowering().lower_function_def(ast.parse(src).body[0])
+        t0 = time.perf_counter()
+        gval, _ = gcc.run_function([ssa_fn], "loop_calc", args=[N])
+        dt_gcc = time.perf_counter() - t0
+        results["gcc_o3"] = {"time_sec": dt_gcc, "result": gval, "iterations": N}
+
     return results
+
+
+def benchmark_homeostasis_quad():
+    import ast, struct
+    feats = detect_host_simd_features()
+    src_struct = """
+class BenchF64:
+    a: Array[f64, 64]
+    b: Array[f64, 64]
+    out: Array[f64, 64]
+
+def quad_fma_bench(t: BenchF64, n: int) -> float:
+    i = 0
+    acc = 0.0
+    while i < n:
+        v = t.a[i] * t.b[i] + 1.25
+        t.out[i] = v
+        acc += v
+        i += 1
+    return acc
+"""
+    mod = ast.parse(src_struct)
+    low = AstToSsaLowering()
+    low.register_structs_from_statements(mod.body)
+    fn_def = [n for n in mod.body if isinstance(n, ast.FunctionDef)][0]
+    ssa_fn = low.lower_function_def(fn_def)
+    arena = bytearray(64 * 8 * 3)
+    for k in range(32):
+        struct.pack_into("<d", arena, k * 8, float(k + 1) * 0.5)
+        struct.pack_into("<d", arena, 64 * 8 + k * 8, float(k % 7 + 1) * 0.25)
+
+    router = HomeostasisRouter()
+    try:
+        rep = router.execute_differential(
+            [ssa_fn],
+            "quad_fma_bench",
+            args=[0x400000, 32],
+            memory_regions={0x400000: bytes(arena)},
+            policy="throughput",
+        )
+        return {
+            "host_simd_tier": feats.get("recommended_tier"),
+            "consensus_reached": rep.consensus_reached,
+            "active_engines": rep.active_engines,
+            "selected_engine": rep.selected_engine,
+            "elapsed_ms_by_engine": {k: v.elapsed_ms for k, v in rep.results_by_engine.items() if v.success},
+        }
+    finally:
+        router.close()
 
 
 def benchmark_safety_and_audit():
@@ -160,6 +242,14 @@ if __name__ == "__main__":
         print(f"    LLVM O3 JIT:      {e_res['llvm_o3_jit']['time_sec']*1000:.4f} ms (Result: {e_res['llvm_o3_jit']['result']})")
     if "wasmtime_sandbox" in e_res:
         print(f"    Wasmtime Sandbox: {e_res['wasmtime_sandbox']['time_sec']*1000:.4f} ms (Result: {e_res['wasmtime_sandbox']['result']})")
+    if "omni_native_jit" in e_res and "time_sec" in e_res["omni_native_jit"]:
+        print(f"    Omni Native JIT:  {e_res['omni_native_jit']['time_sec']*1000:.4f} ms (Result: {e_res['omni_native_jit']['result']})")
+    if "gcc_o3" in e_res:
+        print(f"    GCC O3 Subproc:   {e_res['gcc_o3']['time_sec']*1000:.4f} ms (Result: {e_res['gcc_o3']['result']})")
+
+    h_res = benchmark_homeostasis_quad()
+    print("\n[2b] Quad-Ecosystem Homeostasis Consensus Benchmark:")
+    print(f"    Host SIMD Tier:   {h_res['host_simd_tier']} | Engines: {h_res['active_engines']} | Winner: {h_res['selected_engine']}")
 
     s_res = benchmark_safety_and_audit()
     print("\n[3] Pre-Flight & Formal Audit Overhead:")
@@ -170,6 +260,7 @@ if __name__ == "__main__":
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "parsing": p_res,
         "execution": e_res,
+        "homeostasis_quad": h_res,
         "safety_and_audit": s_res
     }
     out_file = Path("external_component_candidates/benchmarks/benchmark_results.json")

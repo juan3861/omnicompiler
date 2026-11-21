@@ -403,6 +403,28 @@ class NativeJitCompiler:
         callable_fn._jit_mem = mem
         return callable_fn, mem, raw_code.hex()
 
+    def compile_avx2_fma_dot_pd(self) -> Tuple[Any, NativeJitMemory, str]:
+        """
+        Compiles hardware 256-bit AVX2+FMA `f64` dot-product kernel (`vfmadd231pd` + `vhaddpd`):
+          fn(ptr_a: uint64, ptr_b: uint64, count: int64) -> double
+        """
+        from compiler.native_codegen import detect_host_simd_features
+        feats = detect_host_simd_features()
+        if not feats.get("fma", False):
+            raise RuntimeError(f"Host CPU lacks OS-enabled FMA ({feats}).")
+        raw_code = self.codegen.emit_avx2_fma_dot_pd()
+        mem = NativeJitMemory(size=max(4096, len(raw_code)))
+        mem.write_code(raw_code)
+        fn_type = ctypes.CFUNCTYPE(
+            ctypes.c_double,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_int64,
+        )
+        callable_fn = fn_type(mem.ptr)
+        callable_fn._jit_mem = mem
+        return callable_fn, mem, raw_code.hex()
+
     def compile_avx512_vec_add_i64(self) -> Tuple[Any, NativeJitMemory, str]:
         """
         Compiles EVEX 512-bit AVX-512F kernel (`vmovdqu64 zmm` + `vpaddq zmm`), guarded by CPUID+XGETBV.

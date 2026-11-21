@@ -9,17 +9,187 @@ Connects all four compiler/runtime ecosystems under canonical `Omni-SSA` + Z3 ve
 Enforces bit-exact differential consensus and automatically isolates any diverging engine.
 """
 
+import contextlib
 import ctypes
+import hashlib
 import math
+import os
+import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from compiler.gcc_backend import GCCBackend
 from compiler.llvm_backend import LLVMBackend
+from compiler.native_codegen import detect_host_simd_features
 from compiler.native_jit import NativeJitCompiler
 from compiler.ssa_ir import SSAFunction
 from compiler.wasm_backend import WasmBackend
+
+
+class HomeostasisProfileStore:
+    """
+    Persistent Profile-Guided Optimization (PGO) database for adaptive backend routing.
+    Uses short-lived per-op SQLite connections for file-backed DBs (matching PersistentSalsaCache
+    to avoid Windows file-lock conflicts inside TemporaryDirectory callers).
+    """
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or ":memory:"
+        self._lock = threading.Lock()
+        self._is_file = bool(self.db_path and self.db_path != ":memory:")
+        self._mem_conn: Optional[sqlite3.Connection] = (
+            sqlite3.connect(":memory:", check_same_thread=False) if not self._is_file else None
+        )
+        if self._is_file:
+            parent_d = os.path.dirname(os.path.abspath(self.db_path))
+            if parent_d:
+                os.makedirs(parent_d, exist_ok=True)
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS homeostasis_pgo_profiles (
+                        profile_sig TEXT NOT NULL,
+                        engine TEXT NOT NULL,
+                        samples INTEGER NOT NULL,
+                        ewma_ms REAL NOT NULL,
+                        avg_simd_count REAL NOT NULL,
+                        consensus_wins INTEGER NOT NULL,
+                        divergences INTEGER NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (profile_sig, engine)
+                    )
+                    """
+                )
+                conn.commit()
+
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        if not self._is_file:
+            if self._mem_conn is None:
+                self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            yield self._mem_conn
+            return
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            yield conn
+        finally:
+            conn.close()
+
+    def close(self) -> None:
+        with self._lock:
+            if getattr(self, "_mem_conn", None) is not None:
+                self._mem_conn.close()
+                self._mem_conn = None
+
+    @staticmethod
+    def structural_signature(ssa_funcs: List[SSAFunction], host_tier: Optional[str] = None) -> str:
+        tier = host_tier or detect_host_simd_features().get("recommended_tier", "SSE2_128")
+        has_loops = 0
+        has_fp = 0
+        has_mem = 0
+        has_calls = 0
+        blk_sum = 0
+        inst_sum = 0
+        for f in ssa_funcs:
+            blk_sum += len(f.blocks)
+            if len(f.blocks) > 1:
+                has_loops = 1
+            for b in f.blocks:
+                for ins in b.instructions:
+                    inst_sum += 1
+                    op = ins.opcode.lower()
+                    if op.startswith("f") or op in ("sitofp", "fptosi"):
+                        has_fp = 1
+                    if op in ("load", "store", "load_off", "store_off", "alloca"):
+                        has_mem = 1
+                    if op == "call":
+                        has_calls = 1
+        bucket = "large" if inst_sum >= 64 else ("medium" if inst_sum >= 16 else "small")
+        raw = f"{tier}|fn={min(len(ssa_funcs), 8)}|loops={has_loops}|fp={has_fp}|mem={has_mem}|calls={has_calls}|size={bucket}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+    def record_report(
+        self,
+        ssa_funcs: List[SSAFunction],
+        report: "HomeostasisReport",
+        host_tier: Optional[str] = None,
+    ) -> str:
+        sig = self.structural_signature(ssa_funcs, host_tier=host_tier)
+        now = time.time()
+        isolated_set = set(report.isolated_engines)
+        winner = report.selected_engine
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                for eng, r in report.results_by_engine.items():
+                    simd_c = float((r.simd_stats or {}).get("simd_instruction_count", 0))
+                    is_div = 1 if (not r.success or eng in isolated_set) else 0
+                    is_win = 1 if (report.consensus_reached and eng == winner and not is_div) else 0
+                    row = cur.execute(
+                        "SELECT samples, ewma_ms, avg_simd_count, consensus_wins, divergences "
+                        "FROM homeostasis_pgo_profiles WHERE profile_sig=? AND engine=?",
+                        (sig, eng),
+                    ).fetchone()
+                    if row is None:
+                        cur.execute(
+                            "INSERT INTO homeostasis_pgo_profiles "
+                            "(profile_sig, engine, samples, ewma_ms, avg_simd_count, consensus_wins, divergences, updated_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (sig, eng, 1, float(r.elapsed_ms), simd_c, is_win, is_div, now),
+                        )
+                    else:
+                        n, prev_ms, prev_simd, wins, divs = row
+                        alpha = 0.35
+                        new_ms = prev_ms if is_div else ((1.0 - alpha) * prev_ms + alpha * float(r.elapsed_ms))
+                        new_simd = (prev_simd * n + simd_c) / (n + 1)
+                        cur.execute(
+                            "UPDATE homeostasis_pgo_profiles SET samples=?, ewma_ms=?, avg_simd_count=?, "
+                            "consensus_wins=?, divergences=?, updated_at=? WHERE profile_sig=? AND engine=?",
+                            (n + 1, new_ms, new_simd, wins + is_win, divs + is_div, now, sig, eng),
+                        )
+                conn.commit()
+        return sig
+
+    def recommend_engine(
+        self,
+        ssa_funcs: List[SSAFunction],
+        candidate_engines: List[str],
+        host_tier: Optional[str] = None,
+        policy: str = "throughput",
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        sig = self.structural_signature(ssa_funcs, host_tier=host_tier)
+        if not candidate_engines:
+            return None, {"profile_signature": sig, "scores": {}}
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT engine, samples, ewma_ms, avg_simd_count, consensus_wins, divergences "
+                    "FROM homeostasis_pgo_profiles WHERE profile_sig=?",
+                    (sig,),
+                ).fetchall()
+        stats_map = {r[0]: r[1:] for r in rows}
+        scored: Dict[str, float] = {}
+        for eng in candidate_engines:
+            st = stats_map.get(eng)
+            if st is None:
+                continue
+            samples, ewma_ms, avg_simd, wins, divs = st
+            if divs > 0 and divs >= samples:
+                continue
+            reliability = max(0.05, 1.0 - (divs / max(samples, 1)))
+            if policy == "latency":
+                score = reliability / max(ewma_ms, 0.001)
+            else:
+                simd_bonus = 1.0 + min(avg_simd, 32.0) * 0.05
+                win_bonus = 1.0 + (wins / max(samples, 1)) * 0.25
+                score = (reliability * simd_bonus * win_bonus) / max(ewma_ms, 0.005)
+            scored[eng] = round(score, 4)
+        best = max(scored.keys(), key=lambda e: scored[e]) if scored else None
+        return best, {"profile_signature": sig, "scores": scored}
 
 
 @dataclass
@@ -56,11 +226,26 @@ class HomeostasisRouter:
         llvm_backend: Optional[LLVMBackend] = None,
         gcc_backend: Optional[GCCBackend] = None,
         wasm_backend: Optional[WasmBackend] = None,
+        profile_db_path: Optional[str] = None,
     ):
         self.native_jit = native_jit or NativeJitCompiler()
         self.llvm_backend = llvm_backend or LLVMBackend(opt_level=3)
         self.gcc_backend = gcc_backend or GCCBackend(opt_level=3)
         self.wasm_backend = wasm_backend or WasmBackend()
+        self.profile_store = HomeostasisProfileStore(profile_db_path)
+
+    def close(self) -> None:
+        if getattr(self, "profile_store", None) is not None:
+            self.profile_store.close()
+
+    def recommend_engine(
+        self,
+        ssa_funcs: List[SSAFunction],
+        candidate_engines: Optional[List[str]] = None,
+        policy: str = "throughput",
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        cands = list(candidate_engines) if candidate_engines is not None else self.available_engines()
+        return self.profile_store.recommend_engine(ssa_funcs, cands, policy=policy)
 
     def available_engines(self) -> List[str]:
         engines = ["native"]
@@ -433,7 +618,7 @@ class HomeostasisRouter:
         else:
             selected = majority[0].engine if consensus_ok else None
 
-        return HomeostasisReport(
+        report = HomeostasisReport(
             policy=policy,
             function_name=entry_name,
             consensus_reached=consensus_ok,
@@ -445,3 +630,8 @@ class HomeostasisRouter:
             divergences=divergences,
             results_by_engine=results_by_engine,
         )
+        try:
+            self.profile_store.record_report(ssa_funcs, report)
+        except Exception:
+            pass
+        return report
