@@ -19,7 +19,7 @@ from compiler.ssa_ir import SSAVar, SSAFunction, analyze_ssa_constant_offsets, i
 
 try:
     import wasmtime
-    from wasmtime import Config, Engine, Store, Module, Instance
+    from wasmtime import Config, Engine, Store, Module, Instance, Func, FuncType, ValType
     WASMTIME_AVAILABLE = True
 except ImportError:
     WASMTIME_AVAILABLE = False
@@ -168,12 +168,13 @@ class WasmBackend:
             store = Store(self._engine)
             module = Module(self._engine, wasm_code) if isinstance(wasm_code, str) else Module.deserialize(self._engine, wasm_code)
 
-        instance = Instance(store, module, [])
+        instance, stdout_chunks = self._instantiate_with_host_libc(store, module)
         exports = instance.exports(store)
         if func_name not in exports:
             raise ValueError(f"Exported function '{func_name}' not found in WASM module.")
 
         wasm_fn = exports[func_name]
+        self._last_captured_stdout = "".join(stdout_chunks)
         return wasm_fn(store, *args)
 
     def execute_wasm_with_telemetry(
@@ -190,7 +191,7 @@ class WasmBackend:
         store = Store(self._fuel_engine)
         store.set_fuel(fuel_budget)
         module = Module(self._fuel_engine, wasm_code) if isinstance(wasm_code, str) else Module(self._fuel_engine, bytes(wasm_code))
-        instance = Instance(store, module, [])
+        instance, stdout_chunks = self._instantiate_with_host_libc(store, module)
         exports = instance.exports(store)
         res = exports[func_name](store, *args)
         remaining = store.get_fuel()
@@ -199,6 +200,7 @@ class WasmBackend:
             "fuel_budget": fuel_budget,
             "fuel_remaining": remaining,
             "fuel_consumed": fuel_budget - remaining,
+            "captured_stdout": "".join(stdout_chunks),
         }
 
     # ------------------------------------------------------------------
@@ -211,9 +213,140 @@ class WasmBackend:
         "f32": (4, "f32.load"), "i64": (8, "i64.load"), "u64": (8, "i64.load"), "f64": (8, "f64.load"),
     }
 
+    _WASM_HEAP_LIBC = frozenset({"malloc", "calloc", "realloc", "free"})
+    _WASM_MEM_STR_MATH_LIBC = frozenset({"memcpy", "memmove", "memset", "strlen", "strcmp", "abs", "labs"})
+    _WASM_STDIO_LIBC = frozenset({"printf", "puts", "putchar"})
+    _WASM_ALL_LIBC = _WASM_HEAP_LIBC | _WASM_MEM_STR_MATH_LIBC | _WASM_STDIO_LIBC
+
+    @staticmethod
+    def _read_guest_cstr(memory: Any, store: Any, ptr: int, max_len: int = 4096) -> str:
+        """Reads a NUL-terminated UTF-8 string from WASM Linear Memory starting at `ptr`."""
+        mem_len = memory.data_len(store)
+        addr = int(ptr) & 0xFFFFFFFF
+        if addr <= 0 or addr >= mem_len:
+            return ""
+        end = min(mem_len, addr + max_len)
+        raw = bytes(memory.read(store, addr, end))
+        nul = raw.find(b"\x00")
+        if nul != -1:
+            raw = raw[:nul]
+        return raw.decode("utf-8", errors="replace")
+
     @classmethod
-    def _build_wat_rodata(cls, ssa_funcs: List[SSAFunction]) -> Tuple[Dict[Tuple[str, str], Tuple[int, str, int]], List[str]]:
-        """Assigns linear-memory .rodata addresses >= 245760 (0x3C000) and emits WAT (data ...) directives."""
+    def _format_guest_printf(
+        cls,
+        memory: Any,
+        store: Any,
+        fmt_ptr: int,
+        abuf_ptr: int,
+        nargs: int,
+        type_mask: int,
+    ) -> str:
+        """Formats a variadic C `printf` call reading format and args from WASM linear memory."""
+        fmt = cls._read_guest_cstr(memory, store, fmt_ptr)
+        parsed_args: List[Any] = []
+        base_buf = int(abuf_ptr) & 0xFFFFFFFF
+        for idx in range(max(0, int(nargs))):
+            slot = base_buf + idx * 8
+            raw = bytes(memory.read(store, slot, slot + 8))
+            if (int(type_mask) >> idx) & 1:
+                parsed_args.append(struct.unpack("<d", raw)[0])
+            else:
+                parsed_args.append(struct.unpack("<q", raw)[0])
+
+        out_parts: List[str] = []
+        pos = 0
+        arg_i = 0
+        spec_re = re.compile(r"%(%|[-+#0 ]*(?:\d+)?(?:\.\d+)?(?:ll|l|h|hh|z)?([diuoxXfFeEgGcsp]))")
+        for m in spec_re.finditer(fmt):
+            out_parts.append(fmt[pos:m.start()])
+            pos = m.end()
+            full_spec = m.group(0)
+            conv = m.group(2)
+            if m.group(1) == "%":
+                out_parts.append("%")
+                continue
+            val = parsed_args[arg_i] if arg_i < len(parsed_args) else 0
+            arg_i += 1
+            if conv == "s":
+                out_parts.append(cls._read_guest_cstr(memory, store, int(val)) if isinstance(val, int) else str(val))
+            elif conv == "c":
+                out_parts.append(chr(int(val) & 0xFF))
+            elif conv == "p":
+                out_parts.append(hex(int(val) & 0xFFFFFFFFFFFFFFFF))
+            elif conv in ("f", "F", "e", "E", "g", "G"):
+                py_spec = full_spec.replace("ll", "").replace("l", "").replace("h", "").replace("z", "")
+                out_parts.append(py_spec % float(val))
+            elif conv in ("u", "x", "X", "o"):
+                is_64 = "ll" in full_spec or "l" in full_spec or "z" in full_spec
+                uval = (int(val) & 0xFFFFFFFFFFFFFFFF) if is_64 else (int(val) & 0xFFFFFFFF)
+                if conv == "u":
+                    out_parts.append(str(uval))
+                else:
+                    py_spec = full_spec.replace("ll", "").replace("l", "").replace("h", "").replace("z", "")
+                    out_parts.append(py_spec % uval)
+            else:
+                py_spec = re.sub(r"(?:ll|l|h|hh|z)", "", full_spec)
+                if conv in ("i", "u"):
+                    py_spec = py_spec[:-1] + "d"
+                v_i = (int(val) & 0xFFFFFFFFFFFFFFFF) if (conv == "u" and ("ll" in full_spec or "l" in full_spec or "z" in full_spec)) else (
+                    (int(val) & 0xFFFFFFFF) if conv == "u" else int(val)
+                )
+                out_parts.append(py_spec % v_i)
+        out_parts.append(fmt[pos:])
+        return "".join(out_parts)
+
+    def _instantiate_with_host_libc(self, store: Any, module: Any) -> Tuple[Any, List[str]]:
+        """Instantiates a compiled WASM `Module`, auto-binding `env` host stdio imports if requested."""
+        stdout_chunks: List[str] = []
+        mem_holder: Dict[str, Any] = {}
+        imports: List[Any] = []
+        i64_ty = ValType.i64()
+
+        for imp in module.imports:
+            if imp.module != "env":
+                raise RuntimeError(f"Unsupported WASM import module '{imp.module}.{imp.name}'.")
+            if imp.name == "__omni_printf_host":
+                def _printf_cb(fmt_p: int, abuf_p: int, nargs: int, tmask: int) -> int:
+                    mem = mem_holder.get("memory")
+                    if mem is None:
+                        return 0
+                    rendered = self._format_guest_printf(mem, store, fmt_p, abuf_p, nargs, tmask)
+                    stdout_chunks.append(rendered)
+                    return len(rendered.encode("utf-8"))
+
+                imports.append(Func(store, FuncType([i64_ty, i64_ty, i64_ty, i64_ty], [i64_ty]), _printf_cb))
+            elif imp.name == "__omni_puts_host":
+                def _puts_cb(str_p: int) -> int:
+                    mem = mem_holder.get("memory")
+                    if mem is None:
+                        return 0
+                    s_txt = self._read_guest_cstr(mem, store, str_p) + "\n"
+                    stdout_chunks.append(s_txt)
+                    return len(s_txt.encode("utf-8"))
+
+                imports.append(Func(store, FuncType([i64_ty], [i64_ty]), _puts_cb))
+            elif imp.name == "__omni_putchar_host":
+                def _putchar_cb(ch: int) -> int:
+                    c = chr(int(ch) & 0xFF)
+                    stdout_chunks.append(c)
+                    return int(ch) & 0xFF
+
+                imports.append(Func(store, FuncType([i64_ty], [i64_ty]), _putchar_cb))
+            else:
+                raise RuntimeError(f"Unsupported WASM host libc import '{imp.module}.{imp.name}'.")
+
+        instance = Instance(store, module, imports)
+        exports = instance.exports(store)
+        if "memory" in exports:
+            mem_holder["memory"] = exports["memory"]
+        return instance, stdout_chunks
+
+    @classmethod
+    def _build_wat_rodata_with_bounds(
+        cls, ssa_funcs: List[SSAFunction]
+    ) -> Tuple[Dict[Tuple[str, str], Tuple[int, str, int]], List[str], int]:
+        """Assigns linear-memory .rodata addresses >= 245760 (0x3C000) and returns `(addr_map, data_lines, ro_end)`."""
         from compiler.native_codegen import _pack_lut_bytes
         ro_cursor = 245760  # Page 3 (0x3C000) cleanly disjoint from user vectors at < 240 KiB
         addr_map: Dict[Tuple[str, str], Tuple[int, str, int]] = {}
@@ -233,6 +366,12 @@ class WasmBackend:
                 data_lines.append(f'  (data (i32.const {ro_cursor}) "{esc}")')
                 addr_map[(fn.name, f"__cstr_{c_name}")] = (ro_cursor, "u8", 1)
                 ro_cursor += max(8, len(raw_b))
+        return addr_map, data_lines, ro_cursor
+
+    @classmethod
+    def _build_wat_rodata(cls, ssa_funcs: List[SSAFunction]) -> Tuple[Dict[Tuple[str, str], Tuple[int, str, int]], List[str]]:
+        """Assigns linear-memory .rodata addresses >= 245760 (0x3C000) and emits WAT (data ...) directives."""
+        addr_map, data_lines, _ = cls._build_wat_rodata_with_bounds(ssa_funcs)
         return addr_map, data_lines
 
     def _ssa_function_to_wat_func(
@@ -277,10 +416,17 @@ class WasmBackend:
             for b in ssa_func.blocks
             for ins in b.instructions
         )
+        uses_printf = any(
+            ins.opcode.lower() == "call" and ins.operands and str(ins.operands[0]) == "printf"
+            for b in ssa_func.blocks
+            for ins in b.instructions
+        )
         if is_multiblock:
             wat_lines.append("    (local $__bb i32)")
         if has_alloca:
             wat_lines.append("    (local $__sp_save i32)")
+        if uses_printf:
+            wat_lines.append("    (local $__pbuf i32)")
         for l_name in sorted(var_locals | phi_tmps):
             wat_lines.append(f"    (local ${l_name} {local_types.get(l_name, 'i64')})")
         if has_alloca:
@@ -696,10 +842,70 @@ class WasmBackend:
                     set_result(inst.result, indent)
                 elif opcode == "call":
                     callee = str(inst.operands[0])
-                    for a in inst.operands[1:]:
-                        wat_lines.append(f"{indent}{emit_operand(a)}")
-                    wat_lines.append(f"{indent}call ${callee}")
-                    set_result(inst.result, indent)
+                    if callee == "printf":
+                        fmt_op = inst.operands[1] if len(inst.operands) > 1 else 0
+                        varargs = list(inst.operands[2:])
+                        nargs = len(varargs)
+                        if nargs > 0:
+                            buf_bytes = ((nargs * 8) + 15) & ~15
+                            wat_lines.append(f"{indent}global.get $__omni_sp")
+                            wat_lines.append(f"{indent}local.tee $__pbuf")
+                            wat_lines.append(f"{indent}i32.const {buf_bytes}")
+                            wat_lines.append(f"{indent}i32.add")
+                            wat_lines.append(f"{indent}global.set $__omni_sp")
+                            tmask = 0
+                            for idx_v, vop in enumerate(varargs):
+                                is_fp_v = isinstance(vop, float) or (isinstance(vop, SSAVar) and vop.var_type == "f64")
+                                if is_fp_v:
+                                    tmask |= (1 << idx_v)
+                                wat_lines.append(f"{indent}local.get $__pbuf")
+                                if idx_v > 0:
+                                    wat_lines.append(f"{indent}i32.const {idx_v * 8}")
+                                    wat_lines.append(f"{indent}i32.add")
+                                wat_lines.append(f"{indent}{emit_operand(vop)}")
+                                wat_lines.append(f"{indent}{'f64.store' if is_fp_v else 'i64.store'}")
+                            wat_lines.append(f"{indent}{emit_operand(fmt_op)}")
+                            wat_lines.append(f"{indent}local.get $__pbuf")
+                            wat_lines.append(f"{indent}i64.extend_i32_u")
+                            wat_lines.append(f"{indent}i64.const {nargs}")
+                            wat_lines.append(f"{indent}i64.const {tmask}")
+                            wat_lines.append(f"{indent}call $__omni_printf_host")
+                            wat_lines.append(f"{indent}local.get $__pbuf")
+                            wat_lines.append(f"{indent}global.set $__omni_sp")
+                        else:
+                            wat_lines.append(f"{indent}{emit_operand(fmt_op)}")
+                            wat_lines.append(f"{indent}i64.const 0")
+                            wat_lines.append(f"{indent}i64.const 0")
+                            wat_lines.append(f"{indent}i64.const 0")
+                            wat_lines.append(f"{indent}call $__omni_printf_host")
+                        if inst.result is not None:
+                            set_result(inst.result, indent)
+                        else:
+                            wat_lines.append(f"{indent}drop")
+                    elif callee == "puts":
+                        s_op = inst.operands[1] if len(inst.operands) > 1 else 0
+                        wat_lines.append(f"{indent}{emit_operand(s_op)}")
+                        wat_lines.append(f"{indent}call $__omni_puts_host")
+                        if inst.result is not None:
+                            set_result(inst.result, indent)
+                        else:
+                            wat_lines.append(f"{indent}drop")
+                    elif callee == "putchar":
+                        c_op = inst.operands[1] if len(inst.operands) > 1 else 0
+                        wat_lines.append(f"{indent}{emit_operand(c_op)}")
+                        wat_lines.append(f"{indent}call $__omni_putchar_host")
+                        if inst.result is not None:
+                            set_result(inst.result, indent)
+                        else:
+                            wat_lines.append(f"{indent}drop")
+                    else:
+                        for a in inst.operands[1:]:
+                            wat_lines.append(f"{indent}{emit_operand(a)}")
+                        wat_lines.append(f"{indent}call ${callee}")
+                        if inst.result is not None:
+                            set_result(inst.result, indent)
+                        else:
+                            wat_lines.append(f"{indent}drop")
                 elif opcode == "br":
                     succ_n = str(inst.operands[0])
                     emit_phi_edge(block.name, succ_n, indent)
@@ -813,7 +1019,7 @@ class WasmBackend:
             store = Store(eng)
 
         module = Module(eng, wat_text)
-        instance = Instance(store, module, [])
+        instance, stdout_chunks = self._instantiate_with_host_libc(store, module)
         exports = instance.exports(store)
         if entry_name not in exports:
             raise ValueError(f"Exported function '{entry_name}' not found in compiled WASM module.")
@@ -832,6 +1038,15 @@ class WasmBackend:
         if cursor > current_bytes:
             extra_pages = (cursor - current_bytes + 65535) // 65536
             memory.grow(store, extra_pages)
+
+        if "__omni_heap_ptr" in exports:
+            heap_global = exports["__omni_heap_ptr"]
+            safe_heap = max(int(heap_global.value(store)), (cursor + 4095) & ~4095)
+            cur_len = memory.data_len(store)
+            if safe_heap > cur_len:
+                extra_hp_pages = (safe_heap - cur_len + 65535) // 65536
+                memory.grow(store, extra_hp_pages)
+            heap_global.set_value(store, safe_heap)
 
         for addr in ordered_addrs:
             raw = mem_regions[addr]
@@ -855,6 +1070,8 @@ class WasmBackend:
         raw_ret = exports[entry_name](store, *wasm_args)
         if fuel_budget is not None and self._fuel_engine is not None:
             stats["fuel_consumed"] = fuel_budget - store.get_fuel()
+        if stdout_chunks:
+            stats["captured_stdout"] = "".join(stdout_chunks)
 
         ret_is_fp = getattr(entry_fn, "return_type", "i64") in ("f64", "f32", "float", "double")
         if ret_is_fp:
@@ -876,23 +1093,305 @@ class WasmBackend:
         """
         return self.ssa_module_to_wat([ssa_func])
 
+    @classmethod
+    def _emit_wat_libc_runtime(cls, needed_libc: set) -> List[str]:
+        """Emits pure-WAT synthesized heap/memory/string/math libc functions referenced by SSA."""
+        funcs: List[str] = []
+        uses_heap = bool(needed_libc & cls._WASM_HEAP_LIBC)
+        if uses_heap or "malloc" in needed_libc or "realloc" in needed_libc or "calloc" in needed_libc:
+            funcs.append("""  (func $malloc (param $size i64) (result i64)
+    (local $req i32)
+    (local $hdr i32)
+    (local $user i32)
+    (local $new_end i32)
+    (local $cur_bytes i32)
+    (local $extra_pages i32)
+    (local.set $req (i32.wrap_i64 (local.get $size)))
+    (if (i32.lt_s (local.get $req) (i32.const 8))
+      (then (local.set $req (i32.const 8)))
+    )
+    (local.set $req (i32.and (i32.add (local.get $req) (i32.const 15)) (i32.const -16)))
+    (local.set $hdr (i32.and (i32.add (global.get $__omni_heap_ptr) (i32.const 15)) (i32.const -16)))
+    (local.set $user (i32.add (local.get $hdr) (i32.const 16)))
+    (local.set $new_end (i32.add (local.get $user) (local.get $req)))
+    (local.set $cur_bytes (i32.shl (memory.size) (i32.const 16)))
+    (if (i32.gt_u (local.get $new_end) (local.get $cur_bytes))
+      (then
+        (local.set $extra_pages
+          (i32.div_u
+            (i32.add (i32.sub (local.get $new_end) (local.get $cur_bytes)) (i32.const 65535))
+            (i32.const 65536)
+          )
+        )
+        (if (i32.eq (memory.grow (local.get $extra_pages)) (i32.const -1))
+          (then (return (i64.const 0)))
+        )
+      )
+    )
+    (i64.store (local.get $hdr) (i64.extend_i32_u (local.get $req)))
+    (i64.store (i32.add (local.get $hdr) (i32.const 8)) (i64.const 1330466377))
+    (global.set $__omni_heap_ptr (local.get $new_end))
+    (i64.extend_i32_u (local.get $user))
+  )""")
+        if uses_heap or "free" in needed_libc or "realloc" in needed_libc:
+            funcs.append("""  (func $free (param $ptr i64) (result i64)
+    (local $p32 i32)
+    (local $hdr i32)
+    (local $sz i32)
+    (if (i64.ne (local.get $ptr) (i64.const 0))
+      (then
+        (local.set $p32 (i32.wrap_i64 (local.get $ptr)))
+        (if (i32.ge_u (local.get $p32) (i32.const 16))
+          (then
+            (local.set $hdr (i32.sub (local.get $p32) (i32.const 16)))
+            (if (i64.eq (i64.load (i32.add (local.get $hdr) (i32.const 8))) (i64.const 1330466377))
+              (then
+                (local.set $sz (i32.wrap_i64 (i64.load (local.get $hdr))))
+                (i64.store (i32.add (local.get $hdr) (i32.const 8)) (i64.const 0))
+                (if (i32.eq (i32.add (local.get $p32) (local.get $sz)) (global.get $__omni_heap_ptr))
+                  (then (global.set $__omni_heap_ptr (local.get $hdr)))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+    (i64.const 0)
+  )""")
+        if "calloc" in needed_libc:
+            funcs.append("""  (func $calloc (param $nmemb i64) (param $size i64) (result i64)
+    (local $total i64)
+    (local $ptr i64)
+    (local $p32 i32)
+    (local $n32 i32)
+    (local $i i32)
+    (local.set $total (i64.mul (local.get $nmemb) (local.get $size)))
+    (local.set $ptr (call $malloc (local.get $total)))
+    (if (i64.ne (local.get $ptr) (i64.const 0))
+      (then
+        (local.set $p32 (i32.wrap_i64 (local.get $ptr)))
+        (local.set $n32 (i32.wrap_i64 (local.get $total)))
+        (local.set $i (i32.const 0))
+        (block $cz_done
+          (loop $cz_loop
+            (br_if $cz_done (i32.ge_u (local.get $i) (local.get $n32)))
+            (i32.store8 (i32.add (local.get $p32) (local.get $i)) (i32.const 0))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $cz_loop)
+          )
+        )
+      )
+    )
+    (local.get $ptr)
+  )""")
+        if "realloc" in needed_libc:
+            funcs.append("""  (func $realloc (param $ptr i64) (param $new_size i64) (result i64)
+    (local $new_ptr i64)
+    (local $old_p32 i32)
+    (local $new_p32 i32)
+    (local $old_sz i32)
+    (local $req_sz i32)
+    (local $copy_n i32)
+    (local $i i32)
+    (if (i64.eq (local.get $ptr) (i64.const 0))
+      (then (return (call $malloc (local.get $new_size))))
+    )
+    (if (i64.le_s (local.get $new_size) (i64.const 0))
+      (then
+        (drop (call $free (local.get $ptr)))
+        (return (i64.const 0))
+      )
+    )
+    (local.set $old_p32 (i32.wrap_i64 (local.get $ptr)))
+    (local.set $old_sz (i32.wrap_i64 (i64.load (i32.sub (local.get $old_p32) (i32.const 16)))))
+    (local.set $new_ptr (call $malloc (local.get $new_size)))
+    (if (i64.eq (local.get $new_ptr) (i64.const 0))
+      (then (return (i64.const 0)))
+    )
+    (local.set $new_p32 (i32.wrap_i64 (local.get $new_ptr)))
+    (local.set $req_sz (i32.wrap_i64 (local.get $new_size)))
+    (local.set $copy_n (select (local.get $old_sz) (local.get $req_sz) (i32.lt_u (local.get $old_sz) (local.get $req_sz))))
+    (local.set $i (i32.const 0))
+    (block $rc_done
+      (loop $rc_loop
+        (br_if $rc_done (i32.ge_u (local.get $i) (local.get $copy_n)))
+        (i32.store8 (i32.add (local.get $new_p32) (local.get $i)) (i32.load8_u (i32.add (local.get $old_p32) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $rc_loop)
+      )
+    )
+    (drop (call $free (local.get $ptr)))
+    (local.get $new_ptr)
+  )""")
+        if "memcpy" in needed_libc:
+            funcs.append("""  (func $memcpy (param $dst i64) (param $src i64) (param $n i64) (result i64)
+    (local $d32 i32)
+    (local $s32 i32)
+    (local $n32 i32)
+    (local $i i32)
+    (local.set $d32 (i32.wrap_i64 (local.get $dst)))
+    (local.set $s32 (i32.wrap_i64 (local.get $src)))
+    (local.set $n32 (i32.wrap_i64 (local.get $n)))
+    (local.set $i (i32.const 0))
+    (block $mc_done
+      (loop $mc_loop
+        (br_if $mc_done (i32.ge_u (local.get $i) (local.get $n32)))
+        (i32.store8 (i32.add (local.get $d32) (local.get $i)) (i32.load8_u (i32.add (local.get $s32) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $mc_loop)
+      )
+    )
+    (local.get $dst)
+  )""")
+        if "memmove" in needed_libc:
+            funcs.append("""  (func $memmove (param $dst i64) (param $src i64) (param $n i64) (result i64)
+    (local $d32 i32)
+    (local $s32 i32)
+    (local $n32 i32)
+    (local $i i32)
+    (local.set $d32 (i32.wrap_i64 (local.get $dst)))
+    (local.set $s32 (i32.wrap_i64 (local.get $src)))
+    (local.set $n32 (i32.wrap_i64 (local.get $n)))
+    (if (i32.le_u (local.get $d32) (local.get $s32))
+      (then
+        (local.set $i (i32.const 0))
+        (block $mf_done
+          (loop $mf_loop
+            (br_if $mf_done (i32.ge_u (local.get $i) (local.get $n32)))
+            (i32.store8 (i32.add (local.get $d32) (local.get $i)) (i32.load8_u (i32.add (local.get $s32) (local.get $i))))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $mf_loop)
+          )
+        )
+      )
+      (else
+        (local.set $i (local.get $n32))
+        (block $mb_done
+          (loop $mb_loop
+            (br_if $mb_done (i32.le_s (local.get $i) (i32.const 0)))
+            (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+            (i32.store8 (i32.add (local.get $d32) (local.get $i)) (i32.load8_u (i32.add (local.get $s32) (local.get $i))))
+            (br $mb_loop)
+          )
+        )
+      )
+    )
+    (local.get $dst)
+  )""")
+        if "memset" in needed_libc:
+            funcs.append("""  (func $memset (param $dst i64) (param $ch i64) (param $n i64) (result i64)
+    (local $d32 i32)
+    (local $c32 i32)
+    (local $n32 i32)
+    (local $i i32)
+    (local.set $d32 (i32.wrap_i64 (local.get $dst)))
+    (local.set $c32 (i32.and (i32.wrap_i64 (local.get $ch)) (i32.const 255)))
+    (local.set $n32 (i32.wrap_i64 (local.get $n)))
+    (local.set $i (i32.const 0))
+    (block $ms_done
+      (loop $ms_loop
+        (br_if $ms_done (i32.ge_u (local.get $i) (local.get $n32)))
+        (i32.store8 (i32.add (local.get $d32) (local.get $i)) (local.get $c32))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $ms_loop)
+      )
+    )
+    (local.get $dst)
+  )""")
+        if "strlen" in needed_libc:
+            funcs.append("""  (func $strlen (param $s i64) (result i64)
+    (local $p32 i32)
+    (local $n i32)
+    (local.set $p32 (i32.wrap_i64 (local.get $s)))
+    (local.set $n (i32.const 0))
+    (block $sl_done
+      (loop $sl_loop
+        (br_if $sl_done (i32.eqz (i32.load8_u (i32.add (local.get $p32) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $sl_loop)
+      )
+    )
+    (i64.extend_i32_u (local.get $n))
+  )""")
+        if "strcmp" in needed_libc:
+            funcs.append("""  (func $strcmp (param $a i64) (param $b i64) (result i64)
+    (local $a32 i32)
+    (local $b32 i32)
+    (local $i i32)
+    (local $ca i32)
+    (local $cb i32)
+    (local.set $a32 (i32.wrap_i64 (local.get $a)))
+    (local.set $b32 (i32.wrap_i64 (local.get $b)))
+    (local.set $i (i32.const 0))
+    (block $sc_done
+      (loop $sc_loop
+        (local.set $ca (i32.load8_u (i32.add (local.get $a32) (local.get $i))))
+        (local.set $cb (i32.load8_u (i32.add (local.get $b32) (local.get $i))))
+        (br_if $sc_done (i32.or (i32.ne (local.get $ca) (local.get $cb)) (i32.eqz (local.get $ca))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $sc_loop)
+      )
+    )
+    (i64.extend_i32_s (i32.sub (local.get $ca) (local.get $cb)))
+  )""")
+        if "abs" in needed_libc:
+            funcs.append("""  (func $abs (param $x i64) (result i64)
+    (if (result i64) (i64.lt_s (local.get $x) (i64.const 0))
+      (then (i64.sub (i64.const 0) (local.get $x)))
+      (else (local.get $x))
+    )
+  )""")
+        if "labs" in needed_libc:
+            funcs.append("""  (func $labs (param $x i64) (result i64)
+    (if (result i64) (i64.lt_s (local.get $x) (i64.const 0))
+      (then (i64.sub (i64.const 0) (local.get $x)))
+      (else (local.get $x))
+    )
+  )""")
+        return funcs
+
     def ssa_module_to_wat(self, ssa_funcs: List[SSAFunction]) -> str:
         """Lowers multiple `SSAFunction`s into a unified multi-export WAT module."""
-        lut_map, data_lines = self._build_wat_rodata(ssa_funcs)
+        lut_map, data_lines, ro_end = self._build_wat_rodata_with_bounds(ssa_funcs)
+        defined_names = {fn.name for fn in ssa_funcs}
+        external_callees = {
+            str(ins.operands[0])
+            for fn in ssa_funcs
+            for b in fn.blocks
+            for ins in b.instructions
+            if ins.opcode.lower() == "call" and ins.operands and str(ins.operands[0]) not in defined_names
+        }
+        needed_libc = external_callees & self._WASM_ALL_LIBC
         has_alloca = any(
             ins.opcode.lower() == "alloca"
             for fn in ssa_funcs
             for b in fn.blocks
             for ins in b.instructions
         )
-        pages = 4 if (data_lines or has_alloca) else 2
-        parts = [
-            "(module",
-            f'  (memory (export "memory") {pages})',
-        ]
-        if has_alloca:
+        uses_heap = bool(needed_libc & self._WASM_HEAP_LIBC)
+        uses_sp = has_alloca or ("printf" in needed_libc)
+
+        heap_start = max(524288, (ro_end + 65535) & ~65535)
+        ro_pages = max(2, (ro_end + 65535) // 65536) if data_lines else 2
+        pages = max(4 if (data_lines or uses_sp) else 2, ro_pages)
+        if uses_heap:
+            pages = max(pages, (heap_start + 65535) // 65536 + 1)
+
+        parts = ["(module"]
+        if "printf" in needed_libc:
+            parts.append('  (import "env" "__omni_printf_host" (func $__omni_printf_host (param i64 i64 i64 i64) (result i64)))')
+        if "puts" in needed_libc:
+            parts.append('  (import "env" "__omni_puts_host" (func $__omni_puts_host (param i64) (result i64)))')
+        if "putchar" in needed_libc:
+            parts.append('  (import "env" "__omni_putchar_host" (func $__omni_putchar_host (param i64) (result i64)))')
+        parts.append(f'  (memory (export "memory") {pages})')
+        if uses_sp:
             parts.append("  (global $__omni_sp (mut i32) (i32.const 196608))")
+        if uses_heap:
+            parts.append(f'  (global $__omni_heap_ptr (export "__omni_heap_ptr") (mut i32) (i32.const {heap_start}))')
         parts.extend(data_lines)
+        parts.extend(self._emit_wat_libc_runtime(needed_libc))
         for fn in ssa_funcs:
             parts.append(self._ssa_function_to_wat_func(fn, lut_addr_map=lut_map))
         parts.append(")")

@@ -610,11 +610,85 @@ class GCCBackend:
                         if has_res:
                             lines.append(f"    {lhs} = {call_expr};")
                             last_val = lhs
+                        else:
+                            lines.append(f"    (void){call_expr};")
+                    elif callee == "calloc":
+                        n_a = ops[1] if len(ops) > 1 else "0"
+                        sz_a = ops[2] if len(ops) > 2 else "0"
+                        call_expr = f"(int64_t)(uintptr_t)calloc((size_t)({n_a}), (size_t)({sz_a}))"
+                        if has_res:
+                            lines.append(f"    {lhs} = {call_expr};")
+                            last_val = lhs
+                        else:
+                            lines.append(f"    (void){call_expr};")
+                    elif callee == "realloc":
+                        p_a = ops[1] if len(ops) > 1 else "0"
+                        sz_a = ops[2] if len(ops) > 2 else "0"
+                        call_expr = f"(int64_t)(uintptr_t)realloc((void *)(uintptr_t)({p_a}), (size_t)({sz_a}))"
+                        if has_res:
+                            lines.append(f"    {lhs} = {call_expr};")
+                            last_val = lhs
+                        else:
+                            lines.append(f"    (void){call_expr};")
                     elif callee == "free":
                         p_a = ops[1] if len(ops) > 1 else "0"
                         lines.append(f"    free((void *)(uintptr_t)({p_a}));")
                         if has_res:
                             lines.append(f"    {lhs} = 0;")
+                            last_val = lhs
+                    elif callee in ("memcpy", "memmove"):
+                        d_a = ops[1] if len(ops) > 1 else "0"
+                        s_a = ops[2] if len(ops) > 2 else "0"
+                        n_a = ops[3] if len(ops) > 3 else "0"
+                        call_expr = f"(int64_t)(uintptr_t){callee}((void *)(uintptr_t)({d_a}), (const void *)(uintptr_t)({s_a}), (size_t)({n_a}))"
+                        if has_res:
+                            lines.append(f"    {lhs} = {call_expr};")
+                            last_val = lhs
+                        else:
+                            lines.append(f"    (void){call_expr};")
+                    elif callee == "memset":
+                        d_a = ops[1] if len(ops) > 1 else "0"
+                        c_a = ops[2] if len(ops) > 2 else "0"
+                        n_a = ops[3] if len(ops) > 3 else "0"
+                        call_expr = f"(int64_t)(uintptr_t)memset((void *)(uintptr_t)({d_a}), (int)({c_a}), (size_t)({n_a}))"
+                        if has_res:
+                            lines.append(f"    {lhs} = {call_expr};")
+                            last_val = lhs
+                        else:
+                            lines.append(f"    (void){call_expr};")
+                    elif callee == "strlen":
+                        s_a = ops[1] if len(ops) > 1 else "0"
+                        call_expr = f"(int64_t)strlen((const char *)(uintptr_t)({s_a}))"
+                        if has_res:
+                            lines.append(f"    {lhs} = {call_expr};")
+                            last_val = lhs
+                    elif callee == "strcmp":
+                        a_a = ops[1] if len(ops) > 1 else "0"
+                        b_a = ops[2] if len(ops) > 2 else "0"
+                        call_expr = f"(int64_t)strcmp((const char *)(uintptr_t)({a_a}), (const char *)(uintptr_t)({b_a}))"
+                        if has_res:
+                            lines.append(f"    {lhs} = {call_expr};")
+                            last_val = lhs
+                    elif callee == "puts":
+                        s_a = ops[1] if len(ops) > 1 else "0"
+                        call_expr = f"(int64_t)puts((const char *)(uintptr_t)({s_a}))"
+                        if has_res:
+                            lines.append(f"    {lhs} = {call_expr};")
+                            last_val = lhs
+                        else:
+                            lines.append(f"    (void){call_expr};")
+                    elif callee == "putchar":
+                        c_a = ops[1] if len(ops) > 1 else "0"
+                        call_expr = f"(int64_t)putchar((int)({c_a}))"
+                        if has_res:
+                            lines.append(f"    {lhs} = {call_expr};")
+                            last_val = lhs
+                        else:
+                            lines.append(f"    (void){call_expr};")
+                    elif callee in ("abs", "labs"):
+                        x_a = ops[1] if len(ops) > 1 else "0"
+                        if has_res:
+                            lines.append(f"    {lhs} = (int64_t)llabs((long long)({x_a}));")
                             last_val = lhs
                     else:
                         if declared_externals is not None and (defined_funcs is None or callee not in defined_funcs):
@@ -686,6 +760,7 @@ class GCCBackend:
             "#include <stddef.h>",
             "#include <stdio.h>",
             "#include <stdlib.h>",
+            "#include <string.h>",
             "",
         ]
         header.extend(sorted(externals.values()))

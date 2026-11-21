@@ -2844,10 +2844,15 @@ class Arm64CodeGenerator:
 class NativeCodeGenerator:
     """Unified Multi-Architecture Codegen Dispatcher (`x86_64` & `arm64`)."""
 
-    def __init__(self, arch: str = "x86_64", target_os: Optional[str] = None):
+    def __init__(
+        self,
+        arch: str = "x86_64",
+        target_os: Optional[str] = None,
+        enable_avx512: Optional[bool] = None,
+    ):
         self.arch = arch.lower()
         self.target_os = target_os
-        self.x64 = X64CodeGenerator(target_os=target_os)
+        self.x64 = X64CodeGenerator(target_os=target_os, enable_avx512=enable_avx512)
         self.arm64 = Arm64CodeGenerator()
 
     def compile_ssa(self, fn: SSAFunction) -> CompiledFunctionArtifact:

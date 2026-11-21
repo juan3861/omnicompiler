@@ -311,6 +311,7 @@ class OmniRepoCompiler:
         speculative_targets: Optional[Dict[str, Tuple[int, str]]] = None,
         homeostasis_policy: str = "consensus",
         homeostasis_probes: Optional[Dict[str, Any]] = None,
+        homeostasis_function_overrides: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Executes the full 9-stage multi-repository compilation pipeline with real AST->SSA->Native/LLVM/GCC/WASM
@@ -329,6 +330,15 @@ class OmniRepoCompiler:
             raise ValueError(
                 f"Unsupported homeostasis_policy '{homeostasis_policy}'. Expected 'consensus', 'throughput', or 'latency'."
             )
+        normalized_homeo_overrides: Dict[str, str] = {}
+        if homeostasis_function_overrides:
+            for o_fn, o_eng in homeostasis_function_overrides.items():
+                eng_norm = str(o_eng).lower().strip()
+                if eng_norm not in ("native", "llvm", "gcc"):
+                    raise ValueError(
+                        f"Unsupported homeostasis emitter override '{o_eng}' for '{o_fn}'. Expected 'native', 'llvm', or 'gcc'."
+                    )
+                normalized_homeo_overrides[str(o_fn)] = eng_norm
 
         results: Dict[str, Any] = {"stages": {}}
         effective_os = (target_os.lower() if target_os else ("windows" if sys.platform == "win32" else "linux"))
@@ -554,7 +564,16 @@ class OmniRepoCompiler:
             k: v for k, v in all_ast_funcs.items() if k in retained_export_names
         }
         native_compilable_syms = _compute_native_compilable_set(compilable_ast_pool)
-        codegen = NativeCodeGenerator(arch=effective_arch, target_os=effective_os)
+        from compiler.native_codegen import detect_host_simd_features
+        host_os_name = "windows" if sys.platform == "win32" else "linux"
+        host_avx512 = bool(
+            effective_arch == "x86_64"
+            and effective_os == host_os_name
+            and detect_host_simd_features().get("avx512f", False)
+        )
+        host_vec_lanes = 8 if host_avx512 else None
+        host_unroll_factor = 8 if host_avx512 else 4
+        codegen = NativeCodeGenerator(arch=effective_arch, target_os=effective_os, enable_avx512=host_avx512)
 
         compiled_artifacts: Dict[str, CompiledFunctionArtifact] = {}
         real_ast_compiled_count = 0
@@ -712,7 +731,9 @@ class OmniRepoCompiler:
                     # 2. Loop Auto-Vectorizer
                     try:
                         from compiler.loop_vectorizer import LoopVectorizerPass
-                        ssa_fn, vec_stats = LoopVectorizerPass().vectorize_function(ssa_fn)
+                        ssa_fn, vec_stats = LoopVectorizerPass().vectorize_function(
+                            ssa_fn, vector_lanes=host_vec_lanes
+                        )
                         vectorized_loops += sum(vec_stats.values())
                     except Exception:
                         pass
@@ -736,7 +757,7 @@ class OmniRepoCompiler:
                     # 5. Loop Unrolling Pass
                     try:
                         from compiler.polyhedral_tiler import LoopUnrollPass
-                        ssa_fn, unroll_stats = LoopUnrollPass(unroll_factor=4).unroll_function(ssa_fn)
+                        ssa_fn, unroll_stats = LoopUnrollPass(unroll_factor=host_unroll_factor).unroll_function(ssa_fn)
                         unrolled_loops += unroll_stats.get("unrolled_loops", 0)
                     except Exception:
                         pass
@@ -1119,6 +1140,7 @@ class OmniRepoCompiler:
         homeostasis_pgo_rec: Optional[str] = None
         homeostasis_pgo_sig: Optional[str] = None
         homeostasis_emitter_used = "native"
+        homeostasis_function_emitters: Dict[str, str] = {}
         for m, obj_mod, stub_list in repo_order_objs:
             repo_ssas = [
                 ssa_program[fn_n]
@@ -1128,8 +1150,11 @@ class OmniRepoCompiler:
             llvm_handled: Set[str] = set()
             host_matches_target_os = (effective_os == ("windows" if sys.platform == "win32" else "linux"))
             prefer_gcc_emitter = False
+            gcc_partition_ssas: Optional[List[SSAFunction]] = None
+            llvm_partition_ssas: Optional[List[SSAFunction]] = None
 
             if resolved_backend == "homeostasis" and repo_ssas:
+                probe_winner_by_fn: Dict[str, str] = {}
                 homeo_eligible = [
                     s for s in repo_ssas
                     if not any(
@@ -1191,15 +1216,25 @@ class OmniRepoCompiler:
                                     )
                                 if rep.selected_engine:
                                     homeostasis_throughput_winners.append(rep.selected_engine)
+                                    probe_winner_by_fn[hs.name] = rep.selected_engine
 
-                    pgo_cands: List[str] = ["native"]
-                    if self.llvm.is_available and host_matches_target_os and "llvm" not in homeostasis_isolated_engines:
-                        pgo_cands.append("llvm")
-                    if (
-                        ((effective_os == "linux" and self.gcc.supports_elf64)
-                         or (effective_os == "windows" and self.gcc.supports_windows_coff))
+                    can_llvm = (
+                        self.llvm.is_available
+                        and host_matches_target_os
+                        and "llvm" not in homeostasis_isolated_engines
+                    )
+                    can_gcc = (
+                        effective_arch == "x86_64"
+                        and (
+                            (effective_os == "linux" and self.gcc.supports_elf64)
+                            or (effective_os == "windows" and self.gcc.supports_windows_coff)
+                        )
                         and "gcc" not in homeostasis_isolated_engines
-                    ):
+                    )
+                    pgo_cands: List[str] = ["native"]
+                    if can_llvm:
+                        pgo_cands.append("llvm")
+                    if can_gcc:
                         pgo_cands.append("gcc")
                     pgo_best, pgo_meta = self.homeostasis.recommend_engine(
                         homeo_eligible, candidate_engines=pgo_cands, policy=resolved_homeo_policy
@@ -1209,21 +1244,58 @@ class OmniRepoCompiler:
 
                     if (
                         resolved_homeo_policy == "throughput"
-                        and "gcc" not in homeostasis_isolated_engines
-                        and (
-                            (effective_os == "linux" and self.gcc.supports_elf64)
-                            or (effective_os == "windows" and self.gcc.supports_windows_coff)
-                        )
+                        and can_gcc
                         and (
                             "gcc" in homeostasis_throughput_winners
                             or pgo_best == "gcc"
-                            or not self.llvm.is_available
-                            or "llvm" in homeostasis_isolated_engines
+                            or not can_llvm
                         )
                     ):
                         prefer_gcc_emitter = True
 
-            if (resolved_backend == "gcc" or prefer_gcc_emitter) and repo_ssas:
+                    if resolved_homeo_policy == "latency":
+                        repo_default_emitter = "native"
+                    elif prefer_gcc_emitter and can_gcc:
+                        repo_default_emitter = "gcc"
+                    elif can_llvm:
+                        repo_default_emitter = "llvm"
+                    elif can_gcc:
+                        repo_default_emitter = "gcc"
+                    else:
+                        repo_default_emitter = "native"
+
+                    gcc_partition_ssas = []
+                    llvm_partition_ssas = []
+                    valid_set = set(pgo_cands)
+                    for hs in homeo_eligible:
+                        override_eng = normalized_homeo_overrides.get(hs.name)
+                        if override_eng in valid_set:
+                            chosen = override_eng
+                        elif resolved_homeo_policy == "latency" and "native" in valid_set:
+                            chosen = "native"
+                        else:
+                            fn_pgo, _ = self.homeostasis.recommend_engine(
+                                [hs], candidate_engines=pgo_cands, policy=resolved_homeo_policy
+                            )
+                            probe_w = probe_winner_by_fn.get(hs.name)
+                            if (
+                                resolved_homeo_policy == "throughput"
+                                and probe_w in valid_set
+                                and (probe_w == "gcc" or fn_pgo == probe_w)
+                            ):
+                                chosen = probe_w
+                            elif fn_pgo in valid_set:
+                                chosen = fn_pgo
+                            else:
+                                chosen = repo_default_emitter
+                        homeostasis_function_emitters[hs.name] = chosen
+                        if chosen == "gcc":
+                            gcc_partition_ssas.append(hs)
+                        elif chosen == "llvm":
+                            llvm_partition_ssas.append(hs)
+
+            gcc_eligible: List[SSAFunction] = []
+            if resolved_backend == "gcc" and repo_ssas:
                 gcc_eligible = [
                     s for s in repo_ssas
                     if not any(
@@ -1231,37 +1303,30 @@ class OmniRepoCompiler:
                         for blk in s.blocks for inst in blk.instructions
                     )
                 ]
-                if gcc_eligible:
-                    gcc_obj_bytes = self.gcc.emit_object(
-                        gcc_eligible, module_name=f"omni_{m.repo_name}", target_os=effective_os
-                    )
-                    gcc_obj_mod = (
-                        load_coff_object(gcc_obj_bytes, repo_name=f"{m.repo_name}_gcc")
-                        if effective_os == "windows"
-                        else load_elf_object(gcc_obj_bytes, repo_name=f"{m.repo_name}_gcc")
-                    )
-                    for s in gcc_eligible:
-                        if s.name in gcc_obj_mod.symbols:
-                            gcc_obj_mod.symbols[s.name].is_exported = unit_export_flag.get(s.name, True)
-                            llvm_handled.add(s.name)
-                            defined_symbols_across_mods.add(s.name)
-                            real_ast_compiled_count += 1
-                            gcc_compiled_functions += 1
-                            backend_verdicts[s.name] = "GCC_O3_COMPILED"
-                            if prefer_gcc_emitter:
-                                homeostasis_emitter_used = "gcc"
-                    self.linker.add_module(gcc_obj_mod)
+            elif resolved_backend == "homeostasis" and gcc_partition_ssas:
+                gcc_eligible = gcc_partition_ssas
 
-            if (
-                resolved_backend == "llvm"
-                or (
-                    resolved_backend == "homeostasis"
-                    and not prefer_gcc_emitter
-                    and self.llvm.is_available
-                    and host_matches_target_os
-                    and "llvm" not in homeostasis_isolated_engines
+            if gcc_eligible:
+                gcc_obj_bytes = self.gcc.emit_object(
+                    gcc_eligible, module_name=f"omni_{m.repo_name}", target_os=effective_os
                 )
-            ) and repo_ssas:
+                gcc_obj_mod = (
+                    load_coff_object(gcc_obj_bytes, repo_name=f"{m.repo_name}_gcc")
+                    if effective_os == "windows"
+                    else load_elf_object(gcc_obj_bytes, repo_name=f"{m.repo_name}_gcc")
+                )
+                for s in gcc_eligible:
+                    if s.name in gcc_obj_mod.symbols:
+                        gcc_obj_mod.symbols[s.name].is_exported = unit_export_flag.get(s.name, True)
+                        llvm_handled.add(s.name)
+                        defined_symbols_across_mods.add(s.name)
+                        real_ast_compiled_count += 1
+                        gcc_compiled_functions += 1
+                        backend_verdicts[s.name] = "GCC_O3_COMPILED"
+                self.linker.add_module(gcc_obj_mod)
+
+            llvm_eligible: List[SSAFunction] = []
+            if resolved_backend == "llvm" and repo_ssas:
                 if not self.llvm.is_available:
                     raise RuntimeError("LLVM backend selected, but llvmlite/LLVM is unavailable.")
                 llvm_eligible = [
@@ -1271,33 +1336,36 @@ class OmniRepoCompiler:
                         for blk in s.blocks for inst in blk.instructions
                     )
                 ]
-                if llvm_eligible:
-                    llvm_ir = self.llvm.ssa_module_to_llvm_ir(llvm_eligible, module_name=f"omni_{m.repo_name}")
-                    for ls in llvm_eligible:
-                        bv = self.backend_validator.verify_ssa_to_llvm_ir(ls, llvm_ir, timeout_ms=400)
-                        backend_verdicts[ls.name] = bv["status"]
-                        if bv["proven"]:
-                            backend_proofs_proven += 1
-                        if bv["status"] == "REFUTED_COUNTEREXAMPLE":
-                            backend_refuted += 1
-                            raise RuntimeError(
-                                f"LLVM backend lowering translation validation REFUTED for '{ls.name}': {bv['counterexample']}"
-                            )
-                    llvm_mod = self.llvm.compile_ir(llvm_ir, optimize=True)
-                    obj_bytes = self.llvm.emit_object(llvm_mod)
-                    llvm_obj_mod = (
-                        load_coff_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
-                        if effective_os == "windows"
-                        else load_elf_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
-                    )
-                    for s in llvm_eligible:
-                        if s.name in llvm_obj_mod.symbols:
-                            llvm_obj_mod.symbols[s.name].is_exported = unit_export_flag.get(s.name, True)
-                            llvm_handled.add(s.name)
-                            defined_symbols_across_mods.add(s.name)
-                            real_ast_compiled_count += 1
-                            llvm_compiled_functions += 1
-                    self.linker.add_module(llvm_obj_mod)
+            elif resolved_backend == "homeostasis" and llvm_partition_ssas:
+                llvm_eligible = [s for s in llvm_partition_ssas if s.name not in llvm_handled]
+
+            if llvm_eligible:
+                llvm_ir = self.llvm.ssa_module_to_llvm_ir(llvm_eligible, module_name=f"omni_{m.repo_name}")
+                for ls in llvm_eligible:
+                    bv = self.backend_validator.verify_ssa_to_llvm_ir(ls, llvm_ir, timeout_ms=400)
+                    backend_verdicts[ls.name] = bv["status"]
+                    if bv["proven"]:
+                        backend_proofs_proven += 1
+                    if bv["status"] == "REFUTED_COUNTEREXAMPLE":
+                        backend_refuted += 1
+                        raise RuntimeError(
+                            f"LLVM backend lowering translation validation REFUTED for '{ls.name}': {bv['counterexample']}"
+                        )
+                llvm_mod = self.llvm.compile_ir(llvm_ir, optimize=True)
+                obj_bytes = self.llvm.emit_object(llvm_mod)
+                llvm_obj_mod = (
+                    load_coff_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
+                    if effective_os == "windows"
+                    else load_elf_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
+                )
+                for s in llvm_eligible:
+                    if s.name in llvm_obj_mod.symbols:
+                        llvm_obj_mod.symbols[s.name].is_exported = unit_export_flag.get(s.name, True)
+                        llvm_handled.add(s.name)
+                        defined_symbols_across_mods.add(s.name)
+                        real_ast_compiled_count += 1
+                        llvm_compiled_functions += 1
+                self.linker.add_module(llvm_obj_mod)
 
             for ssa_fn in repo_ssas:
                 if ssa_fn.name in llvm_handled:
@@ -1351,6 +1419,8 @@ class OmniRepoCompiler:
                 compiled_artifacts[ssa_fn.name] = artifact
                 defined_symbols_across_mods.add(ssa_fn.name)
                 real_ast_compiled_count += 1
+                if resolved_backend == "homeostasis":
+                    homeostasis_function_emitters.setdefault(ssa_fn.name, "native")
 
             for stub_name, is_exp in stub_list:
                 stub_bytes = _default_entrypoint_bytes(effective_arch, effective_os)
@@ -1376,7 +1446,13 @@ class OmniRepoCompiler:
         }
         if resolved_backend == "homeostasis":
             from compiler.native_codegen import detect_host_simd_features
-            if homeostasis_emitter_used == "native" and llvm_compiled_functions > 0:
+            hybrid_emitters_used = sorted(set(homeostasis_function_emitters.values()))
+            heterogeneous_link = len(hybrid_emitters_used) > 1
+            if heterogeneous_link:
+                homeostasis_emitter_used = "hybrid:" + "+".join(hybrid_emitters_used)
+            elif hybrid_emitters_used:
+                homeostasis_emitter_used = hybrid_emitters_used[0]
+            elif homeostasis_emitter_used == "native" and llvm_compiled_functions > 0:
                 homeostasis_emitter_used = "llvm"
             elif homeostasis_emitter_used == "native" and gcc_compiled_functions > 0:
                 homeostasis_emitter_used = "gcc"
@@ -1398,6 +1474,9 @@ class OmniRepoCompiler:
                 "consensus_all_passed": all(r["consensus_reached"] for r in homeostasis_diff_reports) if homeostasis_diff_reports else True,
                 "pgo_profile_signature": homeostasis_pgo_sig,
                 "pgo_recommended_engine": homeostasis_pgo_rec,
+                "function_emitters": homeostasis_function_emitters,
+                "hybrid_emitters_used": hybrid_emitters_used,
+                "heterogeneous_link": heterogeneous_link,
                 "binary_emitter_engine": homeostasis_emitter_used,
             }
 

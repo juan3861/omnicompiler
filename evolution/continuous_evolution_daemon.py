@@ -116,7 +116,8 @@ class ContinuousEvolutionDaemon:
         lineage = []
         if os.path.exists(LINEAGE_FILE):
             try:
-                lineage = json.load(open(LINEAGE_FILE, "r", encoding="utf-8"))
+                with open(LINEAGE_FILE, "r", encoding="utf-8") as f_lin:
+                    lineage = json.load(f_lin)
             except Exception:
                 lineage = []
         lineage.append(epoch_record)

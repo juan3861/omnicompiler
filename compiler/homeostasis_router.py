@@ -15,6 +15,7 @@ import hashlib
 import math
 import os
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -259,8 +260,9 @@ class HomeostasisRouter:
 
     @staticmethod
     def self_contained_wasm_subset(ssa_funcs: List[SSAFunction]) -> List[SSAFunction]:
-        """Fixed-point closure of functions having zero unresolved external `call`s (safe for WASM)."""
+        """Fixed-point closure of functions runnable in WASM (including synthesized & host-bridged libc)."""
         wasm_set = {f.name for f in ssa_funcs}
+        allowed_builtins = WasmBackend._WASM_ALL_LIBC
         changed = True
         while changed:
             changed = False
@@ -269,7 +271,10 @@ class HomeostasisRouter:
                     continue
                 for b in f.blocks:
                     if any(
-                        ins.opcode.lower() == "call" and ins.operands and str(ins.operands[0]) not in wasm_set
+                        ins.opcode.lower() == "call"
+                        and ins.operands
+                        and str(ins.operands[0]) not in wasm_set
+                        and str(ins.operands[0]) not in allowed_builtins
                         for ins in b.instructions
                     ):
                         wasm_set.remove(f.name)
@@ -292,6 +297,50 @@ class HomeostasisRouter:
     def _snapshots_key(snapshots: Dict[int, bytes]) -> Tuple[Tuple[int, bytes], ...]:
         return tuple((k, snapshots[k]) for k in sorted(snapshots.keys()))
 
+    @staticmethod
+    def _resolve_host_libc_symbols(ssa_funcs: List[SSAFunction]) -> Dict[str, int]:
+        """Resolves process C runtime function addresses needed by JIT-compiled `SSAFunction`s."""
+        needed = {
+            str(ins.operands[0])
+            for fn in ssa_funcs
+            for b in fn.blocks
+            for ins in b.instructions
+            if ins.opcode.lower() == "call" and ins.operands
+        }
+        if not needed:
+            return {}
+        libs: List[Any] = []
+        if sys.platform == "win32":
+            for lib_name in ("ucrtbase", "msvcrt"):
+                try:
+                    libs.append(ctypes.CDLL(lib_name))
+                except Exception:
+                    pass
+        else:
+            try:
+                libs.append(ctypes.CDLL(None))
+            except Exception:
+                pass
+            try:
+                libs.append(ctypes.CDLL("libm.so.6"))
+            except Exception:
+                pass
+        syms: Dict[str, int] = {}
+        for sym in needed:
+            if sym in ("omni_main",) or sym.startswith("omni_"):
+                continue
+            for lib in libs:
+                fn_obj = getattr(lib, sym, None)
+                if fn_obj is not None:
+                    try:
+                        addr = ctypes.cast(fn_obj, ctypes.c_void_p).value
+                        if addr:
+                            syms[sym] = int(addr)
+                            break
+                    except Exception:
+                        pass
+        return syms
+
     def _run_native(
         self,
         ssa_funcs: List[SSAFunction],
@@ -300,8 +349,35 @@ class HomeostasisRouter:
         memory_regions: Dict[int, bytes],
     ) -> EngineExecutionResult:
         t0 = time.perf_counter()
+        sib_mems: List[Any] = []
         try:
-            cf, _mem, _ = self.native_jit.compile_ssa(entry_fn)
+            extra_syms = self._resolve_host_libc_symbols(ssa_funcs)
+            fn_by_name = {f.name: f for f in ssa_funcs}
+            compiled_sibs: Dict[str, int] = {}
+
+            def _compile_with_deps(target_fn: SSAFunction, visiting: set) -> Tuple[Any, Any]:
+                visiting.add(target_fn.name)
+                for b in target_fn.blocks:
+                    for ins in b.instructions:
+                        if ins.opcode.lower() == "call" and ins.operands:
+                            callee = str(ins.operands[0])
+                            if (
+                                callee != target_fn.name
+                                and callee in fn_by_name
+                                and callee not in compiled_sibs
+                                and callee not in visiting
+                            ):
+                                _scf, s_mem = _compile_with_deps(fn_by_name[callee], visiting)
+                                sib_mems.append(s_mem)
+                                compiled_sibs[callee] = s_mem.ptr
+                                extra_syms[callee] = s_mem.ptr
+                cf_res, mem_res, _ = self.native_jit.compile_ssa(
+                    target_fn, extra_symbols=extra_syms or None
+                )
+                return cf_res, mem_res
+
+            cf, _mem = _compile_with_deps(entry_fn, set())
+            sib_mems.append(_mem)
             mem_bufs: Dict[int, Any] = {}
             call_args: List[Any] = []
             for addr in sorted(memory_regions.keys()):
@@ -632,6 +708,8 @@ class HomeostasisRouter:
         )
         try:
             self.profile_store.record_report(ssa_funcs, report)
+            if len(ssa_funcs) > 1:
+                self.profile_store.record_report([entry_fn], report)
         except Exception:
             pass
         return report

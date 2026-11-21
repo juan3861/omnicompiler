@@ -242,8 +242,16 @@ class LLVMBackend:
                 res_ty = self._llvm_type(inst.result.var_type) if inst.result is not None else "i64"
 
                 if opcode == "const":
-                    v1 = ops[0] if ops else "0"
-                    lines.append(f"    {lhs} = add i64 0, {v1}")
+                    is_fp_c = (res_ty == "double") or (bool(inst.operands) and isinstance(inst.operands[0], float))
+                    if is_fp_c:
+                        if inst.operands and isinstance(inst.operands[0], int) and not isinstance(inst.operands[0], bool):
+                            v1 = self._format_ssa_operand(float(inst.operands[0]), param_set)
+                        else:
+                            v1 = ops[0] if ops else "0.0"
+                        lines.append(f"    {lhs} = fadd double -0.0, {v1}")
+                    else:
+                        v1 = ops[0] if ops else "0"
+                        lines.append(f"    {lhs} = add i64 0, {v1}")
                     last_val = lhs
 
                 elif opcode == "fconst":

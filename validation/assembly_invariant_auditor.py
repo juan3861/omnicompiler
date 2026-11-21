@@ -77,44 +77,112 @@ class AssemblyInvariantAuditor:
         branch_safe = True
         n = len(code_bytes)
 
-        # Scan leading prologue push r64 instructions (0x50..0x57 or 0x41 0x50..0x57), allowing mov rbp, rsp (48 89 E5)
+        # Scan leading prologue push r64 instructions (allowing interleaved setup ALU movs in -O3)
         prologue_push_bytes = 0
+        post_rbp_push_bytes = 0
+        has_frame_ptr_setup = False
         pi = 0
-        while pi < n:
+        saw_mov_rbp_rsp = False
+        while pi < min(n, 48):
             b = code_bytes[pi]
-            if 0x50 <= b <= 0x57:
+            if b == 0x55 and pi + 3 < n and code_bytes[pi+1:pi+4] == b"\x48\x89\xe5":
                 prologue_push_bytes += 8
+                has_frame_ptr_setup = True
+                saw_mov_rbp_rsp = True
+                pi += 4
+            elif 0x50 <= b <= 0x57:
+                prologue_push_bytes += 8
+                if saw_mov_rbp_rsp:
+                    post_rbp_push_bytes += 8
                 pi += 1
             elif b == 0x41 and pi + 1 < n and 0x50 <= code_bytes[pi + 1] <= 0x57:
                 prologue_push_bytes += 8
+                if saw_mov_rbp_rsp:
+                    post_rbp_push_bytes += 8
                 pi += 2
             elif code_bytes[pi:pi+3] == b"\x48\x89\xe5":
+                has_frame_ptr_setup = True
+                saw_mov_rbp_rsp = True
                 pi += 3
+            elif saw_mov_rbp_rsp and (
+                code_bytes[pi:pi+3] == b"\x48\x83\xec"
+                or code_bytes[pi:pi+3] == b"\x48\x81\xec"
+                or code_bytes[pi:pi+3] == b"\x48\x83\xe4"
+            ):
+                break
+            elif saw_mov_rbp_rsp and code_bytes[pi:pi+3] in (b"\x49\x89\xfd", b"\x48\x89\xfb"):
+                pi += 3
+            elif saw_mov_rbp_rsp and b == 0x41 and pi + 5 < n and 0xB8 <= code_bytes[pi+1] <= 0xBF:
+                pi += 6
+            elif saw_mov_rbp_rsp and 0xB8 <= b <= 0xBF and pi + 4 < n:
+                pi += 5
             else:
                 break
 
-        def _scan_epilogue_pops(pos: int) -> Tuple[int, int]:
-            """Counts consecutive pop r64 instructions immediately following add rsp, imm."""
+        def _epilogue_inst_len(pos: int) -> int:
+            """Lightweight length decoder for x86-64 epilogue scheduling instructions."""
+            b0 = code_bytes[pos]
+            if 0x40 <= b0 <= 0x4F and pos + 1 < n:
+                b1 = code_bytes[pos + 1]
+                if 0xB8 <= b1 <= 0xBF:
+                    return 10 if (b0 & 0x08) else 6
+                if b1 == 0x69:
+                    return 7
+                if b1 in (0x83, 0xC1, 0x6B):
+                    return 4
+                if b1 in (0x01, 0x03, 0x29, 0x2B, 0x31, 0x33, 0x39, 0x85, 0x89, 0x8B, 0xF7):
+                    if pos + 2 < n:
+                        modrm = code_bytes[pos + 2]
+                        mod = (modrm >> 6) & 0x03
+                        rm = modrm & 0x07
+                        if mod == 3:
+                            return 3
+                        sib = 1 if rm == 4 else 0
+                        disp = 1 if mod == 1 else (4 if (mod == 2 or (mod == 0 and rm == 5)) else 0)
+                        return 3 + sib + disp
+                    return 3
+                if b1 == 0x8D and pos + 2 < n:
+                    modrm = code_bytes[pos + 2]
+                    mod = (modrm >> 6) & 0x03
+                    rm = modrm & 0x07
+                    sib = 1 if (mod != 3 and rm == 4) else 0
+                    disp = 1 if mod == 1 else (4 if (mod == 2 or (mod == 0 and rm == 5)) else 0)
+                    return 3 + sib + disp
+            if b0 == 0xC5 and pos + 2 < n:
+                return 3  # 2-byte VEX e.g. vzeroupper
+            if b0 in (0x01, 0x29, 0x31, 0x39, 0x89, 0x8B, 0xF7) and pos + 1 < n and (code_bytes[pos + 1] >> 6) == 3:
+                return 2
+            return 1
+
+        def _scan_epilogue_pops(pos: int, scan_limit: int = 80) -> Tuple[int, int]:
+            """Counts pop r64 instructions following epilogue stack restore before ret/jmp."""
             pop_b = 0
             cur = pos
-            while cur < n:
+            end_s = min(n, pos + scan_limit)
+            while cur < end_s:
                 pb = code_bytes[cur]
                 if 0x58 <= pb <= 0x5F:
                     pop_b += 8
                     cur += 1
-                elif pb == 0x41 and cur + 1 < n and 0x58 <= code_bytes[cur + 1] <= 0x5F:
+                elif pb == 0x41 and cur + 1 < end_s and 0x58 <= code_bytes[cur + 1] <= 0x5F:
                     pop_b += 8
                     cur += 2
-                else:
+                elif pb in (0xC3, 0xE8, 0xE9, 0xEB):
                     break
-            return pop_b, cur
+                else:
+                    step = _epilogue_inst_len(cur)
+                    cur += max(1, step)
+            return pop_b, (pos if pop_b == 0 else cur)
 
+        total_pro_sub = 0
+        i = 0
         while i < n:
             # Check 48 83 EC <imm8> (sub rsp, imm8)
             if code_bytes[i:i+3] == b"\x48\x83\xec":
                 if i + 3 < n:
                     imm = code_bytes[i+3]
                     stack_alloc += imm
+                    total_pro_sub += imm
                     i += 4
                     continue
                 else:
@@ -126,6 +194,7 @@ class AssemblyInvariantAuditor:
                 if i + 6 < n:
                     imm = struct.unpack("<I", code_bytes[i+3:i+7])[0]
                     stack_alloc += imm
+                    total_pro_sub += imm
                     i += 7
                     continue
                 else:
@@ -160,6 +229,32 @@ class AssemblyInvariantAuditor:
                     errors.append(f"Truncated add rsp, imm32 instruction at offset {i}")
                     i += 3
                     continue
+            # Frame-pointer teardown: lea disp(%rbp), %rsp (48 8D 65 disp8 / 48 8D A5 disp32) or mov rbp, rsp
+            elif has_frame_ptr_setup and code_bytes[i:i+3] in (b"\x48\x8d\x65", b"\x48\x8d\xa5", b"\x48\x89\xec", b"\x48\x8b\xe5"):
+                op3 = code_bytes[i:i+3]
+                if op3 == b"\x48\x8d\x65" and i + 3 < n:
+                    disp = struct.unpack("<b", code_bytes[i+3:i+4])[0]
+                    after_pos = i + 4
+                elif op3 == b"\x48\x8d\xa5" and i + 6 < n:
+                    disp = struct.unpack("<i", code_bytes[i+3:i+7])[0]
+                    after_pos = i + 7
+                else:
+                    disp = 0
+                    after_pos = i + 3
+                if disp <= 0 and (-disp) == post_rbp_push_bytes:
+                    pop_b, next_i = _scan_epilogue_pops(after_pos)
+                    if pop_b >= post_rbp_push_bytes + 8:
+                        epi_free = stack_alloc + prologue_push_bytes
+                        stack_free += epi_free
+                        free_sizes.append(epi_free)
+                        i = next_i
+                        continue
+            elif has_frame_ptr_setup and code_bytes[i] == 0xC9 and post_rbp_push_bytes == 0 and i > pi:
+                epi_free = stack_alloc + prologue_push_bytes
+                stack_free += epi_free
+                free_sizes.append(epi_free)
+                i += 1
+                continue
             # Check Call relative (E8 <disp32>)
             elif code_bytes[i] == 0xE8:
                 if i + 4 < n:

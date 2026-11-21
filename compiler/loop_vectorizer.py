@@ -15,7 +15,15 @@ from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar, opt
 class LoopVectorizerPass:
     """Detects vectorizable linear loops and replaces them with SIMD collection intrinsics."""
 
-    def vectorize_function(self, fn: SSAFunction) -> Tuple[SSAFunction, Dict[str, Any]]:
+    def __init__(self, vector_lanes: Optional[int] = None):
+        self.vector_lanes = vector_lanes
+
+    def vectorize_function(
+        self,
+        fn: SSAFunction,
+        vector_lanes: Optional[int] = None,
+    ) -> Tuple[SSAFunction, Dict[str, Any]]:
+        preferred_lanes = vector_lanes if vector_lanes is not None else self.vector_lanes
         stats = {
             "vectorized_adds": 0,
             "vectorized_dots": 0,
@@ -153,6 +161,7 @@ class LoopVectorizerPass:
                             exit_bb=exit_blk,
                             pattern=store_pattern,
                             step_id=stats["vectorized_stores"],
+                            preferred_lanes=preferred_lanes,
                         )
                         stats["vectorized_stores"] += 1
                         if store_pattern.get("reductions"):
@@ -2554,6 +2563,7 @@ class LoopVectorizerPass:
         exit_bb: BasicBlock,
         pattern: Dict[str, Any],
         step_id: int,
+        preferred_lanes: Optional[int] = None,
     ) -> None:
         """Transforms single or multi-field elementwise array/struct write loops into 4-lane vector store + alias guard + scalar tail."""
         i_var: SSAVar = pattern["i_var"]
@@ -2606,9 +2616,18 @@ class LoopVectorizerPass:
             acc_nexts_by_r.append([SSAVar(f"vec_st_acc{lane}_nxt_{step_id}_{r_idx}", 0, var_type=vt) for lane in range(4)])
         use_8way = (
             not red_specs
-            and all(d[3] in ("i32", "u32", "f32") and d[2] == 4 for d in dst_specs)
-            and all(l[3] in ("i32", "u32", "f32") and l[2] == 4 for l in load_specs)
             and (bound_count is None or bound_count >= 8)
+            and (
+                (
+                    all(d[3] in ("i32", "u32", "f32") and d[2] == 4 for d in dst_specs)
+                    and all(l[3] in ("i32", "u32", "f32") and l[2] == 4 for l in load_specs)
+                )
+                or (
+                    preferred_lanes == 8
+                    and all(d[2] in (4, 8) for d in dst_specs)
+                    and all(l[2] in (4, 8) for l in load_specs)
+                )
+            )
         )
         lanes = 8 if use_8way else 4
         lane_shift = 3 if use_8way else 2
@@ -2983,7 +3002,7 @@ class LoopVectorizerPass:
         """
         from compiler.vla_simd_engine import VLASimdEngine
         vla = VLASimdEngine(target_isa=target_isa)
-        fn, base_stats = self.vectorize_function(fn)
+        fn, base_stats = self.vectorize_function(fn, vector_lanes=vla.vector_lanes)
         vla_ops = sum(v for k, v in base_stats.items() if k.startswith("vectorized_"))
         stats = {
             **base_stats,

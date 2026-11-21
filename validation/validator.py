@@ -407,10 +407,37 @@ class IndependentValidator:
         except Exception as e:
             return {"returncode": -1, "stdout": "", "stderr": str(e)}
 
+    @classmethod
+    def close_persistent_worker(cls) -> None:
+        """Cleanly terminates and closes all stdio handles of the persistent worker."""
+        p = cls._PERSISTENT_WORKER
+        cls._PERSISTENT_WORKER = None
+        if p is None:
+            return
+        try:
+            if p.stdin:
+                p.stdin.close()
+        except Exception:
+            pass
+        try:
+            if p.poll() is None:
+                p.kill()
+                p.wait(timeout=1)
+        except Exception:
+            pass
+        for stream in (getattr(p, "stdout", None), getattr(p, "stderr", None)):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
     def _get_or_spawn_worker(self) -> subprocess.Popen:
         proc = IndependentValidator._PERSISTENT_WORKER
         if proc is not None and proc.poll() is None and IndependentValidator._PERSISTENT_WORKER_PY == self.python_executable:
             return proc
+        if proc is not None:
+            self.close_persistent_worker()
 
         safe_keys = {
             'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATH', 'PATHEXT',
@@ -456,6 +483,14 @@ class IndependentValidator:
                     p.wait(timeout=1)
             except Exception:
                 pass
+            for stream in (getattr(p, "stdout", None), getattr(p, "stderr", None)):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+            if IndependentValidator._PERSISTENT_WORKER is p:
+                IndependentValidator._PERSISTENT_WORKER = None
 
         atexit.register(_cleanup_worker)
         return proc
