@@ -291,7 +291,9 @@ class TestAlphaC27PolyglotAndCallTV(unittest.TestCase):
             codegen = res["stages"]["codegen"]
             self.assertGreaterEqual(codegen["vectorized_loops"], 1)
             self.assertIsNotNone(codegen["vla_simd_metadata"])
-            self.assertEqual(codegen["vla_simd_metadata"]["isa"], "AVX2_256")
+            from compiler.native_codegen import detect_host_simd_features
+            expected_isa = "AVX512_512" if detect_host_simd_features().get("avx512f", False) else "AVX2_256"
+            self.assertEqual(codegen["vla_simd_metadata"]["isa"], expected_isa)
 
 
 if __name__ == "__main__":
