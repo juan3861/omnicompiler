@@ -1,33 +1,33 @@
 {
-  "timestamp": "2026-11-21T15:41:55Z",
+  "timestamp": "2026-11-21T17:07:37Z",
   "parsing": {
     "tree_sitter": {
-      "time_sec": 0.020514300000286312,
+      "time_sec": 0.029671100000996375,
       "symbols_extracted": 400
     },
     "regex": {
-      "time_sec": 0.0006685999996989267,
+      "time_sec": 0.001049500000590342,
       "symbols_extracted": 400
     }
   },
   "execution": {
     "llvm_o3_jit": {
-      "time_sec": 3.6999999792897142e-06,
+      "time_sec": 1.1300000551273115e-05,
       "result": 4999950000,
       "iterations": 100000
     },
     "wasmtime_sandbox": {
-      "time_sec": 0.007244300000820658,
+      "time_sec": 0.013870100001440733,
       "result": 4999950000,
       "iterations": 100000
     },
     "omni_native_jit": {
-      "time_sec": 0.00016510000023117755,
+      "time_sec": 0.00017880000086734071,
       "result": 4999950000,
       "iterations": 100000
     },
     "gcc_o3": {
-      "time_sec": 1.5195580999998128,
+      "time_sec": 2.8227186000003712,
       "result": 4999950000,
       "iterations": 100000
     }
@@ -43,14 +43,25 @@
     ],
     "selected_engine": "wasm",
     "elapsed_ms_by_engine": {
-      "native": 24.711,
-      "llvm": 45.287,
-      "gcc": 2001.377,
-      "wasm": 7.143
+      "native": 32.182,
+      "llvm": 63.516,
+      "gcc": 3116.768,
+      "wasm": 12.618
     }
   },
+  "heterogeneous_hybrid": {
+    "heterogeneous_link": true,
+    "binary_emitter_engine": "hybrid:llvm+native",
+    "hybrid_emitters_used": [
+      "llvm",
+      "native"
+    ],
+    "compile_ms": 3008.3,
+    "call_ms": 0.0187,
+    "result": 549
+  },
   "safety_and_audit": {
-    "unicorn_preflight_latency_ms": 1.5911940000114555,
-    "formal_audit_latency_ms": 0.6966840000040975
+    "unicorn_preflight_latency_ms": 2.362567999989551,
+    "formal_audit_latency_ms": 0.8028789999843866
   }
 }

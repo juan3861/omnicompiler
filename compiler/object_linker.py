@@ -193,7 +193,15 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
         raw_name, val, sec_num, _stype, storage_cls, num_aux = struct.unpack_from("<8sIhHBB", obj_bytes, soff)
         sname = decode_coff_name(raw_name)
         sym_by_idx[idx] = (sname, val, sec_num, storage_cls)
-        if sec_num == text_sec["index_1based"] and sname and not sname.startswith("."):
+        if (
+            sec_num == text_sec["index_1based"]
+            and sname
+            and not sname.startswith(".")
+            and not (
+                storage_cls == 3
+                and (sname in ("$x", "$d", "$a", "$t") or sname.startswith(("$x.", "$d.", "$a.", "$t.")))
+            )
+        ):
             is_exp = (storage_cls == 2)  # IMAGE_SYM_CLASS_EXTERNAL
             mod.symbols[sname] = SymbolDef(
                 name=sname,
@@ -274,7 +282,18 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
     symtab = elf.get_section_by_name(".symtab")
     if symtab is not None:
         for sym in symtab.iter_symbols():
-            if sym.name and sym["st_shndx"] == text_shndx and sym["st_info"]["type"] in ("STT_FUNC", "STT_NOTYPE"):
+            if (
+                sym.name
+                and sym["st_shndx"] == text_shndx
+                and sym["st_info"]["type"] in ("STT_FUNC", "STT_NOTYPE")
+                and not (
+                    sym["st_info"]["bind"] == "STB_LOCAL"
+                    and (
+                        sym.name in ("$x", "$d", "$a", "$t")
+                        or sym.name.startswith(("$x.", "$d.", "$a.", "$t."))
+                    )
+                )
+            ):
                 is_exp = sym["st_info"]["bind"] == "STB_GLOBAL"
                 mod.symbols[sym.name] = SymbolDef(
                     name=sym.name,

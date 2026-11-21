@@ -167,6 +167,13 @@ class OmniRepoCompiler:
     Transforms multi-project topologies into unified, formally verified native binaries.
     """
 
+    _LLVM_TARGET_TRIPLES: Dict[Tuple[str, str], str] = {
+        ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
+        ("windows", "x86_64"): "x86_64-pc-windows-msvc",
+        ("linux", "arm64"): "aarch64-unknown-linux-gnu",
+        ("windows", "arm64"): "aarch64-pc-windows-msvc",
+    }
+
     def __init__(self, db_path: Optional[str] = None):
         self.ingestor = RepoManifestIngestor()
         self.topology_resolver = RepoTopologyResolver()
@@ -181,6 +188,7 @@ class OmniRepoCompiler:
         self.asm_auditor = AssemblyInvariantAuditor()
         self.slicer = InterRepoSlicer()
         self.llvm = LLVMBackend(opt_level=3)
+        self._llvm_cross_cache: Dict[Tuple[str, str], LLVMBackend] = {}
         self.gcc = GCCBackend(opt_level=3)
         self.wasm = WasmBackend()
         homeo_db_path = f"{db_path}.homeostasis_pgo.db" if (db_path and db_path != ":memory:") else ":memory:"
@@ -213,6 +221,23 @@ class OmniRepoCompiler:
         self._cpg_topo_digest: Optional[str] = None
         self._cpg_last_taint_leak: Optional[Any] = None
         self.salsa.register_query("parsed_module", self._salsa_parse_file)
+
+    def _get_llvm_for_target(self, target_os: str, target_arch: str) -> Optional[LLVMBackend]:
+        """Returns host or cached cross-target `LLVMBackend` for `(target_os, target_arch)` COFF/ELF emission."""
+        key = (target_os.lower(), target_arch.lower())
+        triple = self._LLVM_TARGET_TRIPLES.get(key)
+        if not triple or not self.llvm.is_available:
+            return None
+        host_triple = (self.llvm.target_triple or "").lower()
+        if (
+            (key == ("windows", "x86_64") and "windows" in host_triple and ("x86_64" in host_triple or "amd64" in host_triple))
+            or (key == ("linux", "x86_64") and "linux" in host_triple and ("x86_64" in host_triple or "amd64" in host_triple))
+        ):
+            return self.llvm
+        if key not in self._llvm_cross_cache:
+            self._llvm_cross_cache[key] = LLVMBackend(opt_level=3, target_triple=triple)
+        cached = self._llvm_cross_cache[key]
+        return cached if cached.is_available else None
 
     def close(self) -> None:
         if getattr(self, "_disk_cache", None) is not None:
@@ -1141,6 +1166,7 @@ class OmniRepoCompiler:
         homeostasis_pgo_sig: Optional[str] = None
         homeostasis_emitter_used = "native"
         homeostasis_function_emitters: Dict[str, str] = {}
+        target_llvm = self._get_llvm_for_target(effective_os, effective_arch)
         for m, obj_mod, stub_list in repo_order_objs:
             repo_ssas = [
                 ssa_program[fn_n]
@@ -1148,7 +1174,6 @@ class OmniRepoCompiler:
                 if owner == m.repo_name
             ]
             llvm_handled: Set[str] = set()
-            host_matches_target_os = (effective_os == ("windows" if sys.platform == "win32" else "linux"))
             prefer_gcc_emitter = False
             gcc_partition_ssas: Optional[List[SSAFunction]] = None
             llvm_partition_ssas: Optional[List[SSAFunction]] = None
@@ -1219,8 +1244,7 @@ class OmniRepoCompiler:
                                     probe_winner_by_fn[hs.name] = rep.selected_engine
 
                     can_llvm = (
-                        self.llvm.is_available
-                        and host_matches_target_os
+                        target_llvm is not None
                         and "llvm" not in homeostasis_isolated_engines
                     )
                     can_gcc = (
@@ -1327,8 +1351,11 @@ class OmniRepoCompiler:
 
             llvm_eligible: List[SSAFunction] = []
             if resolved_backend == "llvm" and repo_ssas:
-                if not self.llvm.is_available:
-                    raise RuntimeError("LLVM backend selected, but llvmlite/LLVM is unavailable.")
+                if target_llvm is None:
+                    raise RuntimeError(
+                        f"LLVM backend selected for target ({effective_os}/{effective_arch}), "
+                        "but LLVM target machine is unavailable."
+                    )
                 llvm_eligible = [
                     s for s in repo_ssas
                     if not any(
@@ -1336,11 +1363,11 @@ class OmniRepoCompiler:
                         for blk in s.blocks for inst in blk.instructions
                     )
                 ]
-            elif resolved_backend == "homeostasis" and llvm_partition_ssas:
+            elif resolved_backend == "homeostasis" and llvm_partition_ssas and target_llvm is not None:
                 llvm_eligible = [s for s in llvm_partition_ssas if s.name not in llvm_handled]
 
-            if llvm_eligible:
-                llvm_ir = self.llvm.ssa_module_to_llvm_ir(llvm_eligible, module_name=f"omni_{m.repo_name}")
+            if llvm_eligible and target_llvm is not None:
+                llvm_ir = target_llvm.ssa_module_to_llvm_ir(llvm_eligible, module_name=f"omni_{m.repo_name}")
                 for ls in llvm_eligible:
                     bv = self.backend_validator.verify_ssa_to_llvm_ir(ls, llvm_ir, timeout_ms=400)
                     backend_verdicts[ls.name] = bv["status"]
@@ -1351,8 +1378,8 @@ class OmniRepoCompiler:
                         raise RuntimeError(
                             f"LLVM backend lowering translation validation REFUTED for '{ls.name}': {bv['counterexample']}"
                         )
-                llvm_mod = self.llvm.compile_ir(llvm_ir, optimize=True)
-                obj_bytes = self.llvm.emit_object(llvm_mod)
+                llvm_mod = target_llvm.compile_ir(llvm_ir, optimize=True)
+                obj_bytes = target_llvm.emit_object(llvm_mod)
                 llvm_obj_mod = (
                     load_coff_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
                     if effective_os == "windows"
@@ -1477,6 +1504,7 @@ class OmniRepoCompiler:
                 "function_emitters": homeostasis_function_emitters,
                 "hybrid_emitters_used": hybrid_emitters_used,
                 "heterogeneous_link": heterogeneous_link,
+                "llvm_target_triple": (target_llvm.target_triple if target_llvm is not None else self.llvm.target_triple),
                 "binary_emitter_engine": homeostasis_emitter_used,
             }
 
@@ -1770,12 +1798,22 @@ def main():
     parser.add_argument("--arch", choices=["x86_64", "arm64"], default="x86_64", help="Target architecture")
     parser.add_argument("--backend", choices=["native", "llvm", "gcc", "wasm", "homeostasis"], default="native", help="Codegen backend")
     parser.add_argument("--homeostasis-policy", choices=["consensus", "throughput", "latency"], default="consensus", help="Homeostasis routing policy")
+    parser.add_argument("--homeostasis-overrides", default="", help="Comma-separated per-function emitter overrides (e.g. fn1=native,fn2=llvm,fn3=gcc)")
     parser.add_argument("--entry", default="omni_main", help="Exported entrypoint name")
     parser.add_argument("--export-all", action="store_true", help="Retain and export all functions across repositories")
     parser.add_argument("--audit-nonce", default="NONCE-C5-20261023-OMNI01", help="Audit nonce for provenance ledger")
 
     args = parser.parse_args()
     repo_list = [p.strip() for p in args.repos.split(",")]
+    parsed_overrides: Optional[Dict[str, str]] = None
+    if args.homeostasis_overrides.strip():
+        parsed_overrides = {}
+        for item in args.homeostasis_overrides.split(","):
+            item = item.strip()
+            if "=" not in item:
+                raise ValueError(f"Invalid --homeostasis-overrides entry '{item}', expected 'fn=emitter'")
+            k_fn, v_eng = item.split("=", 1)
+            parsed_overrides[k_fn.strip()] = v_eng.strip()
 
     compiler = OmniRepoCompiler()
     try:
@@ -1790,6 +1828,7 @@ def main():
             export_all=args.export_all,
             backend=args.backend,
             homeostasis_policy=args.homeostasis_policy,
+            homeostasis_function_overrides=parsed_overrides,
         )
     finally:
         compiler.close()

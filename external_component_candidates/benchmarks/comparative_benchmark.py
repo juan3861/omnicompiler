@@ -202,6 +202,80 @@ def quad_fma_bench(t: BenchF64, n: int) -> float:
         router.close()
 
 
+def benchmark_heterogeneous_hybrid():
+    import tempfile
+    from omni_repo_compiler import OmniRepoCompiler
+    with tempfile.TemporaryDirectory() as td:
+        r_a = Path(td) / "repo_a"
+        r_b = Path(td) / "repo_b"
+        r_a.mkdir()
+        r_b.mkdir()
+        (r_a / "omni_repo.json").write_text(
+            json.dumps({"name": "repo_a", "language": "python", "exports": ["stage_native", "stage_mid"], "dependencies": []}),
+            encoding="utf-8",
+        )
+        (r_a / "a.py").write_text(
+            "def stage_native(x: int) -> int:\n    return (x * 7) + 13\n\n"
+            "def stage_mid(x: int) -> int:\n    return stage_native(x) + 100\n",
+            encoding="utf-8",
+        )
+        (r_b / "omni_repo.json").write_text(
+            json.dumps({"name": "repo_b", "language": "python", "exports": ["stage_outer", "omni_main"], "dependencies": ["repo_a"]}),
+            encoding="utf-8",
+        )
+        (r_b / "b.py").write_text(
+            "def stage_outer(x: int) -> int:\n    return stage_mid(x) * 3\n\n"
+            "def omni_main() -> int:\n    return stage_outer(10)\n",
+            encoding="utf-8",
+        )
+        comp = OmniRepoCompiler(db_path=str(Path(td) / "runs.db"))
+        try:
+            host_ext = ".dll" if sys.platform == "win32" else ".so"
+            out_lib = str(Path(td) / f"hybrid_bench{host_ext}")
+            mid_eng = "gcc" if (sys.platform != "win32" and comp.gcc.supports_elf64) else "llvm"
+            t0 = time.perf_counter()
+            res = comp.compile_repositories(
+                [str(r_a), str(r_b)],
+                out_lib,
+                target_format="shared_lib",
+                entry_export="omni_main",
+                backend="homeostasis",
+                homeostasis_policy="throughput",
+                homeostasis_function_overrides={
+                    "stage_native": "native",
+                    "stage_mid": mid_eng,
+                    "stage_outer": "llvm",
+                    "omni_main": "llvm",
+                },
+                audit_nonce="bench-hyb-c67",
+            )
+            compile_ms = (time.perf_counter() - t0) * 1000.0
+            h_info = res["stages"]["homeostasis"]
+            lib = ctypes.CDLL(out_lib)
+            try:
+                lib.stage_outer.argtypes = [ctypes.c_int64]
+                lib.stage_outer.restype = ctypes.c_int64
+                t1 = time.perf_counter()
+                out_val = lib.stage_outer(10)
+                call_ms = (time.perf_counter() - t1) * 1000.0
+            finally:
+                handle = getattr(lib, "_handle", None)
+                del lib
+                if sys.platform == "win32" and handle:
+                    import _ctypes
+                    _ctypes.FreeLibrary(handle)
+            return {
+                "heterogeneous_link": h_info["heterogeneous_link"],
+                "binary_emitter_engine": h_info["binary_emitter_engine"],
+                "hybrid_emitters_used": h_info["hybrid_emitters_used"],
+                "compile_ms": round(compile_ms, 2),
+                "call_ms": round(call_ms, 4),
+                "result": int(out_val),
+            }
+        finally:
+            comp.close()
+
+
 def benchmark_safety_and_audit():
     # Measure Unicorn Pre-Flight emulation overhead vs physical execution
     code = b"\x48\x01\xd1\x48\x89\xc8\xc3"
@@ -251,6 +325,10 @@ if __name__ == "__main__":
     print("\n[2b] Quad-Ecosystem Homeostasis Consensus Benchmark:")
     print(f"    Host SIMD Tier:   {h_res['host_simd_tier']} | Engines: {h_res['active_engines']} | Winner: {h_res['selected_engine']}")
 
+    hyb_res = benchmark_heterogeneous_hybrid()
+    print("\n[2c] Heterogeneous Per-Function Hybrid Linking Benchmark:")
+    print(f"    Emitter Mode:     {hyb_res['binary_emitter_engine']} | Compile: {hyb_res['compile_ms']:.2f} ms | Result: {hyb_res['result']}")
+
     s_res = benchmark_safety_and_audit()
     print("\n[3] Pre-Flight & Formal Audit Overhead:")
     print(f"    Unicorn CPU Sandbox Latency: {s_res['unicorn_preflight_latency_ms']:.3f} ms / function")
@@ -261,6 +339,7 @@ if __name__ == "__main__":
         "parsing": p_res,
         "execution": e_res,
         "homeostasis_quad": h_res,
+        "heterogeneous_hybrid": hyb_res,
         "safety_and_audit": s_res
     }
     out_file = Path("external_component_candidates/benchmarks/benchmark_results.json")
