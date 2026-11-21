@@ -55,8 +55,8 @@ class TestAlphaC62TriEcosystemHomeostasis(unittest.TestCase):
     def test_01_gcc_backend_ssa_to_c99_o3_avx2_elf64_and_execution(self):
         """Compiles vectorized store + Order-3 Tribonacci via GCCBackend O3 into ELF64 `.o` + executes cleanly."""
         gcc = GCCBackend(opt_level=3)
-        if not gcc.is_available:
-            self.skipTest("GCC not available")
+        if not gcc.supports_elf64:
+            self.skipTest("GCC ELF64 backend not available")
 
         src = """
 def tribonacci_store(base: int, n: int) -> int:
@@ -294,15 +294,15 @@ def homeo_kernel(t: HomeoState, n: int) -> int:
                 self.assertIn(f"C62_HOMEO={exp}", p.stdout)
                 self.assertEqual(p.returncode, exp % 251)
 
-            if comp.gcc.is_available:
-                if sys.platform == "win32" and comp.gcc.mode != "native_exe":
-                    with self.assertRaises(ValueError):
-                        comp.compile_repositories(
-                            [r_dir], os.path.join(self.test_dir, "bad.exe"),
-                            target_format="executable", entry_export="omni_main",
-                            target_os="windows", backend="gcc", audit_nonce="c62-gcc-win-block",
-                        )
+            if comp.gcc.is_available and not comp.gcc.supports_windows_coff:
+                with self.assertRaises(ValueError):
+                    comp.compile_repositories(
+                        [r_dir], os.path.join(self.test_dir, "bad.exe"),
+                        target_format="executable", entry_export="omni_main",
+                        target_os="windows", backend="gcc", audit_nonce="c62-gcc-win-block",
+                    )
 
+            if comp.gcc.supports_elf64:
                 gcc_lin = os.path.join(self.test_dir, "c62_gcc_linux")
                 res_g = comp.compile_repositories(
                     [r_dir], gcc_lin, target_format="executable", entry_export="omni_main",

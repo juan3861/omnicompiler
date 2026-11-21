@@ -285,19 +285,110 @@ def _x64_ucomisd(xmm_a: int = 0, xmm_b: int = 1) -> bytes:
     return bytes([0x66, 0x0F, 0x2E, modrm])
 
 
-def _host_supports_avx2() -> bool:
+_HOST_SIMD_FEATURES_CACHE: Optional[Dict[str, Any]] = None
+
+
+def detect_host_simd_features() -> Dict[str, Any]:
+    """
+    Executes hardware CPUID (leaves 1 and 7,0) + XGETBV(0) in W^X JIT memory on x86-64
+    (Win64 or SysV AMD64) to detect exact silicon + OS-enabled AVX/AVX2/FMA/AVX-512 support.
+    """
+    global _HOST_SIMD_FEATURES_CACHE
+    if _HOST_SIMD_FEATURES_CACHE is not None:
+        return dict(_HOST_SIMD_FEATURES_CACHE)
+
+    import platform
+    mach = platform.machine().lower()
+    if mach in ("aarch64", "arm64"):
+        feats = {
+            "arch": "arm64",
+            "sse2": False, "sse4_1": False, "avx": False, "avx2": False,
+            "fma": True, "avx512f": False, "avx512dq": False, "avx512bw": False,
+            "avx512vl": False, "osxsave": False, "os_avx": False, "os_avx512": False,
+            "neon": True, "recommended_tier": "NEON_128",
+        }
+        _HOST_SIMD_FEATURES_CACHE = feats
+        return dict(feats)
+
+    feats = {
+        "arch": "x86_64",
+        "sse2": True, "sse4_1": False, "avx": False, "avx2": False,
+        "fma": False, "avx512f": False, "avx512dq": False, "avx512bw": False,
+        "avx512vl": False, "osxsave": False, "os_avx": False, "os_avx512": False,
+        "neon": False, "recommended_tier": "SSE2_128",
+    }
     try:
-        if sys.platform == "win32":
-            import ctypes
-            return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))
-        if sys.platform.startswith("linux"):
-            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if line.startswith("flags") and " avx2" in line:
-                        return True
+        import ctypes
+        from compiler.native_jit import NativeJitMemory
+
+        # Win64 arg0=rcx, SysV arg0=rdi -> mov r8, rcx (49 89 c8) vs mov r8, rdi (49 89 f8)
+        arg_mov = b"\x49\x89\xc8" if sys.platform == "win32" else b"\x49\x89\xf8"
+        code = (
+            b"\x53"                     # push rbx
+            + arg_mov                   # mov r8, <arg0>
+            + b"\xb8\x01\x00\x00\x00"   # mov eax, 1
+            b"\x31\xc9"                 # xor ecx, ecx
+            b"\x0f\xa2"                 # cpuid
+            b"\x41\x89\x08"             # mov [r8], ecx
+            b"\xb8\x07\x00\x00\x00"     # mov eax, 7
+            b"\x31\xc9"                 # xor ecx, ecx
+            b"\x0f\xa2"                 # cpuid
+            b"\x41\x89\x58\x08"         # mov [r8+8], ebx
+            b"\x41\x8b\x00"             # mov eax, [r8]
+            b"\xa9\x00\x00\x00\x08"     # test eax, 1<<27 (OSXSAVE)
+            b"\x74\x09"                 # jz skip_xgetbv
+            b"\x31\xc9"                 # xor ecx, ecx
+            b"\x0f\x01\xd0"             # xgetbv
+            b"\x41\x89\x40\x04"         # mov [r8+4], eax
+            b"\xeb\x08"                 # jmp done
+            b"\x41\xc7\x40\x04\x00\x00\x00\x00"  # mov dword ptr [r8+4], 0
+            b"\x5b"                     # pop rbx
+            b"\xc3"                     # ret
+        )
+        mem = NativeJitMemory(4096)
+        try:
+            mem.write_code(code)
+            out = (ctypes.c_uint32 * 4)()
+            ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_uint32))(mem.ptr)(out)
+        finally:
+            mem.free()
+
+        ecx1, xcr0, ebx7 = int(out[0]), int(out[1]), int(out[2])
+        sse4_1 = bool(ecx1 & (1 << 19))
+        osxsave = bool(ecx1 & (1 << 27))
+        avx_hw = bool(ecx1 & (1 << 28))
+        os_avx = osxsave and avx_hw and ((xcr0 & 0x6) == 0x6)
+        os_avx512 = os_avx and ((xcr0 & 0xE0) == 0xE0)
+        avx2 = os_avx and bool(ebx7 & (1 << 5))
+        fma = os_avx and bool(ecx1 & (1 << 12))
+        avx512f = os_avx512 and bool(ebx7 & (1 << 16))
+        avx512dq = os_avx512 and bool(ebx7 & (1 << 17))
+        avx512bw = os_avx512 and bool(ebx7 & (1 << 30))
+        avx512vl = os_avx512 and bool(ebx7 & (1 << 31))
+
+        tier = (
+            "AVX512_512" if avx512f
+            else ("AVX2_FMA" if (avx2 and fma)
+                  else ("AVX2_256" if avx2
+                        else ("AVX_256" if os_avx
+                              else ("SSE4_128" if sse4_1 else "SSE2_128"))))
+        )
+        feats.update({
+            "sse4_1": sse4_1, "avx": os_avx, "osxsave": osxsave,
+            "os_avx": os_avx, "os_avx512": os_avx512,
+            "avx2": avx2, "fma": fma,
+            "avx512f": avx512f, "avx512dq": avx512dq,
+            "avx512bw": avx512bw, "avx512vl": avx512vl,
+            "recommended_tier": tier,
+        })
     except Exception:
         pass
-    return False
+    _HOST_SIMD_FEATURES_CACHE = feats
+    return dict(feats)
+
+
+def _host_supports_avx2() -> bool:
+    return bool(detect_host_simd_features().get("avx2", False))
 
 
 class X64CodeGenerator:
@@ -312,7 +403,7 @@ class X64CodeGenerator:
         "cmp_ge": 0x9D,
     }
 
-    def __init__(self, target_os: Optional[str] = None, enable_avx2: Optional[bool] = None):
+    def __init__(self, target_os: Optional[str] = None, enable_avx2: Optional[bool] = None, enable_fma: Optional[bool] = None):
         if target_os is None:
             self.is_windows = sys.platform == "win32"
         else:
@@ -320,7 +411,9 @@ class X64CodeGenerator:
         self.abi = "win64" if self.is_windows else "sysv_amd64"
         self.param_regs = WIN64_PARAM_REGS if self.is_windows else SYSV_PARAM_REGS
         self.callee_saved_pool = WIN64_CALLEE_SAVED if self.is_windows else SYSV_CALLEE_SAVED
-        self.enable_avx2 = _host_supports_avx2() if enable_avx2 is None else bool(enable_avx2)
+        self.host_simd = detect_host_simd_features()
+        self.enable_avx2 = bool(self.host_simd.get("avx2", False)) if enable_avx2 is None else bool(enable_avx2)
+        self.enable_fma = (bool(self.host_simd.get("fma", False)) if enable_fma is None else bool(enable_fma)) and self.enable_avx2
 
     def compile_function(self, fn: SSAFunction) -> CompiledFunctionArtifact:
         has_calls = any(
@@ -933,6 +1026,54 @@ class X64CodeGenerator:
                         ):
                             vals_q = [inst.operands[2], st1.operands[2], st2.operands[2], st3.operands[2]]
                             inss_q = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals_q]
+                            if self.enable_fma and width == "f64" and all(
+                                x is not None and x.opcode.lower() == "fadd" and len(x.operands) == 2 for x in inss_q
+                            ):
+                                mul_left = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss_q]
+                                mul_right = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss_q]
+                                if all(m is not None and m.opcode.lower() == "fmul" and len(m.operands) == 2 for m in mul_left):
+                                    muls_f, add_ops = mul_left, [x.operands[1] for x in inss_q]
+                                elif all(m is not None and m.opcode.lower() == "fmul" and len(m.operands) == 2 for m in mul_right):
+                                    muls_f, add_ops = mul_right, [x.operands[0] for x in inss_q]
+                                else:
+                                    muls_f, add_ops = [], []
+                                if muls_f:
+                                    lda_f = [blk_def_map.get(m.operands[0]) if isinstance(m.operands[0], SSAVar) else None for m in muls_f]
+                                    ldb_f = [blk_def_map.get(m.operands[1]) if isinstance(m.operands[1], SSAVar) else None for m in muls_f]
+                                    ldc_f = [blk_def_map.get(c) if isinstance(c, SSAVar) else None for c in add_ops]
+                                    if (
+                                        all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) == "f64" for x in lda_f)
+                                        and all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) == "f64" for x in ldb_f)
+                                        and all(x is not None and x.opcode.lower() == "load_off" and len(x.operands) >= 3 and str(x.operands[2]) == "f64" for x in ldc_f)
+                                        and len({x.operands[0] for x in lda_f}) == 1
+                                        and len({x.operands[0] for x in ldb_f}) == 1
+                                        and len({x.operands[0] for x in ldc_f}) == 1
+                                        and _are_contiguous_8b_quad(lda_f[0].operands[1], lda_f[1].operands[1], lda_f[2].operands[1], lda_f[3].operands[1])
+                                        and _are_contiguous_8b_quad(ldb_f[0].operands[1], ldb_f[1].operands[1], ldb_f[2].operands[1], ldb_f[3].operands[1])
+                                        and _are_contiguous_8b_quad(ldc_f[0].operands[1], ldc_f[1].operands[1], ldc_f[2].operands[1], ldc_f[3].operands[1])
+                                    ):
+                                        resolve_operand_to_reg(lda_f[0].operands[0], "r11")
+                                        resolve_operand_to_reg(lda_f[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xc4\xc1\x7e\x6f\x03")    # vmovdqu ymm0, [r11]
+                                        resolve_operand_to_reg(ldb_f[0].operands[0], "r11")
+                                        resolve_operand_to_reg(ldb_f[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xc4\xc1\x7e\x6f\x0b")    # vmovdqu ymm1, [r11]
+                                        resolve_operand_to_reg(ldc_f[0].operands[0], "r11")
+                                        resolve_operand_to_reg(ldc_f[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xc4\xc1\x7e\x6f\x13")    # vmovdqu ymm2, [r11]
+                                        buf.emit(b"\xc4\xe2\xf5\xa8\xc2")    # vfmadd213pd ymm0, ymm1, ymm2
+                                        resolve_operand_to_reg(inst.operands[0], "r11")
+                                        resolve_operand_to_reg(inst.operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")            # add r11, rcx
+                                        buf.emit(b"\xc4\xc1\x7e\x7f\x03")    # vmovdqu [r11], ymm0
+                                        used_avx2_ymm = True
+                                        buf.record_line(st3.source_line)
+                                        inst_idx += 3
+                                        continue
+
                             if (
                                 all(x is not None for x in inss_q)
                                 and len({x.opcode.lower() for x in inss_q}) == 1
@@ -1068,6 +1209,51 @@ class X64CodeGenerator:
                         ):
                             vals_o = [s.operands[2] for s in oct_sts]
                             inss_o = [blk_def_map.get(v) if isinstance(v, SSAVar) else None for v in vals_o]
+                            if self.enable_fma and width == "f32" and all(
+                                x is not None and x.opcode.lower() == "fadd" and len(x.operands) == 2 for x in inss_o
+                            ):
+                                mul_l = [blk_def_map.get(x.operands[0]) if isinstance(x.operands[0], SSAVar) else None for x in inss_o]
+                                mul_r = [blk_def_map.get(x.operands[1]) if isinstance(x.operands[1], SSAVar) else None for x in inss_o]
+                                if all(m is not None and m.opcode.lower() == "fmul" and len(m.operands) == 2 for m in mul_l):
+                                    muls_8, add_8 = mul_l, [x.operands[1] for x in inss_o]
+                                elif all(m is not None and m.opcode.lower() == "fmul" and len(m.operands) == 2 for m in mul_r):
+                                    muls_8, add_8 = mul_r, [x.operands[0] for x in inss_o]
+                                else:
+                                    muls_8, add_8 = [], []
+                                if muls_8:
+                                    lda_8 = [blk_def_map.get(m.operands[0]) if isinstance(m.operands[0], SSAVar) else None for m in muls_8]
+                                    ldb_8 = [blk_def_map.get(m.operands[1]) if isinstance(m.operands[1], SSAVar) else None for m in muls_8]
+                                    ldc_8 = [blk_def_map.get(c) if isinstance(c, SSAVar) else None for c in add_8]
+                                    if (
+                                        all(la is not None and la.opcode.lower() == "load_off" and str(la.operands[2]) == "f32" and la.operands[0] == lda_8[0].operands[0] for la in lda_8)
+                                        and all(lb is not None and lb.opcode.lower() == "load_off" and str(lb.operands[2]) == "f32" and lb.operands[0] == ldb_8[0].operands[0] for lb in ldb_8)
+                                        and all(lc is not None and lc.opcode.lower() == "load_off" and str(lc.operands[2]) == "f32" and lc.operands[0] == ldc_8[0].operands[0] for lc in ldc_8)
+                                        and _are_contiguous_4b_oct([la.operands[1] for la in lda_8])
+                                        and _are_contiguous_4b_oct([lb.operands[1] for lb in ldb_8])
+                                        and _are_contiguous_4b_oct([lc.operands[1] for lc in ldc_8])
+                                    ):
+                                        resolve_operand_to_reg(lda_8[0].operands[0], "r11")
+                                        resolve_operand_to_reg(lda_8[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")
+                                        buf.emit(b"\xc4\xc1\x7e\x6f\x03")    # vmovdqu ymm0, [r11]
+                                        resolve_operand_to_reg(ldb_8[0].operands[0], "r11")
+                                        resolve_operand_to_reg(ldb_8[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")
+                                        buf.emit(b"\xc4\xc1\x7e\x6f\x0b")    # vmovdqu ymm1, [r11]
+                                        resolve_operand_to_reg(ldc_8[0].operands[0], "r11")
+                                        resolve_operand_to_reg(ldc_8[0].operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")
+                                        buf.emit(b"\xc4\xc1\x7e\x6f\x13")    # vmovdqu ymm2, [r11]
+                                        buf.emit(b"\xc4\xe2\x75\xa8\xc2")    # vfmadd213ps ymm0, ymm1, ymm2
+                                        resolve_operand_to_reg(inst.operands[0], "r11")
+                                        resolve_operand_to_reg(inst.operands[1], "rcx")
+                                        buf.emit(b"\x49\x01\xcb")
+                                        buf.emit(b"\xc4\xc1\x7e\x7f\x03")    # vmovdqu [r11], ymm0
+                                        used_avx2_ymm = True
+                                        buf.record_line(oct_sts[-1].source_line)
+                                        inst_idx += 7
+                                        continue
+
                             if all(
                                 x is not None
                                 and x.opcode.lower() == inss_o[0].opcode.lower()
@@ -1545,6 +1731,175 @@ class X64CodeGenerator:
         buf.jmp(".L_dot_tail")
 
         buf.mark(".L_dot_done")
+        buf.emit(b"\xc3")
+        return buf.finalize()
+
+    def _emit_5arg_setup(self, buf: "X64LabelBuffer") -> None:
+        """Normalizes 5 pointer/count args into volatile regs: r10=a, r11=b, r8=c, r9=out, rax=count."""
+        if self.is_windows:
+            buf.emit(b"\x48\x8b\x44\x24\x28")  # mov rax, qword ptr [rsp + 0x28]
+            buf.emit(_x64_mov_rr("r10", "rcx"))
+            buf.emit(_x64_mov_rr("r11", "rdx"))
+        else:
+            buf.emit(_x64_mov_rr("rax", "r8"))
+            buf.emit(_x64_mov_rr("r10", "rdi"))
+            buf.emit(_x64_mov_rr("r11", "rsi"))
+            buf.emit(_x64_mov_rr("r8", "rdx"))
+            buf.emit(_x64_mov_rr("r9", "rcx"))
+
+    def emit_avx2_fma_pd(self) -> bytes:
+        """
+        Emits hardware VEX 256-bit AVX2+FMA kernel:
+          int64_t avx2_fma_pd(const double* a, const double* b, const double* c, double* out, int64_t count)
+        Computes out[i] = a[i] * b[i] + c[i] using `vfmadd213pd` (4 lanes) + `vfmadd213sd` tail.
+        """
+        buf = X64LabelBuffer()
+        self._emit_5arg_setup(buf)
+
+        buf.mark(".L_fma256_vec")
+        buf.emit(b"\x48\x83\xf8\x04")              # cmp rax, 4
+        buf.emit(b"\x0f\x8c\x00\x00\x00\x00")      # jl .L_fma256_tail
+        buf.fixups.append((len(buf.code) - 4, ".L_fma256_tail"))
+
+        buf.emit(b"\xc4\xc1\x7d\x10\x02")          # vmovupd ymm0, ymmword ptr [r10]
+        buf.emit(b"\xc4\xc1\x7d\x10\x0b")          # vmovupd ymm1, ymmword ptr [r11]
+        buf.emit(b"\xc4\xc1\x7d\x10\x10")          # vmovupd ymm2, ymmword ptr [r8]
+        buf.emit(b"\xc4\xe2\xf5\xa8\xc2")          # vfmadd213pd ymm0, ymm1, ymm2
+        buf.emit(b"\xc4\xc1\x7d\x11\x01")          # vmovupd ymmword ptr [r9], ymm0
+        buf.emit(b"\x49\x83\xc2\x20")              # add r10, 32
+        buf.emit(b"\x49\x83\xc3\x20")              # add r11, 32
+        buf.emit(b"\x49\x83\xc0\x20")              # add r8, 32
+        buf.emit(b"\x49\x83\xc1\x20")              # add r9, 32
+        buf.emit(b"\x48\x83\xe8\x04")              # sub rax, 4
+        buf.jmp(".L_fma256_vec")
+
+        buf.mark(".L_fma256_tail")
+        buf.emit(b"\xc5\xf8\x77")                  # vzeroupper
+
+        buf.mark(".L_fma256_scalar")
+        buf.emit(_x64_test_rr("rax"))              # test rax, rax
+        buf.emit(b"\x0f\x8e\x00\x00\x00\x00")
+        buf.fixups.append((len(buf.code) - 4, ".L_fma256_done"))
+
+        buf.emit(b"\xc4\xc1\x7b\x10\x02")          # vmovsd xmm0, qword ptr [r10]
+        buf.emit(b"\xc4\xc1\x7b\x10\x0b")          # vmovsd xmm1, qword ptr [r11]
+        buf.emit(b"\xc4\xc1\x7b\x10\x10")          # vmovsd xmm2, qword ptr [r8]
+        buf.emit(b"\xc4\xe2\xf1\xa9\xc2")          # vfmadd213sd xmm0, xmm1, xmm2
+        buf.emit(b"\xc4\xc1\x7b\x11\x01")          # vmovsd qword ptr [r9], xmm0
+        buf.emit(b"\x49\x83\xc2\x08")              # add r10, 8
+        buf.emit(b"\x49\x83\xc3\x08")              # add r11, 8
+        buf.emit(b"\x49\x83\xc0\x08")              # add r8, 8
+        buf.emit(b"\x49\x83\xc1\x08")              # add r9, 8
+        buf.emit(b"\x48\xff\xc8")                  # dec rax
+        buf.jmp(".L_fma256_scalar")
+
+        buf.mark(".L_fma256_done")
+        buf.emit(_x64_mov_ri("rax", 1))
+        buf.emit(b"\xc3")
+        return buf.finalize()
+
+    def emit_avx512_evex_vec_add_i64(self) -> bytes:
+        """
+        Emits EVEX-encoded 512-bit AVX-512F kernel (8x i64 per vector instruction):
+          int64_t avx512_vec_add_i64(const int64_t* a, const int64_t* b, int64_t* out, int64_t count)
+        """
+        buf = X64LabelBuffer()
+        if self.is_windows:
+            buf.emit(_x64_mov_rr("r10", "rcx"))
+            buf.emit(_x64_mov_rr("r11", "rdx"))
+            buf.emit(_x64_mov_rr("rax", "r9"))
+            # out = r8, so mirror via r9 = r8
+            buf.emit(_x64_mov_rr("r9", "r8"))
+        else:
+            buf.emit(_x64_mov_rr("r10", "rdi"))
+            buf.emit(_x64_mov_rr("r11", "rsi"))
+            buf.emit(_x64_mov_rr("r9", "rdx"))
+            buf.emit(_x64_mov_rr("rax", "rcx"))
+
+        buf.mark(".L_zmm_vec")
+        buf.emit(b"\x48\x83\xf8\x08")              # cmp rax, 8
+        buf.emit(b"\x0f\x8c\x00\x00\x00\x00")
+        buf.fixups.append((len(buf.code) - 4, ".L_zmm_vzero"))
+
+        buf.emit(b"\x62\xd1\xfe\x48\x6f\x02")      # vmovdqu64 zmm0, zmmword ptr [r10]
+        buf.emit(b"\x62\xd1\xfe\x48\x6f\x0b")      # vmovdqu64 zmm1, zmmword ptr [r11]
+        buf.emit(b"\x62\xf1\xfd\x48\xd4\xc1")      # vpaddq zmm0, zmm0, zmm1
+        buf.emit(b"\x62\xd1\xfe\x48\x7f\x01")      # vmovdqu64 zmmword ptr [r9], zmm0
+        buf.emit(b"\x49\x83\xc2\x40")              # add r10, 64
+        buf.emit(b"\x49\x83\xc3\x40")              # add r11, 64
+        buf.emit(b"\x49\x83\xc1\x40")              # add r9, 64
+        buf.emit(b"\x48\x83\xe8\x08")              # sub rax, 8
+        buf.jmp(".L_zmm_vec")
+
+        buf.mark(".L_zmm_vzero")
+        buf.emit(b"\xc5\xf8\x77")                  # vzeroupper
+
+        buf.mark(".L_zmm_tail")
+        buf.emit(_x64_test_rr("rax"))
+        buf.emit(b"\x0f\x8e\x00\x00\x00\x00")
+        buf.fixups.append((len(buf.code) - 4, ".L_zmm_done"))
+
+        buf.emit(b"\x49\x8b\x0a")                  # mov rcx, [r10]
+        buf.emit(b"\x49\x03\x0b")                  # add rcx, [r11]
+        buf.emit(b"\x49\x89\x09")                  # mov [r9], rcx
+        buf.emit(b"\x49\x83\xc2\x08")              # add r10, 8
+        buf.emit(b"\x49\x83\xc3\x08")              # add r11, 8
+        buf.emit(b"\x49\x83\xc1\x08")              # add r9, 8
+        buf.emit(b"\x48\xff\xc8")                  # dec rax
+        buf.jmp(".L_zmm_tail")
+
+        buf.mark(".L_zmm_done")
+        buf.emit(_x64_mov_ri("rax", 1))
+        buf.emit(b"\xc3")
+        return buf.finalize()
+
+    def emit_avx512_evex_fma_pd(self) -> bytes:
+        """
+        Emits EVEX-encoded 512-bit AVX-512F Fused Multiply-Add kernel (8x f64 per instruction):
+          int64_t avx512_fma_pd(const double* a, const double* b, const double* c, double* out, int64_t count)
+        """
+        buf = X64LabelBuffer()
+        self._emit_5arg_setup(buf)
+
+        buf.mark(".L_zfma_vec")
+        buf.emit(b"\x48\x83\xf8\x08")              # cmp rax, 8
+        buf.emit(b"\x0f\x8c\x00\x00\x00\x00")
+        buf.fixups.append((len(buf.code) - 4, ".L_zfma_vzero"))
+
+        buf.emit(b"\x62\xd1\xfd\x48\x10\x02")      # vmovupd zmm0, zmmword ptr [r10]
+        buf.emit(b"\x62\xd1\xfd\x48\x10\x0b")      # vmovupd zmm1, zmmword ptr [r11]
+        buf.emit(b"\x62\xd1\xfd\x48\x10\x10")      # vmovupd zmm2, zmmword ptr [r8]
+        buf.emit(b"\x62\xf2\xf5\x48\xa8\xc2")      # vfmadd213pd zmm0, zmm1, zmm2
+        buf.emit(b"\x62\xd1\xfd\x48\x11\x01")      # vmovupd zmmword ptr [r9], zmm0
+        buf.emit(b"\x49\x83\xc2\x40")
+        buf.emit(b"\x49\x83\xc3\x40")
+        buf.emit(b"\x49\x83\xc0\x40")
+        buf.emit(b"\x49\x83\xc1\x40")
+        buf.emit(b"\x48\x83\xe8\x08")
+        buf.jmp(".L_zfma_vec")
+
+        buf.mark(".L_zfma_vzero")
+        buf.emit(b"\xc5\xf8\x77")
+
+        buf.mark(".L_zfma_tail")
+        buf.emit(_x64_test_rr("rax"))
+        buf.emit(b"\x0f\x8e\x00\x00\x00\x00")
+        buf.fixups.append((len(buf.code) - 4, ".L_zfma_done"))
+
+        buf.emit(b"\xc4\xc1\x7b\x10\x02")          # vmovsd xmm0, qword ptr [r10]
+        buf.emit(b"\xc4\xc1\x7b\x10\x0b")          # vmovsd xmm1, qword ptr [r11]
+        buf.emit(b"\xc4\xc1\x7b\x10\x10")          # vmovsd xmm2, qword ptr [r8]
+        buf.emit(b"\xc4\xe2\xf1\xa9\xc2")          # vfmadd213sd xmm0, xmm1, xmm2
+        buf.emit(b"\xc4\xc1\x7b\x11\x01")          # vmovsd qword ptr [r9], xmm0
+        buf.emit(b"\x49\x83\xc2\x08")
+        buf.emit(b"\x49\x83\xc3\x08")
+        buf.emit(b"\x49\x83\xc0\x08")
+        buf.emit(b"\x49\x83\xc1\x08")
+        buf.emit(b"\x48\xff\xc8")
+        buf.jmp(".L_zfma_tail")
+
+        buf.mark(".L_zfma_done")
+        buf.emit(_x64_mov_ri("rax", 1))
         buf.emit(b"\xc3")
         return buf.finalize()
 

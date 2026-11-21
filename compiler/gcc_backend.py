@@ -54,20 +54,108 @@ class GCCBackend:
         "fcmp_ge": ">=",
     }
 
-    _PROBE_CACHE: Optional[Tuple[Optional[str], Optional[str], str]] = None
+    _PROBE_CACHE: Optional[Tuple[Optional[str], Optional[str], str, Optional[str], str]] = None
 
     def __init__(self, opt_level: int = 3, march: Optional[str] = None):
         self.opt_level = opt_level
         self.march = march
-        self._mode: Optional[str] = None  # "native_linux", "wsl", "native_exe"
-        self._gcc_bin: Optional[str] = None
-        self._version_str: str = "unavailable"
+        self._elf_mode: Optional[str] = None  # "native_linux", "wsl"
+        self._elf_bin: Optional[str] = None
+        self._elf_ver: str = "unavailable"
+        self._coff_bin: Optional[str] = None
+        self._coff_ver: str = "unavailable"
         self._probe_gcc()
+
+    @staticmethod
+    def _canary_test_windows_coff(cand: str) -> Optional[str]:
+        """Canary-tests a native Windows C compiler (MinGW/Clang) for COFF `.obj` + executable compatibility."""
+        try:
+            dm = subprocess.run(
+                [cand, "-dumpmachine"],
+                capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+            )
+            if dm.returncode != 0:
+                return None
+            mach = dm.stdout.strip().lower()
+            if not any(tok in mach for tok in ("mingw", "w64", "windows", "pc-windows")):
+                return None
+            ver_r = subprocess.run(
+                [cand, "--version"],
+                capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+            )
+            if ver_r.returncode != 0:
+                return None
+
+            from compiler.object_linker import OS_C_ABI_IMPORT_TABLE, load_coff_object
+
+            canary_c = (
+                "#define __USE_MINGW_ANSI_STDIO 0\n"
+                "#include <stdint.h>\n"
+                "#include <stdio.h>\n"
+                "int64_t __omni_canary(int64_t a, int64_t b) {\n"
+                "    int64_t s = (int64_t)((uint64_t)a + (uint64_t)b);\n"
+                "    printf(\"CANARY=%lld\\n\", (long long)s);\n"
+                "    return s;\n"
+                "}\n"
+            )
+            with tempfile.TemporaryDirectory() as tmpd:
+                c_p = os.path.join(tmpd, "canary.c")
+                o_p = os.path.join(tmpd, "canary.obj")
+                e_p = os.path.join(tmpd, "canary.exe")
+                with open(c_p, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(canary_c)
+                is_clang = "clang" in os.path.basename(cand).lower()
+                cflags = [
+                    "-O3", "-std=gnu99", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+                    "-fwrapv", "-fno-strict-aliasing", "-fno-asynchronous-unwind-tables",
+                ]
+                if not is_clang:
+                    cflags.append("-mno-stack-arg-probe")
+                rc = subprocess.run(
+                    [cand] + cflags + ["-c", c_p, "-o", o_p],
+                    capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+                )
+                if rc.returncode != 0 or not os.path.exists(o_p):
+                    return None
+                with open(o_p, "rb") as f:
+                    obj_b = f.read()
+                mod = load_coff_object(obj_b, repo_name="gcc_coff_canary")
+                if "__omni_canary" not in mod.symbols:
+                    return None
+                for rel in mod.relocations:
+                    sym = rel.symbol_name
+                    if sym not in mod.symbols and not sym.startswith("__coff_sec_") and sym not in OS_C_ABI_IMPORT_TABLE:
+                        return None
+
+                exe_c = canary_c + "\nint main(void) { return __omni_canary(19, 23) == 42 ? 0 : 1; }\n"
+                c_ep = os.path.join(tmpd, "canary_exe.c")
+                with open(c_ep, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(exe_c)
+                re_c = subprocess.run(
+                    [cand] + cflags + [c_ep, "-o", e_p],
+                    capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+                )
+                if re_c.returncode != 0 or not os.path.exists(e_p):
+                    return None
+                rx = subprocess.run(
+                    [e_p], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+                )
+                if rx.returncode != 0 or "CANARY=42" not in rx.stdout:
+                    return None
+            return (ver_r.stdout.splitlines() or [os.path.basename(cand)])[0].strip()
+        except Exception:
+            return None
 
     def _probe_gcc(self) -> None:
         if GCCBackend._PROBE_CACHE is not None:
-            self._mode, self._gcc_bin, self._version_str = GCCBackend._PROBE_CACHE
+            self._elf_mode, self._elf_bin, self._elf_ver, self._coff_bin, self._coff_ver = GCCBackend._PROBE_CACHE
             return
+        elf_mode: Optional[str] = None
+        elf_bin: Optional[str] = None
+        elf_ver = "unavailable"
+        coff_bin: Optional[str] = None
+        coff_ver = "unavailable"
+
         if sys.platform != "win32":
             cand = shutil.which("gcc")
             if cand:
@@ -77,15 +165,12 @@ class GCCBackend:
                         capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
                     )
                     if r.returncode == 0:
-                        self._mode = "native_linux"
-                        self._gcc_bin = cand
-                        self._version_str = (r.stdout.splitlines() or ["gcc"])[0].strip()
-                        GCCBackend._PROBE_CACHE = (self._mode, self._gcc_bin, self._version_str)
-                        return
+                        elf_mode = "native_linux"
+                        elf_bin = cand
+                        elf_ver = (r.stdout.splitlines() or ["gcc"])[0].strip()
                 except Exception:
                     pass
         else:
-            # Check WSL2 /usr/bin/gcc (provides full ELF64 System V + GNU GCC O3)
             if shutil.which("wsl"):
                 try:
                     r = subprocess.run(
@@ -93,26 +178,50 @@ class GCCBackend:
                         capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL,
                     )
                     if r.returncode == 0:
-                        self._mode = "wsl"
-                        self._gcc_bin = "gcc"
-                        self._version_str = (r.stdout.splitlines() or ["gcc"])[0].strip()
-                        GCCBackend._PROBE_CACHE = (self._mode, self._gcc_bin, self._version_str)
-                        return
+                        elf_mode = "wsl"
+                        elf_bin = "gcc"
+                        elf_ver = (r.stdout.splitlines() or ["gcc"])[0].strip()
                 except Exception:
                     pass
-        GCCBackend._PROBE_CACHE = (None, None, "unavailable")
+
+            seen_cands: Set[str] = set()
+            for tool_name in ("x86_64-w64-mingw32-gcc", "gcc", "clang"):
+                cand = shutil.which(tool_name)
+                if not cand or cand in seen_cands:
+                    continue
+                seen_cands.add(cand)
+                ver_ok = self._canary_test_windows_coff(cand)
+                if ver_ok:
+                    coff_bin = cand
+                    coff_ver = ver_ok
+                    break
+
+        GCCBackend._PROBE_CACHE = (elf_mode, elf_bin, elf_ver, coff_bin, coff_ver)
+        self._elf_mode, self._elf_bin, self._elf_ver, self._coff_bin, self._coff_ver = GCCBackend._PROBE_CACHE
+
+    @property
+    def supports_elf64(self) -> bool:
+        return self._elf_mode is not None
+
+    @property
+    def supports_windows_coff(self) -> bool:
+        return self._coff_bin is not None
 
     @property
     def is_available(self) -> bool:
-        return self._mode is not None
+        return self.supports_elf64 or self.supports_windows_coff
 
     @property
     def mode(self) -> Optional[str]:
-        return self._mode
+        if self._elf_mode is not None:
+            return self._elf_mode
+        if self._coff_bin is not None:
+            return "native_exe"
+        return None
 
     @property
     def gcc_version(self) -> str:
-        return self._version_str
+        return self._elf_ver if self._elf_mode is not None else self._coff_ver
 
     @staticmethod
     def _c_type(var_type: str) -> str:
@@ -570,6 +679,9 @@ class GCCBackend:
         ]
         header = [
             f"/* Generated by OmniCompiler GCCBackend ({module_name}) */",
+            "#ifndef __USE_MINGW_ANSI_STDIO",
+            "#define __USE_MINGW_ANSI_STDIO 0",
+            "#endif",
             "#include <stdint.h>",
             "#include <stddef.h>",
             "#include <stdio.h>",
@@ -581,7 +693,7 @@ class GCCBackend:
         header.append("")
         return "\n".join(header + bodies)
 
-    def _gcc_flags(self, extra_flags: Optional[List[str]] = None) -> List[str]:
+    def _gcc_flags(self, extra_flags: Optional[List[str]] = None, target_format: str = "elf64") -> List[str]:
         flags = [
             f"-O{self.opt_level}",
             "-std=gnu99",
@@ -590,20 +702,32 @@ class GCCBackend:
             "-fwrapv",
             "-fno-strict-aliasing",
             "-fno-asynchronous-unwind-tables",
-            "-fPIC",
-            "-fcf-protection=none",
         ]
+        if target_format == "elf64":
+            flags.extend(["-fPIC", "-fcf-protection=none"])
+        else:
+            if self._coff_bin and "clang" not in os.path.basename(self._coff_bin).lower():
+                flags.append("-mno-stack-arg-probe")
         if self.march:
             flags.append(f"-march={self.march}")
         elif self.opt_level >= 3:
-            flags.append("-mavx2")
+            flags.extend(["-mavx2", "-mfma"])
         if extra_flags:
             flags.extend(extra_flags)
         return flags
 
-    def _run_gcc(self, src_c: str, out_ext: str, extra_flags: Optional[List[str]] = None) -> bytes:
-        if not self.is_available:
-            raise RuntimeError("GCC backend is not available (neither native gcc nor WSL gcc found).")
+    def _run_gcc(
+        self,
+        src_c: str,
+        out_ext: str,
+        extra_flags: Optional[List[str]] = None,
+        target_format: str = "elf64",
+    ) -> bytes:
+        if target_format == "coff64":
+            if not self.supports_windows_coff or not self._coff_bin:
+                raise RuntimeError("Native Windows COFF compiler (MinGW/Clang) is unavailable or failed canary.")
+        elif not self.supports_elf64:
+            raise RuntimeError("Linux ELF64 GCC backend is unavailable.")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             c_file = os.path.join(tmpdir, "module.c")
@@ -611,13 +735,15 @@ class GCCBackend:
             with open(c_file, "w", encoding="utf-8", newline="\n") as f:
                 f.write(src_c)
 
-            flags = self._gcc_flags(extra_flags)
-            if self._mode == "wsl":
+            flags = self._gcc_flags(extra_flags, target_format=target_format)
+            if target_format == "coff64":
+                cmd = [self._coff_bin] + flags + [c_file, "-o", out_file]
+            elif self._elf_mode == "wsl":
                 w_c = _to_wsl_path(c_file)
                 w_o = _to_wsl_path(out_file)
                 cmd = ["wsl", "/usr/bin/gcc"] + flags + [w_c, "-o", w_o]
             else:
-                cmd = [self._gcc_bin] + flags + [c_file, "-o", out_file]
+                cmd = [self._elf_bin] + flags + [c_file, "-o", out_file]
 
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
             if r.returncode != 0:
@@ -626,23 +752,48 @@ class GCCBackend:
             with open(out_file, "rb") as f:
                 return f.read()
 
-    def emit_object(self, ssa_funcs: List[SSAFunction], module_name: str = "omni_gcc_module") -> bytes:
-        """Compiles `SSAFunction`s via GCC `-O3 -c` into a relocatable ELF64 `.o` object."""
+    def emit_object(
+        self,
+        ssa_funcs: List[SSAFunction],
+        module_name: str = "omni_gcc_module",
+        target_os: Optional[str] = None,
+    ) -> bytes:
+        """Compiles `SSAFunction`s via GCC `-O3 -c` into relocatable ELF64 `.o` or Windows PE/COFF `.obj`."""
+        if not self.is_available:
+            raise RuntimeError("GCC backend is not available (neither ELF64 gcc nor canary-verified Windows COFF compiler found).")
+        if target_os is not None:
+            want_coff = target_os.lower() in ("windows", "win32", "pe", "pe64", "pe_dll")
+        else:
+            want_coff = (not self.supports_elf64) and self.supports_windows_coff
         c_src = self.ssa_module_to_c(ssa_funcs, module_name=module_name)
-        return self._run_gcc(c_src, ".o", extra_flags=["-c"])
+        if want_coff:
+            return self._run_gcc(c_src, ".obj", extra_flags=["-c"], target_format="coff64")
+        return self._run_gcc(c_src, ".o", extra_flags=["-c"], target_format="elf64")
 
-    def emit_assembly(self, ssa_funcs: List[SSAFunction], module_name: str = "omni_gcc_module") -> str:
-        """Emits target assembly (`-S`) compiled with GCC `-O3`."""
+    def emit_assembly(self, ssa_funcs: List[SSAFunction], module_name: str = "omni_gcc_module", target_os: Optional[str] = None) -> str:
+        """Emits target assembly (`-S`) compiled with GCC `-O3 -mavx2 -mfma`."""
+        if not self.is_available:
+            raise RuntimeError("GCC backend is not available.")
+        if target_os is not None:
+            want_coff = target_os.lower() in ("windows", "win32", "pe", "pe64", "pe_dll")
+        else:
+            want_coff = (not self.supports_elf64) and self.supports_windows_coff
         c_src = self.ssa_module_to_c(ssa_funcs, module_name=module_name)
-        return self._run_gcc(c_src, ".s", extra_flags=["-S"]).decode("utf-8", errors="replace")
+        fmt = "coff64" if want_coff else "elf64"
+        return self._run_gcc(c_src, ".s", extra_flags=["-S"], target_format=fmt).decode("utf-8", errors="replace")
 
     @staticmethod
     def inspect_optimization_stats(asm_text: str) -> Dict[str, Any]:
-        simd_hits = re.findall(r"\b(v?(?:padd|psub|pmull|addp|subp|mulp|movdqu|movdqa)[a-z0-9]*)\b", asm_text)
+        simd_hits = re.findall(
+            r"\b(v?(?:padd|psub|pmull|addp|subp|mulp|movdqu[0-9]*|movdqa|movupd|movups|fm(?:add|sub)[a-z0-9]*)[a-z0-9]*)\b",
+            asm_text,
+        )
+        zmm_regs = re.findall(r"%?zmm\d+", asm_text)
         ymm_regs = re.findall(r"%?ymm\d+", asm_text)
         xmm_regs = re.findall(r"%?xmm\d+", asm_text)
         return {
             "simd_instruction_count": len(simd_hits),
+            "zmm_operand_refs": len(zmm_regs),
             "ymm_operand_refs": len(ymm_regs),
             "xmm_operand_refs": len(xmm_regs),
             "sample_simd_mnemonics": sorted(set(simd_hits))[:16],
@@ -743,8 +894,9 @@ class GCCBackend:
                 for addr in ordered_addrs:
                     f.write(mem_regions[addr])
 
-            flags = self._gcc_flags()
-            if self._mode == "wsl":
+            use_coff_exec = (not self.supports_elf64) and self.supports_windows_coff
+            flags = self._gcc_flags(target_format="coff64" if use_coff_exec else "elf64")
+            if not use_coff_exec and self._elf_mode == "wsl":
                 w_c = _to_wsl_path(c_path)
                 w_e = f"/tmp/omni_gcc_{os.getpid()}_{uuid.uuid4().hex[:10]}"
                 w_in = _to_wsl_path(in_path)
@@ -759,14 +911,23 @@ class GCCBackend:
                         raise RuntimeError(f"GCC harness execution failed (rc={rr.returncode}): {rr.stderr}")
                 finally:
                     subprocess.run(["wsl", "rm", "-f", w_e], capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
-            else:
-                comp_cmd = [self._gcc_bin] + flags + [c_path, "-o", exe_path, "-lm"]
+            elif not use_coff_exec:
+                comp_cmd = [self._elf_bin] + flags + [c_path, "-o", exe_path, "-lm"]
                 rc = subprocess.run(comp_cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
                 if rc.returncode != 0:
                     raise RuntimeError(f"GCC harness compilation failed:\n{rc.stderr}")
                 rr = subprocess.run([exe_path, in_path, out_path], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
                 if rr.returncode != 0:
                     raise RuntimeError(f"GCC harness execution failed (rc={rr.returncode}): {rr.stderr}")
+            else:
+                exe_win = exe_path + ".exe"
+                comp_cmd = [self._coff_bin] + flags + [c_path, "-o", exe_win, "-lm"]
+                rc = subprocess.run(comp_cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+                if rc.returncode != 0:
+                    raise RuntimeError(f"GCC Windows COFF harness compilation failed:\n{rc.stderr}")
+                rr = subprocess.run([exe_win, in_path, out_path], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+                if rr.returncode != 0:
+                    raise RuntimeError(f"GCC Windows COFF harness execution failed (rc={rr.returncode}): {rr.stderr}")
 
             with open(out_path, "rb") as f:
                 raw_out = f.read()

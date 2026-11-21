@@ -326,7 +326,7 @@ class TestAlphaC63QuadHomeostasisE2E(unittest.TestCase):
                 self.assertIn(f"C63_QUAD={exp}", p.stdout)
                 self.assertEqual(p.returncode, exp % 251)
 
-            if comp.gcc.is_available:
+            if comp.gcc.supports_elf64:
                 lin_bin = os.path.join(self.test_dir, "c63_quad_linux")
                 res_lin = comp.compile_repositories(
                     [r_dir],

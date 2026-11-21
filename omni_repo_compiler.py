@@ -331,11 +331,15 @@ class OmniRepoCompiler:
         effective_arch = (target_arch.lower() if target_arch else "x86_64")
         if resolved_backend == "gcc":
             if not self.gcc.is_available:
-                raise RuntimeError("GCC backend selected, but neither native gcc nor WSL gcc is available.")
-            if effective_os == "windows" and self.gcc.mode != "native_exe":
+                raise RuntimeError("GCC backend selected, but neither ELF64 gcc nor canary-verified COFF compiler is available.")
+            if effective_os == "windows" and not self.gcc.supports_windows_coff:
                 raise ValueError(
-                    "GCC ELF64 backend requires target_os='linux' on Windows without native MinGW; "
+                    "GCC ELF64 backend requires target_os='linux' on Windows without canary-verified MinGW/Clang; "
                     "use target_os='linux' or backend='homeostasis'."
+                )
+            if effective_os == "linux" and not self.gcc.supports_elf64:
+                raise ValueError(
+                    "GCC Windows COFF backend cannot emit Linux ELF64 objects without WSL2/native Linux GCC."
                 )
         results["target"] = {
             "os": effective_os,
@@ -1184,9 +1188,11 @@ class OmniRepoCompiler:
 
                     if (
                         resolved_homeo_policy == "throughput"
-                        and effective_os == "linux"
-                        and self.gcc.is_available
                         and "gcc" not in homeostasis_isolated_engines
+                        and (
+                            (effective_os == "linux" and self.gcc.supports_elf64)
+                            or (effective_os == "windows" and self.gcc.supports_windows_coff)
+                        )
                         and (
                             "gcc" in homeostasis_throughput_winners
                             or not self.llvm.is_available
@@ -1204,8 +1210,14 @@ class OmniRepoCompiler:
                     )
                 ]
                 if gcc_eligible:
-                    gcc_obj_bytes = self.gcc.emit_object(gcc_eligible, module_name=f"omni_{m.repo_name}")
-                    gcc_obj_mod = load_elf_object(gcc_obj_bytes, repo_name=f"{m.repo_name}_gcc")
+                    gcc_obj_bytes = self.gcc.emit_object(
+                        gcc_eligible, module_name=f"omni_{m.repo_name}", target_os=effective_os
+                    )
+                    gcc_obj_mod = (
+                        load_coff_object(gcc_obj_bytes, repo_name=f"{m.repo_name}_gcc")
+                        if effective_os == "windows"
+                        else load_elf_object(gcc_obj_bytes, repo_name=f"{m.repo_name}_gcc")
+                    )
                     for s in gcc_eligible:
                         if s.name in gcc_obj_mod.symbols:
                             gcc_obj_mod.symbols[s.name].is_exported = unit_export_flag.get(s.name, True)
@@ -1341,6 +1353,7 @@ class OmniRepoCompiler:
             "verdicts": backend_verdicts,
         }
         if resolved_backend == "homeostasis":
+            from compiler.native_codegen import detect_host_simd_features
             if homeostasis_emitter_used == "native" and llvm_compiled_functions > 0:
                 homeostasis_emitter_used = "llvm"
             elif homeostasis_emitter_used == "native" and gcc_compiled_functions > 0:
@@ -1350,8 +1363,11 @@ class OmniRepoCompiler:
                 "available_engines": self.homeostasis.available_engines(),
                 "llvm_available": self.llvm.is_available,
                 "gcc_available": self.gcc.is_available,
+                "gcc_supports_elf64": self.gcc.supports_elf64,
+                "gcc_supports_windows_coff": self.gcc.supports_windows_coff,
                 "wasm_available": self.wasm.is_available,
                 "native_available": True,
+                "host_simd_features": detect_host_simd_features(),
                 "simd_telemetry_by_engine": homeostasis_simd_telemetry,
                 "wat_translation_proofs": homeostasis_wat_proofs,
                 "differential_consensus_reports": homeostasis_diff_reports,
@@ -1363,13 +1379,20 @@ class OmniRepoCompiler:
 
         vla_simd_metadata = None
         if vectorized_loops > 0:
+            from compiler.native_codegen import detect_host_simd_features
             from compiler.vla_simd_engine import VLASimdEngine
-            isa = "SVE_SCALABLE" if effective_arch == "arm64" else "AVX2_256"
+            host_simd = detect_host_simd_features()
+            if effective_arch == "arm64":
+                isa, lanes_v = "SVE_SCALABLE", 4
+            elif host_simd.get("avx512f", False):
+                isa, lanes_v = "AVX512_512", 8
+            else:
+                isa, lanes_v = "AVX2_256", 4
             vla_engine = VLASimdEngine(target_isa=isa)
             vla_simd_metadata = (
-                vla_engine.emit_arm64_sve_metadata()
+                vla_engine.emit_arm64_sve_metadata(lanes=lanes_v)
                 if effective_arch == "arm64"
-                else vla_engine.emit_x86_vmaskmov_metadata()
+                else vla_engine.emit_x86_vmaskmov_metadata(lanes=lanes_v)
             )
 
         results["stages"]["codegen"] = {
