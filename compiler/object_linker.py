@@ -338,6 +338,150 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
     return mod
 
 
+def load_macho_object(obj_bytes: bytes, repo_name: str = "macho_object") -> ObjectModule:
+    """
+    Parses a 64-bit Mach-O relocatable object file (`.o`, `MH_OBJECT`) for x86-64
+    or ARM64 into an `ObjectModule` for unified static linking.
+    """
+    if len(obj_bytes) < 32:
+        raise LinkerError("Truncated Mach-O object header")
+    magic, cputype, _cpusub, filetype, ncmds, _szcmds, _flags, _res = struct.unpack_from("<IIIIIIII", obj_bytes, 0)
+    if magic != 0xFEEDFACF:
+        raise LinkerError(f"Invalid Mach-O 64 magic: 0x{magic:08x}")
+    if filetype != 1:
+        raise LinkerError(f"Expected MH_OBJECT (filetype=1), got {filetype}")
+
+    mod = ObjectModule(repo_name=repo_name)
+    sections_meta: List[Tuple[str, str, int, int, int, int, int]] = []
+    sym_cmd: Optional[Tuple[int, int, int, int]] = None
+
+    off = 32
+    for _ in range(ncmds):
+        if off + 8 > len(obj_bytes):
+            break
+        cmd, cmdsize = struct.unpack_from("<II", obj_bytes, off)
+        if cmd == 0x19:  # LC_SEGMENT_64
+            nsects = struct.unpack_from("<I", obj_bytes, off + 64)[0]
+            soff = off + 72
+            for _ in range(nsects):
+                sname = obj_bytes[soff : soff + 16].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                segname = obj_bytes[soff + 16 : soff + 32].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                vmaddr, sz, foff, _align, reloff, nreloc, _sflags = struct.unpack_from("<QQIIIII", obj_bytes, soff + 32)
+                sections_meta.append((segname, sname, vmaddr, sz, foff, reloff, nreloc))
+                soff += 80
+        elif cmd == 0x02:  # LC_SYMTAB
+            sym_cmd = struct.unpack_from("<IIII", obj_bytes, off + 8)
+        off += cmdsize
+
+    text_idx_1based: Optional[int] = None
+    text_vmaddr = 0
+    text_sz = 0
+    text_reloff = 0
+    text_nreloc = 0
+    rodata_sec_bases: Dict[int, Tuple[int, int]] = {}
+
+    for idx_1, (segname, sname, vmaddr, sz, foff, reloff, nreloc) in enumerate(sections_meta, start=1):
+        if segname == "__TEXT" and sname == "__text":
+            text_idx_1based = idx_1
+            text_vmaddr = vmaddr
+            text_sz = sz
+            text_reloff = reloff
+            text_nreloc = nreloc
+            mod.text_bytes.extend(obj_bytes[foff : foff + sz])
+        elif (
+            (segname == "__TEXT" and (sname in ("__cstring", "__const") or sname.startswith("__literal")))
+            or (segname == "__DATA" and sname in ("__const", "__data"))
+        ) and sz > 0:
+            pad = (32 - (len(mod.text_bytes) % 32)) % 32
+            if pad:
+                mod.text_bytes.extend(b"\x00" * pad)
+            sec_base = len(mod.text_bytes)
+            mod.text_bytes.extend(obj_bytes[foff : foff + sz])
+            rodata_sec_bases[idx_1] = (sec_base, vmaddr)
+            sec_sym = f"__macho_sec_{idx_1}__"
+            mod.symbols[sec_sym] = SymbolDef(
+                name=sec_sym,
+                section=".rodata",
+                offset=sec_base,
+                size=max(1, sz),
+                is_exported=False,
+                source_repo=repo_name,
+            )
+
+    if text_idx_1based is None:
+        raise LinkerError("Mach-O object contains no __TEXT,__text section")
+
+    sym_clean_names: Dict[int, str] = {}
+    if sym_cmd is not None:
+        symoff, nsyms, stroff, _strsize = sym_cmd
+        for i in range(nsyms):
+            entry_off = symoff + i * 16
+            if entry_off + 16 > len(obj_bytes):
+                break
+            strx, n_type, n_sect, _n_desc, n_val = struct.unpack_from("<IBBHQ", obj_bytes, entry_off)
+            end_z = obj_bytes.find(b"\x00", stroff + strx)
+            raw_name = obj_bytes[stroff + strx : (end_z if end_z != -1 else len(obj_bytes))].decode("utf-8", errors="replace")
+            clean_name = raw_name[1:] if raw_name.startswith("_") else raw_name
+            sym_clean_names[i] = clean_name
+            is_ext = bool(n_type & 0x01)
+            is_sect = (n_type & 0x0E) == 0x0E
+            if is_sect and n_sect == text_idx_1based and is_ext and clean_name:
+                rel_off = int(n_val - text_vmaddr)
+                mod.symbols[clean_name] = SymbolDef(
+                    name=clean_name,
+                    section=".text",
+                    offset=rel_off,
+                    size=max(1, text_sz - rel_off),
+                    is_exported=True,
+                    source_repo=repo_name,
+                )
+            elif is_sect and n_sect in rodata_sec_bases and clean_name and not raw_name.startswith("ltmp"):
+                sec_base, sec_vm = rodata_sec_bases[n_sect]
+                mod.symbols[clean_name] = SymbolDef(
+                    name=clean_name,
+                    section=".rodata",
+                    offset=sec_base + int(n_val - sec_vm),
+                    size=8,
+                    is_exported=False,
+                    source_repo=repo_name,
+                )
+
+    is_arm64 = (cputype == 0x0100000C)
+    for r_i in range(text_nreloc):
+        ro = text_reloff + r_i * 8
+        if ro + 8 > len(obj_bytes):
+            break
+        r_addr, r_val = struct.unpack_from("<iI", obj_bytes, ro)
+        if r_addr < 0:
+            continue
+        r_sym = r_val & 0x00FFFFFF
+        r_len = (r_val >> 25) & 3
+        r_ext = (r_val >> 27) & 1
+        r_type = (r_val >> 28) & 0xF
+        if r_ext == 1:
+            target_sym = sym_clean_names.get(r_sym, "")
+            if not target_sym:
+                continue
+            if is_arm64:
+                if r_type == 2:  # ARM64_RELOC_BRANCH26
+                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ARM64_CALL26", addend=0))
+                elif r_type == 0 and r_len == 3:
+                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ADDR64", addend=0))
+            else:
+                if r_type in (1, 2, 3) and r_len == 2:
+                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "REL32", addend=0))
+                elif r_type == 0 and r_len == 3:
+                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ADDR64", addend=0))
+        else:
+            if r_sym in rodata_sec_bases and not is_arm64 and r_type == 1 and r_len == 2:
+                _sec_base, sec_vm = rodata_sec_bases[r_sym]
+                init_disp = struct.unpack_from("<i", mod.text_bytes, r_addr)[0] if r_addr + 4 <= len(mod.text_bytes) else 0
+                inner_addend = (r_addr + 4 + init_disp) - sec_vm
+                mod.relocations.append(RelocationEntry(".text", r_addr, f"__macho_sec_{r_sym}__", "REL32", addend=inner_addend))
+
+    return mod
+
+
 # ==============================================================================
 # Static Multi-Module Linker
 # ==============================================================================
@@ -407,6 +551,11 @@ class NativeObjectLinker:
 
     def add_elf_object(self, obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectModule:
         mod = load_elf_object(obj_bytes, repo_name=repo_name)
+        self.add_module(mod)
+        return mod
+
+    def add_macho_object(self, obj_bytes: bytes, repo_name: str = "macho_object") -> ObjectModule:
+        mod = load_macho_object(obj_bytes, repo_name=repo_name)
         self.add_module(mod)
         return mod
 

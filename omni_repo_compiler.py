@@ -22,7 +22,7 @@ from orchestrator.salsa_query_engine import SalsaQueryEngine
 from orchestrator.persistent_salsa_cache import PersistentSalsaCache
 from slicer.persistent_cpg import PersistentCodePropertyGraph
 from adapters.universal_abi_bridge import UniversalAbiBridge
-from compiler.object_linker import NativeObjectLinker, ObjectModule, OS_C_ABI_IMPORT_TABLE, load_coff_object, load_elf_object
+from compiler.object_linker import NativeObjectLinker, ObjectModule, OS_C_ABI_IMPORT_TABLE, load_coff_object, load_elf_object, load_macho_object
 from compiler.binary_emitter import StandaloneBinaryEmitter
 from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator
 from compiler.ssa_ir import lower_ast_to_ssa
@@ -170,8 +170,10 @@ class OmniRepoCompiler:
     _LLVM_TARGET_TRIPLES: Dict[Tuple[str, str], str] = {
         ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
         ("windows", "x86_64"): "x86_64-pc-windows-msvc",
+        ("macos", "x86_64"): "x86_64-apple-macosx",
         ("linux", "arm64"): "aarch64-unknown-linux-gnu",
         ("windows", "arm64"): "aarch64-pc-windows-msvc",
+        ("macos", "arm64"): "arm64-apple-macosx",
     }
 
     def __init__(self, db_path: Optional[str] = None):
@@ -1380,11 +1382,12 @@ class OmniRepoCompiler:
                         )
                 llvm_mod = target_llvm.compile_ir(llvm_ir, optimize=True)
                 obj_bytes = target_llvm.emit_object(llvm_mod)
-                llvm_obj_mod = (
-                    load_coff_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
-                    if effective_os == "windows"
-                    else load_elf_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
-                )
+                if effective_os == "windows":
+                    llvm_obj_mod = load_coff_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
+                elif effective_os == "macos":
+                    llvm_obj_mod = load_macho_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
+                else:
+                    llvm_obj_mod = load_elf_object(obj_bytes, repo_name=f"{m.repo_name}_llvm")
                 for s in llvm_eligible:
                     if s.name in llvm_obj_mod.symbols:
                         llvm_obj_mod.symbols[s.name].is_exported = unit_export_flag.get(s.name, True)
@@ -1681,6 +1684,10 @@ class OmniRepoCompiler:
                 g_off = global_syms.get(sym_name, 0)
                 for c_off, ln in art.line_table:
                     all_line_entries.append((g_off + c_off, ln))
+            for sym_name, g_off in sorted(global_syms.items()):
+                if sym_name not in compiled_artifacts and sym_name in all_ast_funcs:
+                    src_ln = max(1, int(getattr(all_ast_funcs[sym_name], "lineno", 1) or 1))
+                    all_line_entries.append((g_off, src_ln))
             dwarf_line_bytes = self.dwarf_emitter.emit_debug_line(
                 source_file=primary_source_file,
                 line_entries=all_line_entries,
