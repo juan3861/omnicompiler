@@ -724,16 +724,22 @@ class StandaloneBinaryEmitter:
     # 5. ARM64 (AARCH64) STANDALONE EXECUTABLES (LINUX & WINDOWS)
     # =========================================================================
 
-    def build_arm64_elf(self, exit_code: int = 0, custom_code: Optional[bytes] = None) -> bytes:
+    def build_arm64_elf(
+        self,
+        exit_code: int = 0,
+        custom_code: Optional[bytes] = None,
+        entry_offset: Optional[int] = None,
+    ) -> bytes:
         vaddr = self.VADDR_ELF
-        entry_offset = 120
-        entry_addr = vaddr + entry_offset
+        hdr_entry_offset = 120
+        entry_addr = vaddr + hdr_entry_offset
 
         code = bytearray()
         if custom_code:
-            # Call custom_code (which ends in RET) via BL #2 instructions (+8 bytes), then SVC #0 sys_exit(X0)!
-            # BL +12 (3 words: BL, MOV X8 #93, SVC #0 -> custom_code starts at +12 bytes = +3 words)
-            bl_fn = 0x94000003
+            # Call custom_code + (entry_offset or 0) via BL, then SVC #0 sys_exit(X0)!
+            fn_off = int(entry_offset or 0)
+            bl_words = 3 + (fn_off // 4)
+            bl_fn = 0x94000000 | (bl_words & 0x03FFFFFF)
             mov_x8 = 0xD2800000 | (93 << 5) | 8
             svc_0 = 0xD4000001
             code.extend(struct.pack("<III", bl_fn, mov_x8, svc_0))
@@ -744,7 +750,7 @@ class StandaloneBinaryEmitter:
             svc_0 = 0xD4000001
             code.extend(struct.pack("<III", mov_x0, mov_x8, svc_0))
 
-        total_size = entry_offset + len(code)
+        total_size = hdr_entry_offset + len(code)
         elf_ident = b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 8)
         elf_header = struct.pack(
             "<16sHHIQQQIHHHHHH",
@@ -755,7 +761,12 @@ class StandaloneBinaryEmitter:
         prog_header = struct.pack("<IIQQQQQQ", 1, 7, 0, vaddr, vaddr, total_size, total_size, 0x1000)
         return elf_header + prog_header + bytes(code)
 
-    def build_arm64_pe(self, exit_code: int = 0, custom_code: Optional[bytes] = None) -> bytes:
+    def build_arm64_pe(
+        self,
+        exit_code: int = 0,
+        custom_code: Optional[bytes] = None,
+        entry_offset: Optional[int] = None,
+    ) -> bytes:
         file_align = self.FILE_ALIGN
         sec_align = self.SEC_ALIGN
         image_base = self.IMAGE_BASE_PE
@@ -770,6 +781,7 @@ class StandaloneBinaryEmitter:
 
         raw_code = bytes(code).ljust(self._align_up(max(1, len(code)), file_align), b"\x00")
         size_of_image = 0x1000 + self._align_up(len(raw_code), sec_align)
+        entry_rva = 0x1000 + (int(entry_offset) if (custom_code and entry_offset is not None) else 0)
 
         dos_header = bytearray(64)
         dos_header[0:2] = b"MZ"
@@ -782,7 +794,7 @@ class StandaloneBinaryEmitter:
             "<HBBIIIIIQIIHHHHHHIIIIHHQQQQII",
             0x020B, 14, 0,
             len(raw_code), 0, 0,
-            0x1000, 0x1000,
+            entry_rva, 0x1000,
             image_base,
             sec_align, file_align,
             6, 0, 0, 0, 6, 0, 0,
@@ -808,10 +820,11 @@ class StandaloneBinaryEmitter:
         entry_offset: Optional[int] = None,
         load_dylibs: Optional[List[str]] = None,
         imported_symbols: Optional[List[str]] = None,
+        exported_symbols: Optional[Dict[str, int]] = None,
     ) -> bytes:
         """
         Synthesizes a 64-bit Mach-O standalone executable (`MH_EXECUTE`) for macOS.
-        Supports optional `LC_LOAD_DYLINKER` + `LC_LOAD_DYLIB` (`0x0C`) + `LC_SYMTAB` external imports.
+        Supports optional `LC_LOAD_DYLINKER` + `LC_LOAD_DYLIB` (`0x0C`) + `LC_SYMTAB` + `LC_DYSYMTAB`.
         On Apple Silicon (`arm64`), embeds `__LINKEDIT` + XNU `LC_CODE_SIGNATURE` (`0x1D`)
         with SHA-256 page hashes (`CS_SuperBlob` `0xFADE0CC0`).
         """
@@ -849,19 +862,34 @@ class StandaloneBinaryEmitter:
                 d_sz = self._align_up(24 + len(d_raw), 8)
                 dylib_cmds.append(struct.pack("<IIIIII", 0x0C, d_sz, 24, 2, 0x010000, 0x010000) + d_raw.ljust(d_sz - 24, b"\x00"))
 
-        need_symtab = bool(imported_symbols)
+        need_symtab = bool(imported_symbols or exported_symbols)
+        need_dysymtab = bool(imported_symbols)
         need_linkedit = is_arm64 or need_symtab
 
         symtab_bytes = bytearray()
         strtab_bytes = bytearray(b"\x00")
-        nsyms = 0
+        n_ext_def = 0
+        n_undef = 0
+        defined_names = set()
+        if exported_symbols:
+            for sym, sym_off in sorted(exported_symbols.items(), key=lambda kv: kv[0]):
+                m_sym = sym if sym.startswith("_") else f"_{sym}"
+                defined_names.add(sym)
+                defined_names.add(m_sym)
+                s_off = len(strtab_bytes)
+                strtab_bytes.extend(m_sym.encode("utf-8") + b"\x00")
+                symtab_bytes.extend(struct.pack("<IBBHQ", s_off, 0x0F, 1, 0, code_vaddr + int(sym_off)))  # N_EXT | N_SECT
+                n_ext_def += 1
         if imported_symbols:
             for sym in imported_symbols:
+                if sym in defined_names:
+                    continue
                 m_sym = sym if sym.startswith("_") else f"_{sym}"
                 s_off = len(strtab_bytes)
                 strtab_bytes.extend(m_sym.encode("ascii") + b"\x00")
                 symtab_bytes.extend(struct.pack("<IBBHQ", s_off, 0x01, 0, 0, 0))  # N_EXT | N_UNDF
-                nsyms += 1
+                n_undef += 1
+        nsyms = n_ext_def + n_undef
         symtab_pad = bytes(symtab_bytes)
         strtab_pad = bytes(strtab_bytes).ljust(self._align_up(len(strtab_bytes), 8), b"\x00")
         linkedit_data = symtab_pad + strtab_pad if need_symtab else b""
@@ -877,13 +905,21 @@ class StandaloneBinaryEmitter:
         cmd3_size = 24        # LC_MAIN
         cmd_linkedit_size = 72 if need_linkedit else 0
         cmd_symtab_size = 24 if need_symtab else 0
+        cmd_dysymtab_size = 80 if need_dysymtab else 0
         cmd_codesig_size = 16 if is_arm64 else 0
 
-        ncmds = 3 + len(dylib_cmds) + (1 if need_linkedit else 0) + (1 if need_symtab else 0) + (1 if is_arm64 else 0)
+        ncmds = (
+            3
+            + len(dylib_cmds)
+            + (1 if need_linkedit else 0)
+            + (1 if need_symtab else 0)
+            + (1 if need_dysymtab else 0)
+            + (1 if is_arm64 else 0)
+        )
         sizeofcmds = (
             cmd1_size + cmd2_size + cmd3_size
             + sum(len(c) for c in dylib_cmds)
-            + cmd_linkedit_size + cmd_symtab_size + cmd_codesig_size
+            + cmd_linkedit_size + cmd_symtab_size + cmd_dysymtab_size + cmd_codesig_size
         )
 
         # Pre-calculate codesign size for __LINKEDIT if ARM64
@@ -936,6 +972,8 @@ class StandaloneBinaryEmitter:
             ))
         if need_symtab:
             extra_cmds.extend(struct.pack("<IIIIII", 0x02, 24, symoff, nsyms, stroff, len(strtab_pad)))
+        if need_dysymtab:
+            extra_cmds.extend(struct.pack("<20I", 0x0B, 80, 0, 0, 0, n_ext_def, n_ext_def, n_undef, *([0] * 12)))
         if is_arm64:
             extra_cmds.extend(struct.pack("<IIII", 0x1D, 16, codesig_off, len(est_sig)))
 
@@ -1061,7 +1099,8 @@ class StandaloneBinaryEmitter:
         target_format: str = "auto",
         custom_code: Optional[bytes] = None,
         exit_code: int = 0,
-        entry_offset: Optional[int] = None
+        entry_offset: Optional[int] = None,
+        exported_symbols: Optional[Dict[str, int]] = None,
     ) -> str:
         if target_format == "auto":
             target_format = "pe64" if sys.platform == "win32" else "elf64"
@@ -1073,15 +1112,27 @@ class StandaloneBinaryEmitter:
         elif target_format == "elf64":
             data = self.build_elf64(custom_code=custom_code, exit_code=exit_code, entry_offset=entry_offset)
         elif target_format == "arm64_elf":
-            data = self.build_arm64_elf(exit_code=exit_code, custom_code=custom_code)
+            data = self.build_arm64_elf(exit_code=exit_code, custom_code=custom_code, entry_offset=entry_offset)
         elif target_format == "arm64_pe":
             if not output_path.endswith(".exe"):
                 output_path += ".exe"
-            data = self.build_arm64_pe(exit_code=exit_code, custom_code=custom_code)
+            data = self.build_arm64_pe(exit_code=exit_code, custom_code=custom_code, entry_offset=entry_offset)
         elif target_format in ("macho64", "macho_x86_64"):
-            data = self.build_macho64(exit_code=exit_code, custom_code=custom_code, arch="x86_64", entry_offset=entry_offset)
+            data = self.build_macho64(
+                exit_code=exit_code,
+                custom_code=custom_code,
+                arch="x86_64",
+                entry_offset=entry_offset,
+                exported_symbols=exported_symbols,
+            )
         elif target_format in ("arm64_macho", "macho_arm64"):
-            data = self.build_macho64(exit_code=exit_code, custom_code=custom_code, arch="arm64", entry_offset=entry_offset)
+            data = self.build_macho64(
+                exit_code=exit_code,
+                custom_code=custom_code,
+                arch="arm64",
+                entry_offset=entry_offset,
+                exported_symbols=exported_symbols,
+            )
         else:
             raise ValueError(f"Unsupported binary target: {target_format}")
 
@@ -1651,11 +1702,11 @@ class StandaloneBinaryEmitter:
         os_import_stubs: Dict[str, int],
         os_import_table: Dict[str, Tuple[str, str]],
         target_format: str = "auto",
+        exported_symbols: Optional[Dict[str, int]] = None,
     ) -> str:
         """
-        Emits a native executable (`pe64` or `elf64`) wrapping `linked_code` with CLI entrypoint,
-        synthesizing OS dynamic import tables (`.idata` / `.dynsym`+`.got.plt`), and patching
-        every OS stub in `os_import_stubs` to `jmp qword ptr [rip + iat_or_got_disp32]`.
+        Emits a native executable (`pe64`, `elf64`, `arm64_elf`, `macho64`, or `arm64_macho`)
+        wrapping `linked_code` with CLI entrypoint and synthesizing OS dynamic import tables.
         """
         if target_format == "auto":
             target_format = "pe64" if sys.platform == "win32" else "elf64"
@@ -1740,6 +1791,17 @@ class StandaloneBinaryEmitter:
                     imported_funcs=imported_funcs,
                     custom_code=elf_builder,
                 )
+        elif target_format in ("macho64", "macho_x86_64", "arm64_macho", "macho_arm64"):
+            arch_m = "arm64" if "arm64" in target_format else "x86_64"
+            imported_funcs = sorted(set(os_import_stubs.keys()))
+            data = self.build_macho64(
+                custom_code=linked_code,
+                arch=arch_m,
+                entry_offset=entry_offset,
+                load_dylibs=["/usr/lib/libSystem.B.dylib"],
+                imported_symbols=imported_funcs,
+                exported_symbols=exported_symbols,
+            )
         else:
             raise ValueError(f"Dynamic linked executables unsupported for format: {target_format}")
 

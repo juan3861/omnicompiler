@@ -104,6 +104,20 @@ class ObjectModule:
 # Native COFF (.obj) & ELF64 (.o) Relocatable Object Parsers
 # ==============================================================================
 
+def _arm64_ldst_shift(inst_word: int) -> int:
+    """Returns the log2 byte scale shift for an AArch64 ADD (0) or LDR/STR unsigned-immediate instruction."""
+    if ((inst_word >> 24) & 0x1F) == 0x11:
+        return 0
+    if ((inst_word >> 27) & 0x7) == 0x7:
+        size = (inst_word >> 30) & 0x3
+        v_bit = (inst_word >> 26) & 0x1
+        opc1 = (inst_word >> 23) & 0x1
+        if v_bit == 1 and size == 0 and opc1 == 1:
+            return 4
+        return size
+    return 0
+
+
 def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> ObjectModule:
     """
     Parses a real Microsoft PE/COFF `.obj` relocatable object file (e.g. emitted by
@@ -211,34 +225,68 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
                 is_exported=is_exp,
                 source_repo=repo_name,
             )
-        elif sec_num in rodata_sec_offsets and sname:
-            mod.symbols[sname] = SymbolDef(
-                name=sname,
+        elif sec_num in rodata_sec_offsets:
+            coff_sec_sym = f"__coff_sym_{idx}__"
+            mod.symbols[coff_sec_sym] = SymbolDef(
+                name=coff_sec_sym,
                 section=".rodata",
                 offset=rodata_sec_offsets[sec_num] + val,
                 size=8,
                 is_exported=False,
                 source_repo=repo_name,
             )
+            if sname and not sname.startswith("."):
+                mod.symbols[sname] = SymbolDef(
+                    name=sname,
+                    section=".rodata",
+                    offset=rodata_sec_offsets[sec_num] + val,
+                    size=8,
+                    is_exported=False,
+                    source_repo=repo_name,
+                )
         idx += 1 + num_aux
 
     # Parse .text Relocations (10 bytes each: VirtualAddress, SymbolTableIndex, Type)
+    is_arm64_coff = (machine == 0xAA64)
     reloc_base = text_sec["reloc_ptr"]
     for r_i in range(text_sec["num_relocs"]):
         roff = reloc_base + r_i * 10
         if roff + 10 > len(obj_bytes):
             break
         vaddr_off, sym_idx, rtype = struct.unpack_from("<IIH", obj_bytes, roff)
-        target_name = sym_by_idx.get(sym_idx, ("", 0, 0, 0))[0]
+        sname, _sval, s_sec_num, _scls = sym_by_idx.get(sym_idx, ("", 0, 0, 0))
+        if s_sec_num in rodata_sec_offsets and f"__coff_sym_{sym_idx}__" in mod.symbols:
+            target_name = f"__coff_sym_{sym_idx}__"
+        else:
+            target_name = sname
         if not target_name:
             continue
-        if rtype == 0x0004:  # IMAGE_REL_AMD64_REL32
-            init_disp = struct.unpack_from("<i", mod.text_bytes, vaddr_off)[0] if vaddr_off + 4 <= len(mod.text_bytes) else 0
-            mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "REL32", addend=init_disp))
-        elif rtype == 0x0001:  # IMAGE_REL_AMD64_ADDR64
-            mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "ADDR64", addend=0))
-        elif rtype == 0x0003:  # IMAGE_REL_ARM64_BRANCH26
-            mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "ARM64_CALL26", addend=0))
+        if not is_arm64_coff:
+            if rtype == 0x0004:  # IMAGE_REL_AMD64_REL32
+                init_disp = struct.unpack_from("<i", mod.text_bytes, vaddr_off)[0] if vaddr_off + 4 <= len(mod.text_bytes) else 0
+                mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "REL32", addend=init_disp))
+            elif rtype == 0x0001:  # IMAGE_REL_AMD64_ADDR64
+                mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "ADDR64", addend=0))
+        else:
+            if rtype == 0x0003:  # IMAGE_REL_ARM64_BRANCH26
+                mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "ARM64_CALL26", addend=0))
+            elif rtype == 0x000E:  # IMAGE_REL_ARM64_ADDR64
+                mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "ADDR64", addend=0))
+            elif rtype == 0x0004 and vaddr_off + 4 <= len(mod.text_bytes):  # IMAGE_REL_ARM64_PAGEBASE_REL21
+                inst_w = struct.unpack_from("<I", mod.text_bytes, vaddr_off)[0]
+                raw21 = ((inst_w >> 29) & 0x3) | (((inst_w >> 5) & 0x7FFFF) << 2)
+                if raw21 & (1 << 20):
+                    raw21 -= (1 << 21)
+                mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "ARM64_PAGE21", addend=raw21))
+            elif rtype == 0x0006 and vaddr_off + 4 <= len(mod.text_bytes):  # IMAGE_REL_ARM64_PAGEOFFSET_12A
+                inst_w = struct.unpack_from("<I", mod.text_bytes, vaddr_off)[0]
+                imm12 = (inst_w >> 10) & 0xFFF
+                mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "ARM64_LO12", addend=imm12))
+            elif rtype == 0x0007 and vaddr_off + 4 <= len(mod.text_bytes):  # IMAGE_REL_ARM64_PAGEOFFSET_12L
+                inst_w = struct.unpack_from("<I", mod.text_bytes, vaddr_off)[0]
+                shift = _arm64_ldst_shift(inst_w)
+                imm12 = ((inst_w >> 10) & 0xFFF) << shift
+                mod.relocations.append(RelocationEntry(".text", vaddr_off, target_name, "ARM64_LO12", addend=imm12))
 
     return mod
 
@@ -334,6 +382,10 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                 mod.relocations.append(RelocationEntry(".text", r_off, target_sym_name, "ADDR64", addend=r_addend))
             elif rtype in (282, 283):  # R_AARCH64_JUMP26 / R_AARCH64_CALL26
                 mod.relocations.append(RelocationEntry(".text", r_off, target_sym_name, "ARM64_CALL26", addend=r_addend))
+            elif rtype == 275:  # R_AARCH64_ADR_PREL_PG_HI21
+                mod.relocations.append(RelocationEntry(".text", r_off, target_sym_name, "ARM64_PAGE21", addend=r_addend))
+            elif rtype in (277, 278, 284, 285, 286, 299):  # R_AARCH64_ADD_ABS_LO12_NC & R_AARCH64_LDST*_ABS_LO12_NC
+                mod.relocations.append(RelocationEntry(".text", r_off, target_sym_name, "ARM64_LO12", addend=r_addend))
 
     return mod
 
@@ -447,6 +499,7 @@ def load_macho_object(obj_bytes: bytes, repo_name: str = "macho_object") -> Obje
                 )
 
     is_arm64 = (cputype == 0x0100000C)
+    pending_addend = 0
     for r_i in range(text_nreloc):
         ro = text_reloff + r_i * 8
         if ro + 8 > len(obj_bytes):
@@ -458,26 +511,42 @@ def load_macho_object(obj_bytes: bytes, repo_name: str = "macho_object") -> Obje
         r_len = (r_val >> 25) & 3
         r_ext = (r_val >> 27) & 1
         r_type = (r_val >> 28) & 0xF
+        if is_arm64 and r_type == 10:  # ARM64_RELOC_ADDEND (24-bit signed addend for following relocation)
+            add24 = r_sym
+            if add24 & (1 << 23):
+                add24 -= (1 << 24)
+            pending_addend = add24
+            continue
+        cur_addend = pending_addend
+        pending_addend = 0
         if r_ext == 1:
             target_sym = sym_clean_names.get(r_sym, "")
             if not target_sym:
                 continue
             if is_arm64:
                 if r_type == 2:  # ARM64_RELOC_BRANCH26
-                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ARM64_CALL26", addend=0))
+                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ARM64_CALL26", addend=cur_addend))
+                elif r_type == 3:  # ARM64_RELOC_PAGE21
+                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ARM64_PAGE21", addend=cur_addend))
+                elif r_type == 4:  # ARM64_RELOC_PAGEOFF12
+                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ARM64_LO12", addend=cur_addend))
                 elif r_type == 0 and r_len == 3:
-                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ADDR64", addend=0))
+                    mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ADDR64", addend=cur_addend))
             else:
                 if r_type in (1, 2, 3) and r_len == 2:
                     mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "REL32", addend=0))
                 elif r_type == 0 and r_len == 3:
                     mod.relocations.append(RelocationEntry(".text", r_addr, target_sym, "ADDR64", addend=0))
         else:
-            if r_sym in rodata_sec_bases and not is_arm64 and r_type == 1 and r_len == 2:
-                _sec_base, sec_vm = rodata_sec_bases[r_sym]
-                init_disp = struct.unpack_from("<i", mod.text_bytes, r_addr)[0] if r_addr + 4 <= len(mod.text_bytes) else 0
-                inner_addend = (r_addr + 4 + init_disp) - sec_vm
-                mod.relocations.append(RelocationEntry(".text", r_addr, f"__macho_sec_{r_sym}__", "REL32", addend=inner_addend))
+            if r_sym in rodata_sec_bases:
+                if not is_arm64 and r_type == 1 and r_len == 2:
+                    _sec_base, sec_vm = rodata_sec_bases[r_sym]
+                    init_disp = struct.unpack_from("<i", mod.text_bytes, r_addr)[0] if r_addr + 4 <= len(mod.text_bytes) else 0
+                    inner_addend = (r_addr + 4 + init_disp) - sec_vm
+                    mod.relocations.append(RelocationEntry(".text", r_addr, f"__macho_sec_{r_sym}__", "REL32", addend=inner_addend))
+                elif is_arm64 and r_type in (3, 4):
+                    rel_kind = "ARM64_PAGE21" if r_type == 3 else "ARM64_LO12"
+                    mod.relocations.append(RelocationEntry(".text", r_addr, f"__macho_sec_{r_sym}__", rel_kind, addend=cur_addend))
 
     return mod
 
@@ -712,6 +781,28 @@ class NativeObjectLinker:
                     struct.pack_into("<I", combined_text, patch_offset, patched_inst)
                     applied_relocs += 1
 
+                elif reloc.reloc_type == "ARM64_PAGE21":
+                    eff_target = target_offset + reloc.addend
+                    page_delta = (eff_target >> 12) - (patch_offset >> 12)
+                    if not (-(1 << 20) <= page_delta < (1 << 20)):
+                        raise RelocationOutOfBoundsError(f"ARM64_PAGE21 page delta {page_delta} overflows 21-bit range")
+                    immlo = page_delta & 0x3
+                    immhi = (page_delta >> 2) & 0x7FFFF
+                    orig_inst = struct.unpack_from("<I", combined_text, patch_offset)[0]
+                    patched_inst = (orig_inst & 0x9F00001F) | (immlo << 29) | (immhi << 5)
+                    struct.pack_into("<I", combined_text, patch_offset, patched_inst)
+                    applied_relocs += 1
+
+                elif reloc.reloc_type == "ARM64_LO12":
+                    eff_target = target_offset + reloc.addend
+                    lo12 = eff_target & 0xFFF
+                    orig_inst = struct.unpack_from("<I", combined_text, patch_offset)[0]
+                    shift = _arm64_ldst_shift(orig_inst)
+                    scaled_imm12 = (lo12 >> shift) & 0xFFF
+                    patched_inst = (orig_inst & 0xFFC003FF) | (scaled_imm12 << 10)
+                    struct.pack_into("<I", combined_text, patch_offset, patched_inst)
+                    applied_relocs += 1
+
         if unresolved_symbols:
             raise LinkerError(f"Unresolved external symbols during link: {unresolved_symbols}")
 
@@ -763,9 +854,12 @@ class NativeObjectLinker:
         global_syms = link_res["global_symbols"]
         entry_offset = global_syms.get(entry_symbol, 0) if entry_symbol else 0
         os_imports = link_res.get("external_os_imports") or {}
+        exports = dict(link_res.get("exported_symbols") or {})
+        if entry_symbol and entry_symbol in global_syms:
+            exports.setdefault(entry_symbol, entry_offset)
 
         resolved_fmt = ("pe64" if sys.platform == "win32" else "elf64") if target_format == "auto" else target_format
-        if os_imports and resolved_fmt in ("pe64", "elf64", "arm64_elf"):
+        if os_imports and resolved_fmt in ("pe64", "elf64", "arm64_elf", "macho64", "macho_x86_64", "arm64_macho", "macho_arm64"):
             return self.emitter.emit_dynamic_linked_executable(
                 output_path=output_path,
                 linked_code=code,
@@ -773,13 +867,15 @@ class NativeObjectLinker:
                 os_import_stubs=os_imports,
                 os_import_table=OS_C_ABI_IMPORT_TABLE,
                 target_format=resolved_fmt,
+                exported_symbols=exports,
             )
 
         return self.emitter.emit_standalone_binary(
             output_path=output_path,
             custom_code=code,
             entry_offset=entry_offset,
-            target_format=target_format
+            target_format=target_format,
+            exported_symbols=exports,
         )
 
 

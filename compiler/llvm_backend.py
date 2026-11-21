@@ -122,6 +122,10 @@ class LLVMBackend:
         """Emits target assembly code text from an LLVM module."""
         if not self.is_available:
             raise RuntimeError("LLVM backend is not available.")
+        if self._explicit_triple and self._obj_target_machine is not None:
+            tmp_mod = llvm.parse_assembly(str(mod))
+            tmp_mod.triple = self._obj_target_machine.triple
+            return self._obj_target_machine.emit_assembly(tmp_mod)
         return self._target_machine.emit_assembly(mod)
 
     def inspect_optimization_stats(self, mod: Any) -> Dict[str, Any]:

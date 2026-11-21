@@ -509,125 +509,153 @@ class InterProceduralSCCPPass:
             total_consts += s_stats["sccp_folded_constants"]
             total_gvn += g_stats["gvn_eliminated_exprs"]
 
-        # Step 2: Call-Site Function Specialization
-        # Inspect call sites for constant arguments
+        # Step 2 & Step 3: Multi-Hop Transitive Fixpoint (Call-Site Specialization + Constant-Return Propagation)
         existing_specs: Dict[Tuple[str, Tuple[Optional[int], ...]], str] = {}
+        max_rounds = 4
 
-        for caller_name in list(functions.keys()):
-            caller_fn = functions[caller_name]
-            const_map = self._collect_const_map(caller_fn)
+        for _round in range(max_rounds):
+            round_changed = False
 
-            for b in caller_fn.blocks:
-                for inst in b.instructions:
-                    if inst.opcode != "call" or not inst.operands:
-                        continue
-                    callee_name = str(inst.operands[0])
-                    if callee_name not in functions:
-                        continue
-                    if callee_name == caller_name:
-                        continue  # avoid recursive self-specialization blowup
+            # Step 2: Call-Site Function Specialization
+            for caller_name in list(functions.keys()):
+                if caller_name not in functions:
+                    continue
+                caller_fn = functions[caller_name]
+                const_map = self._collect_const_map(caller_fn)
+                caller_base = caller_name.split("__spec_", 1)[0]
 
-                    callee_fn = functions[callee_name]
-                    call_args = inst.operands[1:]
-                    if len(call_args) != len(callee_fn.params):
-                        continue
-
-                    # Resolve constant arguments
-                    arg_consts: List[Optional[int]] = []
-                    for a in call_args:
-                        if isinstance(a, (int, bool)):
-                            arg_consts.append(int(a))
-                        elif isinstance(a, SSAVar) and a in const_map:
-                            arg_consts.append(const_map[a])
-                        else:
-                            arg_consts.append(None)
-
-                    if not any(c is not None for c in arg_consts):
-                        continue
-
-                    spec_key = (callee_name, tuple(arg_consts))
-                    if spec_key in existing_specs:
-                        spec_name = existing_specs[spec_key]
-                    else:
-                        if specialized_count >= self.max_specializations:
+                for b in caller_fn.blocks:
+                    for inst in b.instructions:
+                        if inst.opcode != "call" or not inst.operands:
                             continue
-                        sig_parts = [
-                            f"a{idx}_{val}" for idx, val in enumerate(arg_consts) if val is not None
+                        callee_name = str(inst.operands[0])
+                        if callee_name not in functions:
+                            continue
+                        callee_base = callee_name.split("__spec_", 1)[0]
+                        if callee_name == caller_name or callee_base == caller_base:
+                            continue  # avoid recursive self-specialization blowup
+
+                        callee_fn = functions[callee_name]
+                        call_args = inst.operands[1:]
+                        if len(call_args) != len(callee_fn.params):
+                            continue
+
+                        # Resolve constant arguments
+                        arg_consts: List[Optional[int]] = []
+                        for a in call_args:
+                            if isinstance(a, (int, bool)):
+                                arg_consts.append(int(a))
+                            elif isinstance(a, SSAVar) and a in const_map:
+                                arg_consts.append(const_map[a])
+                            else:
+                                arg_consts.append(None)
+
+                        if not any(c is not None for c in arg_consts):
+                            continue
+
+                        spec_key = (callee_name, tuple(arg_consts))
+                        if spec_key in existing_specs:
+                            spec_name = existing_specs[spec_key]
+                        else:
+                            if specialized_count >= self.max_specializations:
+                                continue
+                            sig_parts = [
+                                f"a{idx}_{val}" for idx, val in enumerate(arg_consts) if val is not None
+                            ]
+                            spec_name = f"{callee_name}__spec_{'_'.join(sig_parts)}"
+                            spec_fn = clone_ssa_function(callee_fn, new_name=spec_name)
+
+                            # Bind constant parameters inside spec_fn and compact remaining param indices
+                            new_params: List[str] = []
+                            new_param_types: Dict[str, str] = {}
+                            old_to_new_idx: Dict[int, int] = {}
+                            for idx, pname in enumerate(callee_fn.params):
+                                if arg_consts[idx] is None:
+                                    old_to_new_idx[idx] = len(new_params)
+                                    new_params.append(pname)
+                                    new_param_types[pname] = callee_fn.param_types.get(pname, "i64")
+                            spec_fn.params = new_params
+                            spec_fn.param_types = new_param_types
+
+                            for sb in spec_fn.blocks:
+                                for sinst in sb.instructions:
+                                    if sinst.opcode == "param" and sinst.operands:
+                                        raw_param = sinst.operands[0]
+                                        if isinstance(raw_param, int):
+                                            p_idx = raw_param
+                                        elif isinstance(raw_param, str) and raw_param in callee_fn.params:
+                                            p_idx = callee_fn.params.index(raw_param)
+                                        else:
+                                            continue
+                                        if p_idx < len(arg_consts) and arg_consts[p_idx] is not None:
+                                            sinst.opcode = "const"
+                                            sinst.operands = [arg_consts[p_idx]]
+                                        elif isinstance(raw_param, int) and p_idx in old_to_new_idx:
+                                            sinst.operands = [old_to_new_idx[p_idx]]
+
+                            # Optimize specialized clone with SCCP + GVN
+                            spec_fn, s_stats = sccp.run_on_function(spec_fn)
+                            spec_fn, g_stats = gvn.run_on_function(spec_fn)
+                            total_branches += s_stats["sccp_folded_branches"]
+                            total_consts += s_stats["sccp_folded_constants"]
+                            total_gvn += g_stats["gvn_eliminated_exprs"]
+
+                            functions[spec_name] = spec_fn
+                            existing_specs[spec_key] = spec_name
+                            specialized_count += 1
+
+                        # Rewrite call instruction to invoke specialized target with non-constant args
+                        non_const_args = [
+                            a for a, c in zip(call_args, arg_consts) if c is None
                         ]
-                        spec_name = f"{callee_name}__spec_{'_'.join(sig_parts)}"
-                        spec_fn = clone_ssa_function(callee_fn, new_name=spec_name)
+                        inst.operands = [spec_name] + non_const_args
+                        round_changed = True
 
-                        # Bind constant parameters inside spec_fn and compact remaining param indices
-                        new_params: List[str] = []
-                        new_param_types: Dict[str, str] = {}
-                        old_to_new_idx: Dict[int, int] = {}
-                        for idx, pname in enumerate(callee_fn.params):
-                            if arg_consts[idx] is None:
-                                old_to_new_idx[idx] = len(new_params)
-                                new_params.append(pname)
-                                new_param_types[pname] = callee_fn.param_types.get(pname, "i64")
-                        spec_fn.params = new_params
-                        spec_fn.param_types = new_param_types
+            # Step 3: Inter-Procedural Constant Return Propagation
+            pure_const_returns: Dict[str, int] = {}
+            for fname, fn in functions.items():
+                cret = self._is_pure_constant_return(fn)
+                if cret is not None:
+                    pure_const_returns[fname] = cret
 
-                        for sb in spec_fn.blocks:
-                            for sinst in sb.instructions:
-                                if sinst.opcode == "param" and sinst.operands:
-                                    raw_param = sinst.operands[0]
-                                    if isinstance(raw_param, int):
-                                        p_idx = raw_param
-                                    elif isinstance(raw_param, str) and raw_param in callee_fn.params:
-                                        p_idx = callee_fn.params.index(raw_param)
-                                    else:
-                                        continue
-                                    if p_idx < len(arg_consts) and arg_consts[p_idx] is not None:
-                                        sinst.opcode = "const"
-                                        sinst.operands = [arg_consts[p_idx]]
-                                    elif isinstance(raw_param, int) and p_idx in old_to_new_idx:
-                                        sinst.operands = [old_to_new_idx[p_idx]]
-
-                        # Optimize specialized clone with SCCP + GVN
-                        spec_fn, s_stats = sccp.run_on_function(spec_fn)
-                        spec_fn, g_stats = gvn.run_on_function(spec_fn)
+            if pure_const_returns:
+                for fname in list(functions.keys()):
+                    fn = functions[fname]
+                    changed = False
+                    for b in fn.blocks:
+                        for inst in b.instructions:
+                            if inst.opcode == "call" and inst.operands:
+                                callee_name = str(inst.operands[0])
+                                if callee_name in pure_const_returns and inst.result is not None:
+                                    inst.opcode = "const"
+                                    inst.operands = [pure_const_returns[callee_name]]
+                                    ip_const_returns += 1
+                                    changed = True
+                                    round_changed = True
+                    if changed:
+                        fn, s_stats = sccp.run_on_function(fn)
+                        fn, g_stats = gvn.run_on_function(fn)
+                        functions[fname] = fn
                         total_branches += s_stats["sccp_folded_branches"]
                         total_consts += s_stats["sccp_folded_constants"]
                         total_gvn += g_stats["gvn_eliminated_exprs"]
 
-                        functions[spec_name] = spec_fn
-                        existing_specs[spec_key] = spec_name
-                        specialized_count += 1
+            if not round_changed:
+                break
 
-                    # Rewrite call instruction to invoke specialized target with non-constant args
-                    non_const_args = [
-                        a for a, c in zip(call_args, arg_consts) if c is None
-                    ]
-                    inst.operands = [spec_name] + non_const_args
-
-        # Step 3: Inter-Procedural Constant Return Propagation
-        pure_const_returns: Dict[str, int] = {}
-        for fname, fn in functions.items():
-            cret = self._is_pure_constant_return(fn)
-            if cret is not None:
-                pure_const_returns[fname] = cret
-
-        if pure_const_returns:
-            for fname, fn in functions.items():
-                changed = False
-                for b in fn.blocks:
-                    for inst in b.instructions:
-                        if inst.opcode == "call" and inst.operands:
-                            callee_name = str(inst.operands[0])
-                            if callee_name in pure_const_returns and inst.result is not None:
-                                inst.opcode = "const"
-                                inst.operands = [pure_const_returns[callee_name]]
-                                ip_const_returns += 1
-                                changed = True
-                if changed:
-                    fn, s_stats = sccp.run_on_function(fn)
-                    fn, g_stats = gvn.run_on_function(fn)
-                    functions[fname] = fn
-                    total_branches += s_stats["sccp_folded_branches"]
-                    total_consts += s_stats["sccp_folded_constants"]
-                    total_gvn += g_stats["gvn_eliminated_exprs"]
+        # Step 4: Prune unreferenced specialized clones whose call sites were folded into constants
+        referenced_callees: Set[str] = {
+            str(inst.operands[0])
+            for fn in functions.values()
+            for b in fn.blocks
+            for inst in b.instructions
+            if inst.opcode == "call" and inst.operands
+        }
+        pruned_dead_specs = 0
+        for fname in list(functions.keys()):
+            if "__spec_" in fname and fname not in referenced_callees:
+                del functions[fname]
+                pruned_dead_specs += 1
 
         return functions, {
             "gvn_eliminated_exprs": total_gvn,
@@ -635,4 +663,5 @@ class InterProceduralSCCPPass:
             "sccp_folded_constants": total_consts,
             "specialized_functions": specialized_count,
             "ip_constant_returns_propagated": ip_const_returns,
+            "pruned_dead_specializations": pruned_dead_specs,
         }

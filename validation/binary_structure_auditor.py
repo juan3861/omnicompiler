@@ -165,6 +165,17 @@ class BinaryStructureAuditor:
                                         imports.append(clean_sym)
                                 elif clean_sym and clean_sym not in exports:
                                     exports.append(clean_sym)
+            elif cmd == 0x80000028:  # LC_MAIN
+                if cmdsize >= 24:
+                    entryoff, stacksize = struct.unpack("<QQ", macho_bytes[offset+8:offset+24])
+                    metrics["entry_offset"] = entryoff
+                    metrics["stack_size"] = stacksize
+            elif cmd == 0x0B:  # LC_DYSYMTAB
+                if cmdsize >= 80:
+                    _iloc, _nloc, _iext, nextdef, _iund, nundef = struct.unpack("<6I", macho_bytes[offset+8:offset+32])
+                    metrics["dysymtab_present"] = True
+                    metrics["nextdefsym"] = nextdef
+                    metrics["nundefsym"] = nundef
             elif cmd == 0x1D:  # LC_CODE_SIGNATURE (Apple Silicon XNU Ad-Hoc CodeDirectory)
                 if cmdsize >= 16:
                     import hashlib

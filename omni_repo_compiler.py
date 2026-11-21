@@ -801,6 +801,8 @@ class OmniRepoCompiler:
 
         # Pass 5b: Inter-Procedural SCCP & Call-Site Function Specialization
         pre_spec_names = set(ssa_program.keys())
+        ip_constant_returns_propagated = 0
+        pruned_dead_specializations = 0
         if len(ssa_program) >= 2:
             try:
                 from compiler.ip_sccp_gvn import InterProceduralSCCPPass
@@ -808,11 +810,13 @@ class OmniRepoCompiler:
                 specialized_functions += ip_stats.get("specialized_functions", 0)
                 sccp_folded_branches += ip_stats.get("sccp_folded_branches", 0)
                 gvn_eliminated_exprs += ip_stats.get("gvn_eliminated_exprs", 0)
+                ip_constant_returns_propagated += ip_stats.get("ip_constant_returns_propagated", 0)
+                pruned_dead_specializations += ip_stats.get("pruned_dead_specializations", 0)
                 for new_name in ssa_program:
                     if new_name not in pre_spec_names:
                         base_name = new_name.split("__spec_", 1)[0]
                         unit_owner_repo[new_name] = unit_owner_repo.get(base_name, manifests[0].repo_name)
-                        unit_export_flag[new_name] = False
+                        unit_export_flag[new_name] = True
                         defined_symbols_across_mods.add(new_name)
             except Exception:
                 pass
@@ -1294,7 +1298,8 @@ class OmniRepoCompiler:
                     llvm_partition_ssas = []
                     valid_set = set(pgo_cands)
                     for hs in homeo_eligible:
-                        override_eng = normalized_homeo_overrides.get(hs.name)
+                        base_hs_name = hs.name.split("__spec_", 1)[0]
+                        override_eng = normalized_homeo_overrides.get(hs.name) or normalized_homeo_overrides.get(base_hs_name)
                         if override_eng in valid_set:
                             chosen = override_eng
                         elif resolved_homeo_policy == "latency" and "native" in valid_set:
@@ -1545,6 +1550,8 @@ class OmniRepoCompiler:
             "gvn_eliminated_exprs": gvn_eliminated_exprs,
             "sccp_folded_branches": sccp_folded_branches,
             "specialized_functions": specialized_functions,
+            "ip_constant_returns_propagated": ip_constant_returns_propagated,
+            "pruned_dead_specializations": pruned_dead_specializations,
             "licm_hoisted_insts": licm_hoisted_insts,
             "dse_eliminated_stores": dse_eliminated_stores,
             "forwarded_loads": forwarded_loads,
