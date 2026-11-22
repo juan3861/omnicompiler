@@ -63,8 +63,12 @@ NATIVE_BUILTIN_CALLS = frozenset({
 
 def _extract_called_names(fn_def: ast.FunctionDef) -> Set[str]:
     callees: Set[str] = set()
+    raise_exc_calls: Set[int] = set()
     for node in ast.walk(fn_def):
-        if isinstance(node, ast.Call):
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            raise_exc_calls.add(id(node.exc))
+    for node in ast.walk(fn_def):
+        if isinstance(node, ast.Call) and id(node) not in raise_exc_calls:
             if isinstance(node.func, ast.Name):
                 callees.add(node.func.id)
     return callees
@@ -87,9 +91,7 @@ def _has_only_numeric_cfg_syntax(fn_def: ast.FunctionDef) -> bool:
                 ast.Yield,
                 ast.YieldFrom,
                 ast.Await,
-                ast.Try,
                 ast.With,
-                ast.Raise,
                 ast.Import,
                 ast.ImportFrom,
                 ast.JoinedStr,
@@ -652,6 +654,86 @@ class OmniRepoCompiler:
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
 
+        # Stage 4.9: ThinLTO Whole-Program Inter-Procedural Optimization Index
+        from compiler.ip_sccp_gvn import clone_ssa_function
+        fn_ast_digests: Dict[str, str] = {
+            fname: hashlib.sha256(ast.dump(fdef).encode("utf-8")).hexdigest()
+            for fname, fdef in all_ast_funcs.items()
+        }
+
+        # Stage 4.85: Generic Function Monomorphization (`fn<T>` -> `fn__mono_int` / `fn__mono_float`)
+        generic_fn_names = {
+            fn_n for fn_n, f_ast in all_ast_funcs.items()
+            if getattr(f_ast, "_omni_generic_params", None)
+        }
+        if generic_fn_names:
+            import copy
+            from orchestrator.repo_manifest_ingestor import SymbolSignature
+            mono_created: Set[str] = set()
+            owner_by_fn = {
+                fn_n: m
+                for m in manifests
+                for fn_n in repo_funcs_map.get(m.repo_name, {})
+            }
+            for caller_name, caller_ast in list(all_ast_funcs.items()):
+                caller_float_vars: Set[str] = set()
+                for a in caller_ast.args.args:
+                    if isinstance(a.annotation, ast.Name) and a.annotation.id in ("float", "f64", "double"):
+                        caller_float_vars.add(a.arg)
+                for nd in ast.walk(caller_ast):
+                    if isinstance(nd, ast.AnnAssign) and isinstance(nd.target, ast.Name):
+                        if isinstance(nd.annotation, ast.Name) and nd.annotation.id in ("float", "f64", "double"):
+                            caller_float_vars.add(nd.target.id)
+                    elif isinstance(nd, ast.Assign) and len(nd.targets) == 1 and isinstance(nd.targets[0], ast.Name):
+                        if isinstance(nd.value, ast.Constant) and isinstance(nd.value.value, float):
+                            caller_float_vars.add(nd.targets[0].id)
+                        elif isinstance(nd.value, ast.Call) and isinstance(nd.value.func, ast.Name) and nd.value.func.id == "float":
+                            caller_float_vars.add(nd.targets[0].id)
+                for nd in ast.walk(caller_ast):
+                    if isinstance(nd, ast.Call) and isinstance(nd.func, ast.Name) and nd.func.id in generic_fn_names:
+                        g_name = nd.func.id
+                        g_ast = all_ast_funcs[g_name]
+                        g_params = set(getattr(g_ast, "_omni_generic_params", []))
+                        is_float_inst = False
+                        for arg_node, param_node in zip(nd.args, g_ast.args.args):
+                            ann = param_node.annotation
+                            if isinstance(ann, ast.Name) and ann.id in g_params:
+                                if (
+                                    (isinstance(arg_node, ast.Constant) and isinstance(arg_node.value, float))
+                                    or (isinstance(arg_node, ast.Name) and arg_node.id in caller_float_vars)
+                                    or (isinstance(arg_node, ast.Call) and isinstance(arg_node.func, ast.Name) and arg_node.func.id == "float")
+                                ):
+                                    is_float_inst = True
+                                    break
+                        concrete_ty = "float" if is_float_inst else "int"
+                        mono_name = f"{g_name}__mono_{concrete_ty}"
+                        nd.func.id = mono_name
+                        if mono_name not in mono_created and mono_name not in all_ast_funcs:
+                            mono_created.add(mono_name)
+                            m_ast = copy.deepcopy(g_ast)
+                            m_ast.name = mono_name
+                            m_ast._omni_generic_params = []  # type: ignore[attr-defined]
+                            for a in m_ast.args.args:
+                                if isinstance(a.annotation, ast.Name) and a.annotation.id in g_params:
+                                    a.annotation = ast.Name(id=concrete_ty, ctx=ast.Load(), lineno=a.lineno if hasattr(a, "lineno") else 1)
+                            if isinstance(m_ast.returns, ast.Name) and m_ast.returns.id in g_params:
+                                m_ast.returns = ast.Name(id=concrete_ty, ctx=ast.Load(), lineno=m_ast.lineno)
+                            ast.fix_missing_locations(m_ast)
+                            all_ast_funcs[mono_name] = m_ast
+                            retained_export_names.add(mono_name)
+                            native_compilable_syms.add(mono_name)
+                            owner_m = owner_by_fn.get(g_name, manifests[0])
+                            src_p = repo_funcs_map[owner_m.repo_name][g_name][0] if g_name in repo_funcs_map.get(owner_m.repo_name, {}) else ""
+                            repo_funcs_map[owner_m.repo_name][mono_name] = (src_p, m_ast)
+                            fn_ast_digests[mono_name] = hashlib.sha256(ast.dump(m_ast).encode("utf-8")).hexdigest()
+                            owner_m.exports.append(SymbolSignature(
+                                name=mono_name,
+                                params=[a.arg for a in m_ast.args.args],
+                                return_type=concrete_ty,
+                                language="polyglot",
+                                source_file=src_p,
+                            ))
+
         global_return_types: Dict[str, str] = {}
         for m in manifests:
             for exp in m.exports:
@@ -662,15 +744,9 @@ class OmniRepoCompiler:
             if isinstance(ret_ann, ast.Name) and ret_ann.id in ("float", "f64", "double"):
                 global_return_types[fn_n] = "f64"
 
-        # Stage 4.9: ThinLTO Whole-Program Inter-Procedural Optimization Index
-        from compiler.ip_sccp_gvn import clone_ssa_function
         struct_luts_sig = hashlib.sha256(
             repr((sorted(global_struct_layouts.items()), sorted(global_luts.items()), sorted(global_return_types.items()))).encode("utf-8")
         ).hexdigest()
-        fn_ast_digests: Dict[str, str] = {
-            fname: hashlib.sha256(ast.dump(fdef).encode("utf-8")).hexdigest()
-            for fname, fdef in all_ast_funcs.items()
-        }
 
         thin_lto_opt = None
         try:

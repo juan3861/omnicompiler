@@ -1104,8 +1104,9 @@ class _PolyglotParser:
     def _parse_js_ts_function(self) -> ast.FunctionDef:
         fn_tok = self._expect("ID", "function")
         name_tok = self._expect("ID")
+        generic_params: List[str] = []
         if self._at("OP", "<"):
-            self._skip_type_args()
+            generic_params = self._skip_type_args()
         params, param_types = self._parse_js_ts_param_list()
         ret_type: Optional[str] = None
         if self._at("OP", ":"):
@@ -1113,7 +1114,7 @@ class _PolyglotParser:
             ret_type = self._skip_type_annotation(stop_tokens={"{"})
         body = self._parse_block()
         return self._make_function_def(
-            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type
+            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type, generic_params=generic_params
         )
 
     def _parse_arrow_rhs(self, fn_name: str, line: int) -> Optional[ast.FunctionDef]:
@@ -1190,8 +1191,9 @@ class _PolyglotParser:
     def _parse_rust_function(self) -> ast.FunctionDef:
         fn_tok = self._expect("ID", "fn")
         name_tok = self._expect("ID")
+        generic_params: List[str] = []
         if self._at("OP", "<"):
-            self._skip_type_args()
+            generic_params = self._skip_type_args()
         self._expect("PUNCT", "(")
         params: List[str] = []
         param_types: Dict[str, str] = {}
@@ -1221,7 +1223,7 @@ class _PolyglotParser:
                 self._advance()
         body = self._parse_block(allow_tail_return=True)
         return self._make_function_def(
-            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type
+            name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type, generic_params=generic_params
         )
 
     def _parse_go_function(self) -> ast.FunctionDef:
@@ -1277,9 +1279,11 @@ class _PolyglotParser:
             name_tok.val, params, body, fn_tok.line, param_types=param_types, return_type=ret_type
         )
 
-    def _skip_type_args(self) -> None:
+    def _skip_type_args(self) -> List[str]:
         self._expect("OP", "<")
         depth = 1
+        type_params: List[str] = []
+        expect_param = True
         while depth > 0 and not self._at("EOF"):
             t = self._advance()
             if t.kind == "OP" and t.val == "<":
@@ -1288,6 +1292,12 @@ class _PolyglotParser:
                 depth -= 1
             elif t.kind == "OP" and t.val == ">>":
                 depth -= 2
+            elif depth == 1 and t.kind == "PUNCT" and t.val == ",":
+                expect_param = True
+            elif depth == 1 and expect_param and t.kind == "ID":
+                type_params.append(t.val)
+                expect_param = False
+        return type_params
 
     def _skip_type_annotation(self, stop_tokens: set) -> Optional[str]:
         paren = 0
@@ -1369,6 +1379,7 @@ class _PolyglotParser:
         line: int,
         param_types: Optional[Dict[str, str]] = None,
         return_type: Optional[str] = None,
+        generic_params: Optional[List[str]] = None,
     ) -> ast.FunctionDef:
         if not body:
             init_ret = 0.0 if return_type == "float" else 0
@@ -1385,10 +1396,15 @@ class _PolyglotParser:
             )
             for p in params
         ]
+        g_params = list(generic_params or [])
         ret_node = (
             ast.Name(id="float", ctx=ast.Load(), lineno=line)
             if return_type == "float"
-            else None
+            else (
+                ast.Name(id=return_type, ctx=ast.Load(), lineno=line)
+                if (return_type and return_type in g_params)
+                else None
+            )
         )
         fn = ast.FunctionDef(
             name=name,
@@ -1406,7 +1422,9 @@ class _PolyglotParser:
             returns=ret_node,
             lineno=line,
         )
+        fn._omni_generic_params = g_params  # type: ignore[attr-defined]
         ast.fix_missing_locations(fn)
+        return fn
         return fn
 
     # ------------------------------------------------------------------

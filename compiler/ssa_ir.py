@@ -358,6 +358,7 @@ class AstToSsaLowering:
         self.global_return_types: Dict[str, str] = dict(global_return_types or {})
         self._closures: Dict[str, Tuple[str, List[str], str]] = {}
         self._lifted_closures: List[SSAFunction] = []
+        self._try_handler_stack: List[Tuple[BasicBlock, Optional[str]]] = []
 
     _CABI_SIZE_ALIGN: Dict[str, Tuple[int, int]] = {
         "i8": (1, 1), "u8": (1, 1),
@@ -1043,6 +1044,7 @@ class AstToSsaLowering:
         self._loop_depth = 0
         self._closures.clear()
         self._lifted_closures.clear()
+        self._try_handler_stack.clear()
 
         entry = self._new_block("entry", seal=True)
         self._cur_block = entry
@@ -1164,6 +1166,55 @@ class AstToSsaLowering:
             else:
                 val = self._emit_const(0, line=line)
             self._emit(None, "ret", [val], line=line)
+
+        elif isinstance(stmt, ast.Raise):
+            err_v: Optional[SSAVar] = None
+            if stmt.exc is not None:
+                if isinstance(stmt.exc, ast.Call) and stmt.exc.args:
+                    err_v = self._lower_expr(stmt.exc.args[0])
+                elif isinstance(stmt.exc, ast.Constant) and isinstance(stmt.exc.value, int):
+                    err_v = self._emit_const(stmt.exc.value, line=line)
+                elif isinstance(stmt.exc, ast.Name):
+                    err_v = self._lower_expr(stmt.exc)
+            if err_v is None:
+                err_v = self._emit_const(1, line=line)
+            if self._try_handler_stack:
+                handler_bb, exc_name = self._try_handler_stack[-1]
+                if exc_name:
+                    self._write_variable(exc_name, self._cur_block, err_v)
+                self._cur_block.connect_to(handler_bb)
+                self._emit(None, "br", [handler_bb.name], line=line)
+            else:
+                neg_v = self._next_var("raise_ret")
+                self._emit(neg_v, "neg", [err_v], line=line)
+                self._emit(None, "ret", [neg_v], line=line)
+
+        elif isinstance(stmt, ast.Try):
+            handler_bb = self._new_block("except_blk", seal=False)
+            merge_bb = self._new_block("try_merge", seal=False)
+            exc_name = stmt.handlers[0].name if stmt.handlers else None
+            self._try_handler_stack.append((handler_bb, exc_name))
+            self._lower_stmt_list(stmt.body)
+            self._try_handler_stack.pop()
+            if self._cur_block is not None and not self._cur_block.is_terminated:
+                self._cur_block.connect_to(merge_bb)
+                self._emit(None, "br", [merge_bb.name], line=line)
+
+            self._seal_block(handler_bb)
+            if handler_bb.predecessors and stmt.handlers:
+                self._cur_block = handler_bb
+                self._lower_stmt_list(stmt.handlers[0].body)
+                if self._cur_block is not None and not self._cur_block.is_terminated:
+                    self._cur_block.connect_to(merge_bb)
+                    self._emit(None, "br", [merge_bb.name], line=line)
+
+            self._seal_block(merge_bb)
+            if merge_bb.predecessors:
+                self._cur_block = merge_bb
+                if stmt.finalbody:
+                    self._lower_stmt_list(stmt.finalbody)
+            else:
+                self._cur_block = None
 
         elif isinstance(stmt, ast.FunctionDef):
             self._lift_closure_def(stmt.name, stmt.args, list(stmt.body), stmt.returns, line=line)
