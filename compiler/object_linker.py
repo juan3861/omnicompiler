@@ -14,6 +14,7 @@ Supported Relocations:
 import ctypes
 import io
 import struct
+import sys
 import time
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -640,6 +641,11 @@ class NativeObjectLinker:
             from runtime.native_heap import NATIVE_COLLECTION_SYMBOLS
         except ImportError:
             NATIVE_COLLECTION_SYMBOLS = {}
+        try:
+            from runtime.native_atomics import NATIVE_ATOMIC_SYMBOL_NAMES, get_atomic_kernels
+        except ImportError:
+            NATIVE_ATOMIC_SYMBOL_NAMES = frozenset()
+            get_atomic_kernels = None
 
         defined_syms = set()
         for mod in self.modules:
@@ -647,14 +653,31 @@ class NativeObjectLinker:
                 defined_syms.add(s)
 
         needed_runtime_syms = set()
+        needed_atomic_syms = set()
         needed_os_syms = set()
         for mod in self.modules:
             for reloc in mod.relocations:
                 if reloc.symbol_name not in defined_syms:
-                    if reloc.symbol_name in NATIVE_COLLECTION_SYMBOLS:
+                    if reloc.symbol_name in NATIVE_ATOMIC_SYMBOL_NAMES:
+                        needed_atomic_syms.add(reloc.symbol_name)
+                    elif reloc.symbol_name in NATIVE_COLLECTION_SYMBOLS:
                         needed_runtime_syms.add(reloc.symbol_name)
                     elif reloc.symbol_name in OS_C_ABI_IMPORT_TABLE:
                         needed_os_syms.add(reloc.symbol_name)
+
+        if needed_atomic_syms and get_atomic_kernels is not None:
+            is_arm64_link = any(
+                r.reloc_type == "ARM64_CALL26"
+                for m in self.modules
+                for r in m.relocations
+            )
+            host_os = "windows" if sys.platform == "win32" else "linux"
+            atomic_map = get_atomic_kernels(target_os=host_os, arch="arm64" if is_arm64_link else "x86_64")
+            atomic_mod = ObjectModule("__omni_atomic_kernels__")
+            for sym in sorted(needed_atomic_syms):
+                if sym in atomic_map:
+                    atomic_mod.add_symbol(sym, atomic_map[sym], is_exported=True)
+            self.modules.append(atomic_mod)
 
         if needed_runtime_syms:
             if not hasattr(self, "_active_callbacks"):

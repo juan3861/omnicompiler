@@ -58,6 +58,7 @@ NATIVE_BUILTIN_CALLS = frozenset({
     "omni_ffi_load_lib", "omni_ffi_get_symbol",
     "omni_ffi_call0", "omni_ffi_call1", "omni_ffi_call2", "omni_ffi_call3", "omni_ffi_call4", "omni_ffi_call",
     "omni_ffi_call0_f64", "omni_ffi_call1_f64", "omni_ffi_call2_f64",
+    "omni_atomic_add_i64", "omni_atomic_cas_i64", "omni_spinlock_acquire", "omni_spinlock_release",
 })
 
 
