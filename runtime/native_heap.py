@@ -22,6 +22,7 @@ import ctypes
 import os
 import struct
 import sys
+import threading
 from typing import Dict, Any, Tuple, Optional, List
 
 UNSET_KEY = -0x8000000000000000  # -2^63 sentry representing empty hash slot
@@ -91,6 +92,152 @@ def get_global_arena() -> NativeHeapArena:
     if _GLOBAL_ARENA is None:
         _GLOBAL_ARENA = NativeHeapArena()
     return _GLOBAL_ARENA
+
+
+class CoalescingHeapArena(NativeHeapArena):
+    """
+    Contention-free thread-local arena with address-ordered free-list
+    and immediate left/right adjacent block coalescing.
+    """
+
+    def __init__(self, initial_bytes: int = 1024 * 1024):
+        super().__init__(initial_bytes=initial_bytes)
+        self._chunks: List[Tuple[int, int]] = [(self._ptr, self.arena_size)]
+        self._free_blocks: List[Tuple[int, int]] = []  # sorted by base_addr
+        self._alloc_sizes: Dict[int, int] = {}
+        self.coalesce_count: int = 0
+        self.total_freed_bytes: int = 0
+        self.total_reused_bytes: int = 0
+
+    def alloc(self, num_bytes: int) -> int:
+        aligned_sz = ((max(16, num_bytes) + 15) // 16) * 16
+        # 1. First-fit from coalesced free-list
+        for idx, (blk_ptr, blk_sz) in enumerate(self._free_blocks):
+            if blk_sz >= aligned_sz:
+                rem = blk_sz - aligned_sz
+                if rem >= 16:
+                    self._free_blocks[idx] = (blk_ptr + aligned_sz, rem)
+                else:
+                    aligned_sz = blk_sz
+                    self._free_blocks.pop(idx)
+                self._alloc_sizes[blk_ptr] = aligned_sz
+                self.total_reused_bytes += aligned_sz
+                ctypes.memset(blk_ptr, 0, aligned_sz)
+                return blk_ptr
+
+        # 2. Bump-allocate from active OS chunk
+        if self._offset + aligned_sz > self.arena_size:
+            new_chunk_sz = max(self.arena_size * 2, aligned_sz * 2)
+            self._ptr = self._os_alloc(new_chunk_sz)
+            self.arena_size = new_chunk_sz
+            self._offset = 0
+            self._chunks.append((self._ptr, new_chunk_sz))
+
+        p = self._ptr + self._offset
+        self._offset += aligned_sz
+        self._alloc_sizes[p] = aligned_sz
+        ctypes.memset(p, 0, aligned_sz)
+        return p
+
+    def free(self, ptr: int) -> bool:
+        """Frees a pointer allocated from this arena and coalesces adjacent free blocks."""
+        sz = self._alloc_sizes.pop(ptr, None)
+        if sz is None:
+            return False
+        self.total_freed_bytes += sz
+
+        # Insert sorted by address and coalesce neighbors
+        insert_idx = 0
+        while insert_idx < len(self._free_blocks) and self._free_blocks[insert_idx][0] < ptr:
+            insert_idx += 1
+
+        new_start, new_sz = ptr, sz
+        # Coalesce with right neighbor
+        if insert_idx < len(self._free_blocks):
+            r_start, r_sz = self._free_blocks[insert_idx]
+            if new_start + new_sz == r_start:
+                new_sz += r_sz
+                self._free_blocks.pop(insert_idx)
+                self.coalesce_count += 1
+
+        # Coalesce with left neighbor
+        if insert_idx > 0:
+            l_start, l_sz = self._free_blocks[insert_idx - 1]
+            if l_start + l_sz == new_start:
+                self._free_blocks[insert_idx - 1] = (l_start, l_sz + new_sz)
+                self.coalesce_count += 1
+                return True
+
+        self._free_blocks.insert(insert_idx, (new_start, new_sz))
+        return True
+
+    def free_all(self):
+        for chunk_ptr, chunk_sz in self._chunks:
+            if self.is_windows:
+                ctypes.windll.kernel32.VirtualFree(ctypes.c_void_p(chunk_ptr), ctypes.c_size_t(0), 0x8000)
+            else:
+                ctypes.CDLL(None).munmap(ctypes.c_void_p(chunk_ptr), ctypes.c_size_t(chunk_sz))
+        self._chunks.clear()
+        self._free_blocks.clear()
+        self._alloc_sizes.clear()
+
+
+class ThreadLocalArenaPool:
+    """Lock-free fast-path per-thread arena pool for multi-threaded native runtimes."""
+
+    def __init__(self, arena_bytes: int = 512 * 1024):
+        self._arena_bytes = arena_bytes
+        self._tls = threading.local()
+        self._registry_lock = threading.Lock()
+        self._arenas: Dict[int, CoalescingHeapArena] = {}
+
+    def get_arena(self) -> CoalescingHeapArena:
+        arena = getattr(self._tls, "arena", None)
+        if arena is None:
+            arena = CoalescingHeapArena(initial_bytes=self._arena_bytes)
+            self._tls.arena = arena
+            tid = threading.get_ident()
+            with self._registry_lock:
+                self._arenas[tid] = arena
+        return arena
+
+    def stats(self) -> Dict[str, int]:
+        with self._registry_lock:
+            arenas = list(self._arenas.values())
+        return {
+            "thread_arenas": len(arenas),
+            "active_allocations": sum(len(a._alloc_sizes) for a in arenas),
+            "free_blocks": sum(len(a._free_blocks) for a in arenas),
+            "coalesce_count": sum(a.coalesce_count for a in arenas),
+            "reused_bytes": sum(a.total_reused_bytes for a in arenas),
+            "freed_bytes": sum(a.total_freed_bytes for a in arenas),
+        }
+
+    def release_all(self):
+        with self._registry_lock:
+            for arena in self._arenas.values():
+                arena.free_all()
+            self._arenas.clear()
+        self._tls = threading.local()
+
+
+_TLS_POOL = ThreadLocalArenaPool()
+
+
+def get_tls_arena() -> CoalescingHeapArena:
+    return _TLS_POOL.get_arena()
+
+
+def omni_alloc_tls(size_bytes: int) -> int:
+    return _TLS_POOL.get_arena().alloc(max(16, size_bytes))
+
+
+def omni_free_tls(ptr: int) -> int:
+    return 1 if _TLS_POOL.get_arena().free(ptr) else 0
+
+
+def omni_heap_stats() -> Dict[str, int]:
+    return _TLS_POOL.stats()
 
 
 # ==============================================================================
@@ -310,6 +457,8 @@ def omni_item_len(container_ptr: int) -> int:
 # Mapping of collection helper symbols and signatures for C-ABI call trampolines
 NATIVE_COLLECTION_SYMBOLS: Dict[str, Tuple[Any, List[Any], Any]] = {
     "omni_alloc": (omni_alloc, [ctypes.c_int64], ctypes.c_int64),
+    "omni_alloc_tls": (omni_alloc_tls, [ctypes.c_int64], ctypes.c_int64),
+    "omni_free_tls": (omni_free_tls, [ctypes.c_int64], ctypes.c_int64),
     "omni_list_new": (omni_list_new, [ctypes.c_int64], ctypes.c_int64),
     "omni_list_len": (omni_list_len, [ctypes.c_int64], ctypes.c_int64),
     "omni_list_get": (omni_list_get, [ctypes.c_int64, ctypes.c_int64], ctypes.c_int64),
@@ -342,5 +491,12 @@ except ImportError:
 try:
     from runtime.native_ffi import NATIVE_FFI_SYMBOLS
     NATIVE_COLLECTION_SYMBOLS.update(NATIVE_FFI_SYMBOLS)
+except ImportError:
+    pass
+
+# Auto-merge native I/O & socket symbols
+try:
+    from runtime.native_io import NATIVE_IO_SYMBOLS
+    NATIVE_COLLECTION_SYMBOLS.update(NATIVE_IO_SYMBOLS)
 except ImportError:
     pass
