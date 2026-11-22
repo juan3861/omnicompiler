@@ -82,6 +82,7 @@ class RepoManifest:
         imports: List[SymbolRequirement],
         manifest_digest: str = "",
         package_dependencies: Optional[List[str]] = None,
+        local_repo_paths: Optional[List[str]] = None,
     ):
         self.repo_name = repo_name
         self.repo_path = repo_path
@@ -90,6 +91,7 @@ class RepoManifest:
         self.imports = imports
         self.manifest_digest = manifest_digest
         self.package_dependencies = list(package_dependencies or [])
+        self.local_repo_paths = list(local_repo_paths or [])
 
     def get_export(self, name: str) -> Optional[SymbolSignature]:
         for exp in self.exports:
@@ -155,7 +157,7 @@ class RepoManifestIngestor:
                     imports.extend(imp)
                     all_bytes.extend(b)
 
-        pkg_deps = self._parse_ecosystem_dependencies(repo_path)
+        pkg_deps, local_paths = self._parse_ecosystem_dependencies(repo_path)
         digest = blake3_digest(bytes(all_bytes)) if all_bytes else blake3_digest(name.encode("utf-8"))
         manifest = RepoManifest(
             repo_name=name,
@@ -165,6 +167,7 @@ class RepoManifestIngestor:
             imports=imports,
             manifest_digest=digest,
             package_dependencies=pkg_deps,
+            local_repo_paths=local_paths,
         )
 
         # Cache in Salsa Query DB
@@ -184,9 +187,19 @@ class RepoManifestIngestor:
         return "polyglot"
 
     @staticmethod
-    def _parse_ecosystem_dependencies(repo_path: str) -> List[str]:
-        """Extracts declared package dependencies from Cargo.toml, package.json, go.mod, and pyproject.toml."""
+    def _parse_ecosystem_dependencies(repo_path: str) -> Tuple[List[str], List[str]]:
+        """
+        Extracts declared package dependencies and resolved local workspace repo paths
+        from `Cargo.toml`, `package.json`, `go.mod`, and `pyproject.toml`.
+        """
         deps: List[str] = []
+        local_paths: List[str] = []
+
+        def _add_local(rel_p: str):
+            cand = os.path.abspath(os.path.join(repo_path, rel_p.strip()))
+            if os.path.isdir(cand) and cand != os.path.abspath(repo_path) and cand not in local_paths:
+                local_paths.append(cand)
+
         cargo_p = os.path.join(repo_path, "Cargo.toml")
         if os.path.exists(cargo_p):
             try:
@@ -198,6 +211,9 @@ class RepoManifestIngestor:
                             in_deps = s.lower() in ("[dependencies]", "[dev-dependencies]", "[build-dependencies]")
                         elif in_deps and "=" in s and not s.startswith("#"):
                             deps.append(f"cargo:{s.split('=', 1)[0].strip()}")
+                            m_path = re.search(r'path\s*=\s*["\']([^"\']+)["\']', s)
+                            if m_path:
+                                _add_local(m_path.group(1))
             except Exception:
                 pass
         pkg_p = os.path.join(repo_path, "package.json")
@@ -207,8 +223,10 @@ class RepoManifestIngestor:
                 with open(pkg_p, "r", encoding="utf-8") as f:
                     pj = json.load(f)
                 for sec in ("dependencies", "devDependencies"):
-                    for k in (pj.get(sec) or {}):
+                    for k, v in (pj.get(sec) or {}).items():
                         deps.append(f"npm:{k}")
+                        if isinstance(v, str) and v.startswith("file:"):
+                            _add_local(v[5:])
             except Exception:
                 pass
         go_p = os.path.join(repo_path, "go.mod")
@@ -218,7 +236,11 @@ class RepoManifestIngestor:
                 with open(go_p, "r", encoding="utf-8") as f:
                     for line in f:
                         s = line.strip()
-                        if s.startswith("require ("):
+                        if s.startswith("replace ") and "=>" in s:
+                            rhs = s.split("=>", 1)[1].strip().split()[0]
+                            if rhs.startswith(".") or os.path.sep in rhs or "/" in rhs:
+                                _add_local(rhs)
+                        elif s.startswith("require ("):
                             in_req = True
                         elif in_req and s == ")":
                             in_req = False
@@ -240,7 +262,7 @@ class RepoManifestIngestor:
                         deps.append(f"pypi:{pkg_n}")
             except Exception:
                 pass
-        return sorted(set(deps))
+        return sorted(set(deps)), local_paths
 
     def _parse_python_file(self, path: str, rel_path: str) -> Tuple[List[SymbolSignature], List[SymbolRequirement], bytes]:
         exports: List[SymbolSignature] = []

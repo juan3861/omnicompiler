@@ -93,7 +93,6 @@ def _has_only_numeric_cfg_syntax(fn_def: ast.FunctionDef) -> bool:
                 ast.Import,
                 ast.ImportFrom,
                 ast.JoinedStr,
-                ast.Lambda,
             ),
         ):
             return False
@@ -123,9 +122,18 @@ def _compute_native_compilable_set(
     while changed:
         changed = False
         for fname in list(candidates):
-            callees = _extract_called_names(all_ast_funcs[fname])
+            fdef = all_ast_funcs[fname]
+            local_closures: Set[str] = set()
+            for nd in ast.walk(fdef):
+                if nd is not fdef and isinstance(nd, ast.FunctionDef):
+                    local_closures.add(nd.name)
+                elif isinstance(nd, ast.Assign) and isinstance(nd.value, ast.Lambda):
+                    for tgt in nd.targets:
+                        if isinstance(tgt, ast.Name):
+                            local_closures.add(tgt.id)
+            callees = _extract_called_names(fdef)
             for c in callees:
-                if c not in NATIVE_BUILTIN_CALLS and c not in OS_C_ABI_IMPORT_TABLE and c not in candidates:
+                if c not in NATIVE_BUILTIN_CALLS and c not in OS_C_ABI_IMPORT_TABLE and c not in candidates and c not in local_closures:
                     candidates.discard(fname)
                     changed = True
                     break
@@ -403,6 +411,19 @@ class OmniRepoCompiler:
         else:
             manifests = [self.ingestor.ingest_repository(p) for p in repo_paths]
             scanned = [self._scan_repo_asts(m.repo_path) for m in manifests]
+
+        # Auto-expand transitive local workspace dependencies declared in Cargo.toml / package.json / go.mod
+        seen_repo_abs = {os.path.abspath(m.repo_path) for m in manifests}
+        expand_queue = [lp for m in manifests for lp in getattr(m, "local_repo_paths", [])]
+        while expand_queue:
+            next_p = os.path.abspath(expand_queue.pop(0))
+            if next_p in seen_repo_abs or not os.path.isdir(next_p):
+                continue
+            seen_repo_abs.add(next_p)
+            extra_m = self.ingestor.ingest_repository(next_p)
+            manifests.append(extra_m)
+            scanned.append(self._scan_repo_asts(extra_m.repo_path))
+            expand_queue.extend(getattr(extra_m, "local_repo_paths", []))
 
         repo_modules_map: Dict[str, List[Tuple[str, ast.Module]]] = {}
         repo_funcs_map: Dict[str, Dict[str, Tuple[str, ast.FunctionDef]]] = {}
@@ -805,6 +826,11 @@ class OmniRepoCompiler:
                     unit_owner_repo[exp.name] = m.repo_name
                     unit_export_flag[exp.name] = True
                     defined_symbols_across_mods.add(exp.name)
+                    for cl_fn in getattr(ssa_fn, "lifted_closures", []):
+                        ssa_program[cl_fn.name] = cl_fn
+                        unit_owner_repo[cl_fn.name] = m.repo_name
+                        unit_export_flag[cl_fn.name] = True
+                        defined_symbols_across_mods.add(cl_fn.name)
                 else:
                     stub_exports.append(exp.name)
                     defined_symbols_across_mods.add(exp.name)

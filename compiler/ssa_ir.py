@@ -356,6 +356,8 @@ class AstToSsaLowering:
         self._var_struct_types: Dict[str, str] = {}
         self.global_luts: Dict[str, Tuple[str, Tuple[Any, ...]]] = dict(global_luts or {})
         self.global_return_types: Dict[str, str] = dict(global_return_types or {})
+        self._closures: Dict[str, Tuple[str, List[str], str]] = {}
+        self._lifted_closures: List[SSAFunction] = []
 
     _CABI_SIZE_ALIGN: Dict[str, Tuple[int, int]] = {
         "i8": (1, 1), "u8": (1, 1),
@@ -1039,6 +1041,8 @@ class AstToSsaLowering:
         self._block_by_name.clear()
         self._loop_stack.clear()
         self._loop_depth = 0
+        self._closures.clear()
+        self._lifted_closures.clear()
 
         entry = self._new_block("entry", seal=True)
         self._cur_block = entry
@@ -1061,7 +1065,69 @@ class AstToSsaLowering:
 
         self._finalize_ssa_types(fn)
         self._prune_unreachable_blocks(fn)
+        fn.lifted_closures = list(self._lifted_closures)
         return fn
+
+    _CLOSURE_BUILTINS = frozenset({
+        "abs", "min", "max", "int", "float", "range", "len", "c_str",
+        "sin", "cos", "tan", "sqrt", "pow", "floor", "ceil", "fabs",
+        "True", "False", "None",
+    })
+
+    def _lift_closure_def(self, inner_name: str, args_node: ast.arguments, body_stmts: List[ast.stmt], ret_ann: Optional[ast.AST], line: int = 0) -> None:
+        assert self._fn is not None and self._cur_block is not None
+        own_params = [a.arg for a in args_node.args]
+        assigned_locals: Set[str] = set(own_params)
+        loaded_names: Set[str] = set()
+        for sub_stmt in body_stmts:
+            for nd in ast.walk(sub_stmt):
+                if isinstance(nd, ast.Name):
+                    if isinstance(nd.ctx, ast.Store):
+                        assigned_locals.add(nd.id)
+                    elif isinstance(nd.ctx, ast.Load):
+                        loaded_names.add(nd.id)
+                elif isinstance(nd, ast.Call) and isinstance(nd.func, ast.Name):
+                    loaded_names.discard(nd.func.id)
+
+        captured = sorted(
+            n for n in loaded_names
+            if n not in assigned_locals
+            and n not in self._CLOSURE_BUILTINS
+            and n not in self.global_luts
+            and n not in self.global_return_types
+            and n not in self._closures
+            and n in self._current_def
+        )
+
+        lifted_name = f"{self._fn.name}__closure_{inner_name}"
+        lifted_args = list(args_node.args)
+        for cap_n in captured:
+            cur_v = self._read_variable(cap_n, self._cur_block)
+            cap_ann = ast.Name(id="float", ctx=ast.Load()) if cur_v.var_type == "f64" else ast.Name(id="int", ctx=ast.Load())
+            lifted_args.append(ast.arg(arg=cap_n, annotation=cap_ann))
+
+        lifted_fn_ast = ast.FunctionDef(
+            name=lifted_name,
+            args=ast.arguments(
+                posonlyargs=[],
+                args=lifted_args,
+                kwonlyargs=[],
+                kw_defaults=[],
+                defaults=[],
+            ),
+            body=body_stmts,
+            decorator_list=[],
+            returns=ret_ann,
+            lineno=line,
+        )
+        sub_lowerer = AstToSsaLowering(
+            struct_layouts=self.struct_layouts,
+            global_luts=self.global_luts,
+            global_return_types=self.global_return_types,
+        )
+        lifted_ssa = optimize_ssa(sub_lowerer.lower_function_def(lifted_fn_ast))
+        self._lifted_closures.append(lifted_ssa)
+        self._closures[inner_name] = (lifted_name, captured, lifted_ssa.return_type)
 
     def _prune_unreachable_blocks(self, fn: SSAFunction):
         if not fn.blocks:
@@ -1099,7 +1165,20 @@ class AstToSsaLowering:
                 val = self._emit_const(0, line=line)
             self._emit(None, "ret", [val], line=line)
 
+        elif isinstance(stmt, ast.FunctionDef):
+            self._lift_closure_def(stmt.name, stmt.args, list(stmt.body), stmt.returns, line=line)
+
         elif isinstance(stmt, ast.Assign):
+            if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name) and isinstance(stmt.value, ast.Lambda):
+                lam = stmt.value
+                self._lift_closure_def(
+                    stmt.targets[0].id,
+                    lam.args,
+                    [ast.Return(value=lam.body, lineno=line)],
+                    None,
+                    line=line,
+                )
+                return
             if len(stmt.targets) == 1:
                 target = stmt.targets[0]
                 # Tuple unpacking / parallel assignment: `a, b = b, a + b`
@@ -1188,6 +1267,41 @@ class AstToSsaLowering:
                     res = self._next_var("st_val")
                     self._emit(res, opcode, [loaded, rhs_val], line=line)
                     self._emit(None, "call", ["omni_item_set", base_var, idx_var, res], line=line)
+
+        elif hasattr(ast, "Match") and isinstance(stmt, ast.Match):
+            subj_v = self._lower_expr(stmt.subject)
+            merge_bb = self._new_block("match_merge", seal=False)
+            for idx_c, case in enumerate(stmt.cases):
+                pat = case.pattern
+                is_wildcard = isinstance(pat, ast.MatchAs) and pat.pattern is None
+                if is_wildcard:
+                    if pat.name:
+                        self._write_variable(pat.name, self._cur_block, subj_v)
+                    self._lower_stmt_list(case.body)
+                    if self._cur_block is not None and not self._cur_block.is_terminated:
+                        self._cur_block.connect_to(merge_bb)
+                        self._emit(None, "br", [merge_bb.name], line=line)
+                    break
+                elif isinstance(pat, ast.MatchValue) and isinstance(pat.value, ast.Constant) and isinstance(pat.value.value, int):
+                    c_v = self._emit_const(pat.value.value, line=line)
+                    cmp_v = self._next_var("mcmp")
+                    self._emit(cmp_v, "cmp_eq", [subj_v, c_v], line=line)
+                    then_bb = self._new_block(f"match_case_{idx_c}", seal=True)
+                    next_bb = self._new_block(f"match_next_{idx_c}", seal=True)
+                    self._cur_block.connect_to(then_bb)
+                    self._cur_block.connect_to(next_bb)
+                    self._emit(None, "br_cond", [cmp_v, then_bb.name, next_bb.name], line=line)
+                    self._cur_block = then_bb
+                    self._lower_stmt_list(case.body)
+                    if self._cur_block is not None and not self._cur_block.is_terminated:
+                        self._cur_block.connect_to(merge_bb)
+                        self._emit(None, "br", [merge_bb.name], line=line)
+                    self._cur_block = next_bb
+            if self._cur_block is not None and not self._cur_block.is_terminated:
+                self._cur_block.connect_to(merge_bb)
+                self._emit(None, "br", [merge_bb.name], line=line)
+            self._seal_block(merge_bb)
+            self._cur_block = merge_bb
 
         elif isinstance(stmt, ast.If):
             cond_var = self._lower_expr(stmt.test)
@@ -1877,6 +1991,14 @@ class AstToSsaLowering:
                     arg_vars = [self._promote_to_f64(self._lower_expr(a), line=line) for a in node.args]
                     res = self._next_var("fcall", var_type="f64")
                     self._emit(res, "call", [fname] + arg_vars, line=line)
+                    return res
+                elif fname in self._closures:
+                    lifted_name, captured_names, ret_ty = self._closures[fname]
+                    arg_vars = [self._lower_expr(a) for a in node.args] + [
+                        self._read_variable(cn, self._cur_block) for cn in captured_names
+                    ]
+                    res = self._next_var("call", var_type=ret_ty)
+                    self._emit(res, "call", [lifted_name] + arg_vars, line=line)
                     return res
                 else:
                     arg_vars = [self._lower_expr(a) for a in node.args]
