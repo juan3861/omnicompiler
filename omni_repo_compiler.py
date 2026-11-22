@@ -1722,6 +1722,7 @@ class OmniRepoCompiler:
 
         # Stage 6.5: Native DWARF v5 `.debug_line` & Win64 `.pdata` Stack-Unwind Generation
         pdata_xdata_pair: Optional[Tuple[bytes, bytes]] = None
+        dwarf_sections_map: Optional[Dict[str, bytes]] = None
         if emit_debug_info:
             for sym_name, art in compiled_artifacts.items():
                 g_off = global_syms.get(sym_name, 0)
@@ -1760,6 +1761,11 @@ class OmniRepoCompiler:
                 high_pc=0x1000 + max(1, len(combined_code)),
                 subprograms=subprogram_dies,
             )
+            dwarf_sections_map = {
+                ".debug_info": dwarf_info_bytes,
+                ".debug_abbrev": dwarf_abbrev_bytes,
+                ".debug_line": dwarf_line_bytes,
+            }
             results["stages"]["debug_info"] = {
                 "dwarf_version": 5,
                 "debug_line_bytes": len(dwarf_line_bytes),
@@ -1799,6 +1805,7 @@ class OmniRepoCompiler:
                 export_name=entry_export,
                 target_format=resolved_fmt,
                 pdata_xdata=pdata_xdata_pair,
+                dwarf_sections=dwarf_sections_map if resolved_fmt == "elf_so" else None,
             )
         else:
             if effective_os == "macos":

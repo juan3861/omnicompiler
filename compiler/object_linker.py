@@ -823,6 +823,7 @@ class NativeObjectLinker:
         export_name: str,
         target_format: str = "auto",
         pdata_xdata: Optional[Tuple[bytes, bytes]] = None,
+        dwarf_sections: Optional[Dict[str, bytes]] = None,
     ) -> str:
         """Links modules and emits a dynamic shared library exporting ALL exported module symbols."""
         link_res = self.link()
@@ -840,6 +841,7 @@ class NativeObjectLinker:
             target_format=target_format,
             extra_exports=exports,
             pdata_xdata=pdata_xdata,
+            dwarf_sections=dwarf_sections,
         )
 
     def emit_linked_executable(

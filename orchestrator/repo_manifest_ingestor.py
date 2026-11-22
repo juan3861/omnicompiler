@@ -80,7 +80,8 @@ class RepoManifest:
         repo_type: str,
         exports: List[SymbolSignature],
         imports: List[SymbolRequirement],
-        manifest_digest: str = ""
+        manifest_digest: str = "",
+        package_dependencies: Optional[List[str]] = None,
     ):
         self.repo_name = repo_name
         self.repo_path = repo_path
@@ -88,6 +89,7 @@ class RepoManifest:
         self.exports = exports
         self.imports = imports
         self.manifest_digest = manifest_digest
+        self.package_dependencies = list(package_dependencies or [])
 
     def get_export(self, name: str) -> Optional[SymbolSignature]:
         for exp in self.exports:
@@ -153,6 +155,7 @@ class RepoManifestIngestor:
                     imports.extend(imp)
                     all_bytes.extend(b)
 
+        pkg_deps = self._parse_ecosystem_dependencies(repo_path)
         digest = blake3_digest(bytes(all_bytes)) if all_bytes else blake3_digest(name.encode("utf-8"))
         manifest = RepoManifest(
             repo_name=name,
@@ -160,7 +163,8 @@ class RepoManifestIngestor:
             repo_type=repo_type,
             exports=exports,
             imports=imports,
-            manifest_digest=digest
+            manifest_digest=digest,
+            package_dependencies=pkg_deps,
         )
 
         # Cache in Salsa Query DB
@@ -171,11 +175,72 @@ class RepoManifestIngestor:
         has_py = os.path.exists(os.path.join(path, "pyproject.toml")) or os.path.exists(os.path.join(path, "setup.py"))
         has_c = os.path.exists(os.path.join(path, "CMakeLists.txt")) or os.path.exists(os.path.join(path, "Makefile"))
         has_rs = os.path.exists(os.path.join(path, "Cargo.toml"))
+        has_js = os.path.exists(os.path.join(path, "package.json"))
+        has_go = os.path.exists(os.path.join(path, "go.mod"))
 
-        if has_py and not (has_c or has_rs): return "python"
-        if has_c and not (has_py or has_rs): return "c_cpp"
-        if has_rs and not (has_py or has_c): return "rust"
+        kinds = [k for flag, k in ((has_py, "python"), (has_c, "c_cpp"), (has_rs, "rust"), (has_js, "typescript"), (has_go, "go")) if flag]
+        if len(kinds) == 1:
+            return kinds[0]
         return "polyglot"
+
+    @staticmethod
+    def _parse_ecosystem_dependencies(repo_path: str) -> List[str]:
+        """Extracts declared package dependencies from Cargo.toml, package.json, go.mod, and pyproject.toml."""
+        deps: List[str] = []
+        cargo_p = os.path.join(repo_path, "Cargo.toml")
+        if os.path.exists(cargo_p):
+            try:
+                in_deps = False
+                with open(cargo_p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s.startswith("["):
+                            in_deps = s.lower() in ("[dependencies]", "[dev-dependencies]", "[build-dependencies]")
+                        elif in_deps and "=" in s and not s.startswith("#"):
+                            deps.append(f"cargo:{s.split('=', 1)[0].strip()}")
+            except Exception:
+                pass
+        pkg_p = os.path.join(repo_path, "package.json")
+        if os.path.exists(pkg_p):
+            try:
+                import json
+                with open(pkg_p, "r", encoding="utf-8") as f:
+                    pj = json.load(f)
+                for sec in ("dependencies", "devDependencies"):
+                    for k in (pj.get(sec) or {}):
+                        deps.append(f"npm:{k}")
+            except Exception:
+                pass
+        go_p = os.path.join(repo_path, "go.mod")
+        if os.path.exists(go_p):
+            try:
+                in_req = False
+                with open(go_p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s.startswith("require ("):
+                            in_req = True
+                        elif in_req and s == ")":
+                            in_req = False
+                        elif (in_req or s.startswith("require ")) and not s.startswith("//"):
+                            toks = s.replace("require ", "", 1).split()
+                            if toks:
+                                deps.append(f"go:{toks[0]}")
+            except Exception:
+                pass
+        py_p = os.path.join(repo_path, "pyproject.toml")
+        if os.path.exists(py_p):
+            try:
+                import tomllib
+                with open(py_p, "rb") as f:
+                    pd = tomllib.load(f)
+                for dep in (pd.get("project", {}).get("dependencies") or []):
+                    pkg_n = re.split(r"[<>=!~;\s\[]", str(dep), maxsplit=1)[0]
+                    if pkg_n:
+                        deps.append(f"pypi:{pkg_n}")
+            except Exception:
+                pass
+        return sorted(set(deps))
 
     def _parse_python_file(self, path: str, rel_path: str) -> Tuple[List[SymbolSignature], List[SymbolRequirement], bytes]:
         exports: List[SymbolSignature] = []

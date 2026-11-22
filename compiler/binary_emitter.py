@@ -600,10 +600,12 @@ class StandaloneBinaryEmitter:
         func_code: bytes,
         export_name: str = "omni_compute",
         extra_exports: Optional[Dict[str, int]] = None,
+        dwarf_sections: Optional[Dict[str, bytes]] = None,
     ) -> bytes:
         """
         Builds a compliant Linux ELF64 Shared Object (ET_DYN) with
-        PT_DYNAMIC, multi-symbol `.dynsym`, and `.dynstr` for dynamic runtime linking.
+        PT_DYNAMIC, multi-symbol `.dynsym`, `.dynstr`, and optional DWARF v5
+        (`.debug_info`, `.debug_abbrev`, `.debug_line`) non-alloc debug sections.
         """
         vaddr = self.VADDR_SO
         code = bytearray(func_code)
@@ -719,6 +721,51 @@ class StandaloneBinaryEmitter:
         file_bytes[dynsym_offset:dynsym_offset + len(dynsym)] = dynsym
         file_bytes[dynamic_offset:dynamic_offset + len(dyn_table)] = dyn_table
         file_bytes[hash_offset:hash_offset + len(hash_table)] = hash_table
+
+        if dwarf_sections:
+            valid_dwarf = [(k, v) for k, v in dwarf_sections.items() if v]
+            if valid_dwarf:
+                shstrtab = bytearray(b"\x00")
+                shstr_name = b".shstrtab\x00"
+                shstr_off_in_tab = len(shstrtab)
+                shstrtab.extend(shstr_name)
+                sec_name_offs = []
+                for sname, _ in valid_dwarf:
+                    sec_name_offs.append(len(shstrtab))
+                    shstrtab.extend(sname.encode("ascii") + b"\x00")
+
+                shstrtab_file_off = len(file_bytes)
+                file_bytes.extend(shstrtab)
+
+                sec_file_offs = []
+                for _, sdata in valid_dwarf:
+                    pad = (8 - (len(file_bytes) % 8)) % 8
+                    if pad:
+                        file_bytes.extend(b"\x00" * pad)
+                    sec_file_offs.append((len(file_bytes), len(sdata)))
+                    file_bytes.extend(sdata)
+
+                pad_sh = (8 - (len(file_bytes) % 8)) % 8
+                if pad_sh:
+                    file_bytes.extend(b"\x00" * pad_sh)
+                shoff = len(file_bytes)
+                shnum = 2 + len(valid_dwarf)  # SHT_NULL + .shstrtab + dwarf sections
+                # 0: SHT_NULL
+                file_bytes.extend(struct.pack("<IIQQQQIIQQ", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+                # 1: .shstrtab (SHT_STRTAB = 3)
+                file_bytes.extend(struct.pack(
+                    "<IIQQQQIIQQ",
+                    shstr_off_in_tab, 3, 0, 0, shstrtab_file_off, len(shstrtab), 0, 0, 1, 0
+                ))
+                # 2..N: DWARF sections (SHT_PROGBITS = 1)
+                for (sname, _), n_off, (f_off, f_sz) in zip(valid_dwarf, sec_name_offs, sec_file_offs):
+                    file_bytes.extend(struct.pack(
+                        "<IIQQQQIIQQ",
+                        n_off, 1, 0, 0, f_off, f_sz, 0, 0, 1, 0
+                    ))
+                # Patch e_shoff (offset 40), e_shnum (offset 60), e_shstrndx (offset 62)
+                struct.pack_into("<Q", file_bytes, 40, shoff)
+                struct.pack_into("<HH", file_bytes, 60, shnum, 1)
 
         return bytes(file_bytes)
 
@@ -1270,6 +1317,7 @@ class StandaloneBinaryEmitter:
         target_format: str = "auto",
         extra_exports: Optional[Dict[str, int]] = None,
         pdata_xdata: Optional[Tuple[bytes, bytes]] = None,
+        dwarf_sections: Optional[Dict[str, bytes]] = None,
     ) -> str:
         if target_format == "auto":
             target_format = "pe_dll" if sys.platform == "win32" else "elf_so"
@@ -1287,7 +1335,12 @@ class StandaloneBinaryEmitter:
         elif target_format == "elf_so":
             if not output_path.endswith(".so"):
                 output_path += ".so"
-            data = self.build_elf64_so(func_code=func_code, export_name=export_name, extra_exports=extra_exports)
+            data = self.build_elf64_so(
+                func_code=func_code,
+                export_name=export_name,
+                extra_exports=extra_exports,
+                dwarf_sections=dwarf_sections,
+            )
         elif target_format in ("macho_dylib", "dylib"):
             if not output_path.endswith(".dylib"):
                 output_path += ".dylib"
