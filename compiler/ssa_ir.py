@@ -1268,41 +1268,6 @@ class AstToSsaLowering:
                     self._emit(res, opcode, [loaded, rhs_val], line=line)
                     self._emit(None, "call", ["omni_item_set", base_var, idx_var, res], line=line)
 
-        elif hasattr(ast, "Match") and isinstance(stmt, ast.Match):
-            subj_v = self._lower_expr(stmt.subject)
-            merge_bb = self._new_block("match_merge", seal=False)
-            for idx_c, case in enumerate(stmt.cases):
-                pat = case.pattern
-                is_wildcard = isinstance(pat, ast.MatchAs) and pat.pattern is None
-                if is_wildcard:
-                    if pat.name:
-                        self._write_variable(pat.name, self._cur_block, subj_v)
-                    self._lower_stmt_list(case.body)
-                    if self._cur_block is not None and not self._cur_block.is_terminated:
-                        self._cur_block.connect_to(merge_bb)
-                        self._emit(None, "br", [merge_bb.name], line=line)
-                    break
-                elif isinstance(pat, ast.MatchValue) and isinstance(pat.value, ast.Constant) and isinstance(pat.value.value, int):
-                    c_v = self._emit_const(pat.value.value, line=line)
-                    cmp_v = self._next_var("mcmp")
-                    self._emit(cmp_v, "cmp_eq", [subj_v, c_v], line=line)
-                    then_bb = self._new_block(f"match_case_{idx_c}", seal=True)
-                    next_bb = self._new_block(f"match_next_{idx_c}", seal=True)
-                    self._cur_block.connect_to(then_bb)
-                    self._cur_block.connect_to(next_bb)
-                    self._emit(None, "br_cond", [cmp_v, then_bb.name, next_bb.name], line=line)
-                    self._cur_block = then_bb
-                    self._lower_stmt_list(case.body)
-                    if self._cur_block is not None and not self._cur_block.is_terminated:
-                        self._cur_block.connect_to(merge_bb)
-                        self._emit(None, "br", [merge_bb.name], line=line)
-                    self._cur_block = next_bb
-            if self._cur_block is not None and not self._cur_block.is_terminated:
-                self._cur_block.connect_to(merge_bb)
-                self._emit(None, "br", [merge_bb.name], line=line)
-            self._seal_block(merge_bb)
-            self._cur_block = merge_bb
-
         elif isinstance(stmt, ast.If):
             cond_var = self._lower_expr(stmt.test)
             pred_bb = self._cur_block
