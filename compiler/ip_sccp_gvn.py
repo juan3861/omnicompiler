@@ -18,8 +18,10 @@ Implements:
    - Propagates pure constant-return functions across callers.
 """
 
-from typing import Dict, List, Set, Tuple, Any, Optional
+from typing import Dict, List, Set, Tuple, Any, Optional, Union
 import copy
+import math
+import struct
 
 from compiler.ssa_ir import (
     SSAFunction,
@@ -251,11 +253,18 @@ class SCCPPass:
         def get_val(op: Any) -> Any:
             if isinstance(op, bool):
                 return int(op)
-            if isinstance(op, int):
+            if isinstance(op, (int, float)):
                 return op
             if isinstance(op, SSAVar):
                 return lattice.get(op, _TOP)
             return _BOTTOM
+
+        def _same_const(a: Any, b: Any) -> bool:
+            if type(a) is not type(b):
+                return False
+            if isinstance(a, float):
+                return (a == b and math.copysign(1.0, a) == math.copysign(1.0, b)) or (math.isnan(a) and math.isnan(b))
+            return a == b
 
         def meet(a: Any, b: Any) -> Any:
             if a is _TOP:
@@ -264,7 +273,7 @@ class SCCPPass:
                 return a
             if a is _BOTTOM or b is _BOTTOM:
                 return _BOTTOM
-            if a == b:
+            if _same_const(a, b):
                 return a
             return _BOTTOM
 
@@ -272,7 +281,8 @@ class SCCPPass:
             if var is None:
                 return
             old_val = lattice.get(var, _TOP)
-            if new_val != old_val:
+            changed = (new_val is not old_val) if (new_val in (_TOP, _BOTTOM) or old_val in (_TOP, _BOTTOM)) else (not _same_const(new_val, old_val))
+            if changed:
                 lattice[var] = new_val
                 ssa_worklist.append(var)
 
@@ -285,9 +295,16 @@ class SCCPPass:
 
         def eval_inst(bname: str, inst: SSAInstruction):
             op = inst.opcode
-            if op == "const" and inst.operands:
+            if op in ("const", "fconst") and inst.operands:
                 v = inst.operands[0]
-                update_lattice(inst.result, int(v) if isinstance(v, (int, bool)) else _BOTTOM)
+                if isinstance(v, bool):
+                    update_lattice(inst.result, int(v))
+                elif isinstance(v, int):
+                    update_lattice(inst.result, float(v) if op == "fconst" else v)
+                elif isinstance(v, float):
+                    update_lattice(inst.result, v)
+                else:
+                    update_lattice(inst.result, _BOTTOM)
             elif op == "mov" and inst.operands:
                 update_lattice(inst.result, get_val(inst.operands[0]))
             elif op == "param":
@@ -297,6 +314,53 @@ class SCCPPass:
                 if isinstance(v, int):
                     update_lattice(inst.result, -v if op == "neg" else (1 if v == 0 else 0))
                 elif v is _BOTTOM:
+                    update_lattice(inst.result, _BOTTOM)
+            elif op == "fneg" and len(inst.operands) == 1:
+                v = get_val(inst.operands[0])
+                if isinstance(v, float):
+                    update_lattice(inst.result, -v)
+                elif v is _BOTTOM:
+                    update_lattice(inst.result, _BOTTOM)
+            elif op == "sitofp" and len(inst.operands) == 1:
+                v = get_val(inst.operands[0])
+                if isinstance(v, int):
+                    update_lattice(inst.result, float(v))
+                elif v is _BOTTOM:
+                    update_lattice(inst.result, _BOTTOM)
+            elif op == "fptosi" and len(inst.operands) == 1:
+                v = get_val(inst.operands[0])
+                if isinstance(v, float) and math.isfinite(v):
+                    update_lattice(inst.result, int(v))
+                elif v is _BOTTOM:
+                    update_lattice(inst.result, _BOTTOM)
+            elif op in ("fadd", "fsub", "fmul", "fdiv") and len(inst.operands) == 2:
+                v0 = get_val(inst.operands[0])
+                v1 = get_val(inst.operands[1])
+                if isinstance(v0, float) and isinstance(v1, float):
+                    if op == "fadd":
+                        update_lattice(inst.result, v0 + v1)
+                    elif op == "fsub":
+                        update_lattice(inst.result, v0 - v1)
+                    elif op == "fmul":
+                        update_lattice(inst.result, v0 * v1)
+                    elif op == "fdiv":
+                        update_lattice(inst.result, (v0 / v1) if v1 != 0.0 else _BOTTOM)
+                elif v0 is _BOTTOM or v1 is _BOTTOM:
+                    update_lattice(inst.result, _BOTTOM)
+            elif op in ("fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge") and len(inst.operands) == 2:
+                v0 = get_val(inst.operands[0])
+                v1 = get_val(inst.operands[1])
+                if isinstance(v0, float) and isinstance(v1, float):
+                    cmp_map = {
+                        "fcmp_eq": v0 == v1,
+                        "fcmp_ne": v0 != v1,
+                        "fcmp_lt": v0 < v1,
+                        "fcmp_le": v0 <= v1,
+                        "fcmp_gt": v0 > v1,
+                        "fcmp_ge": v0 >= v1,
+                    }
+                    update_lattice(inst.result, 1 if cmp_map[op] else 0)
+                elif v0 is _BOTTOM or v1 is _BOTTOM:
                     update_lattice(inst.result, _BOTTOM)
             elif op in (
                 "add", "sub", "mul", "sdiv", "srem",
@@ -385,9 +449,11 @@ class SCCPPass:
             remaining_phis: List[SSAInstruction] = []
             prepended_consts: List[SSAInstruction] = []
             for phi in b.phi_nodes:
-                if phi.result and isinstance(lattice.get(phi.result), int):
-                    cval = lattice[phi.result]
-                    prepended_consts.append(SSAInstruction(phi.result, "const", [cval], source_line=phi.source_line))
+                pval = lattice.get(phi.result) if phi.result else None
+                if phi.result and isinstance(pval, (int, float)):
+                    if isinstance(pval, float):
+                        phi.result.var_type = "f64"
+                    prepended_consts.append(SSAInstruction(phi.result, "const", [pval], source_line=phi.source_line))
                     folded_constants += 1
                 else:
                     # Prune unreachable incoming edges from phi
@@ -410,9 +476,11 @@ class SCCPPass:
                         inst.opcode = "br"
                         inst.operands = [taken]
                         folded_branches += 1
-                elif inst.result is not None and inst.opcode != "const" and inst.opcode not in SIDE_EFFECT_OPCODES:
+                elif inst.result is not None and inst.opcode not in ("const", "fconst") and inst.opcode not in SIDE_EFFECT_OPCODES:
                     val = lattice.get(inst.result)
-                    if isinstance(val, int):
+                    if isinstance(val, (int, float)):
+                        if isinstance(val, float):
+                            inst.result.var_type = "f64"
                         inst.opcode = "const"
                         inst.operands = [val]
                         folded_constants += 1
@@ -451,20 +519,24 @@ class InterProceduralSCCPPass:
     def __init__(self, max_specializations: int = 16):
         self.max_specializations = max_specializations
 
-    def _collect_const_map(self, fn: SSAFunction) -> Dict[SSAVar, int]:
-        consts: Dict[SSAVar, int] = {}
+    def _collect_const_map(self, fn: SSAFunction) -> Dict[SSAVar, Union[int, float]]:
+        consts: Dict[SSAVar, Union[int, float]] = {}
         for b in fn.blocks:
             for inst in b.instructions:
-                if inst.opcode == "const" and inst.result is not None and inst.operands:
+                if inst.opcode in ("const", "fconst") and inst.result is not None and inst.operands:
                     val = inst.operands[0]
-                    if isinstance(val, (int, bool)):
+                    if isinstance(val, bool):
                         consts[inst.result] = int(val)
+                    elif isinstance(val, int):
+                        consts[inst.result] = float(val) if inst.opcode == "fconst" else val
+                    elif isinstance(val, float):
+                        consts[inst.result] = val
         return consts
 
-    def _is_pure_constant_return(self, fn: SSAFunction) -> Optional[int]:
-        """If `fn` has no side effects and all `ret` instructions return the same int constant, return it."""
+    def _is_pure_constant_return(self, fn: SSAFunction) -> Optional[Union[int, float]]:
+        """If `fn` has no side effects and all `ret` instructions return the same int/float constant, return it."""
         const_map = self._collect_const_map(fn)
-        ret_vals: List[int] = []
+        ret_vals: List[Union[int, float]] = []
         for b in fn.blocks:
             for inst in b.instructions:
                 if inst.opcode in ("store", "call"):
@@ -473,14 +545,18 @@ class InterProceduralSCCPPass:
                     if not inst.operands:
                         return None
                     op = inst.operands[0]
-                    if isinstance(op, int):
+                    if isinstance(op, bool):
+                        ret_vals.append(int(op))
+                    elif isinstance(op, (int, float)):
                         ret_vals.append(op)
                     elif isinstance(op, SSAVar) and op in const_map:
                         ret_vals.append(const_map[op])
                     else:
                         return None
-        if ret_vals and all(v == ret_vals[0] for v in ret_vals):
-            return ret_vals[0]
+        if ret_vals:
+            v0 = ret_vals[0]
+            if all(type(v) is type(v0) and v == v0 for v in ret_vals):
+                return v0
         return None
 
     def optimize_program(
@@ -540,11 +616,13 @@ class InterProceduralSCCPPass:
                         if len(call_args) != len(callee_fn.params):
                             continue
 
-                        # Resolve constant arguments
-                        arg_consts: List[Optional[int]] = []
+                        # Resolve constant arguments (int or float)
+                        arg_consts: List[Optional[Union[int, float]]] = []
                         for a in call_args:
-                            if isinstance(a, (int, bool)):
+                            if isinstance(a, bool):
                                 arg_consts.append(int(a))
+                            elif isinstance(a, (int, float)):
+                                arg_consts.append(a)
                             elif isinstance(a, SSAVar) and a in const_map:
                                 arg_consts.append(const_map[a])
                             else:
@@ -553,14 +631,22 @@ class InterProceduralSCCPPass:
                         if not any(c is not None for c in arg_consts):
                             continue
 
-                        spec_key = (callee_name, tuple(arg_consts))
+                        spec_key = (
+                            callee_name,
+                            tuple(
+                                ("f", struct.pack(">d", c).hex()) if isinstance(c, float) else (("i", c) if c is not None else None)
+                                for c in arg_consts
+                            ),
+                        )
                         if spec_key in existing_specs:
                             spec_name = existing_specs[spec_key]
                         else:
                             if specialized_count >= self.max_specializations:
                                 continue
                             sig_parts = [
-                                f"a{idx}_{val}" for idx, val in enumerate(arg_consts) if val is not None
+                                (f"a{idx}_f{struct.pack('>d', val).hex()}" if isinstance(val, float) else f"a{idx}_{val}")
+                                for idx, val in enumerate(arg_consts)
+                                if val is not None
                             ]
                             spec_name = f"{callee_name}__spec_{'_'.join(sig_parts)}"
                             spec_fn = clone_ssa_function(callee_fn, new_name=spec_name)
@@ -588,8 +674,11 @@ class InterProceduralSCCPPass:
                                         else:
                                             continue
                                         if p_idx < len(arg_consts) and arg_consts[p_idx] is not None:
+                                            cval = arg_consts[p_idx]
                                             sinst.opcode = "const"
-                                            sinst.operands = [arg_consts[p_idx]]
+                                            sinst.operands = [cval]
+                                            if isinstance(cval, float) and sinst.result is not None:
+                                                sinst.result.var_type = "f64"
                                         elif isinstance(raw_param, int) and p_idx in old_to_new_idx:
                                             sinst.operands = [old_to_new_idx[p_idx]]
 
@@ -612,7 +701,7 @@ class InterProceduralSCCPPass:
                         round_changed = True
 
             # Step 3: Inter-Procedural Constant Return Propagation
-            pure_const_returns: Dict[str, int] = {}
+            pure_const_returns: Dict[str, Union[int, float]] = {}
             for fname, fn in functions.items():
                 cret = self._is_pure_constant_return(fn)
                 if cret is not None:
@@ -627,8 +716,11 @@ class InterProceduralSCCPPass:
                             if inst.opcode == "call" and inst.operands:
                                 callee_name = str(inst.operands[0])
                                 if callee_name in pure_const_returns and inst.result is not None:
+                                    cval = pure_const_returns[callee_name]
                                     inst.opcode = "const"
-                                    inst.operands = [pure_const_returns[callee_name]]
+                                    inst.operands = [cval]
+                                    if isinstance(cval, float):
+                                        inst.result.var_type = "f64"
                                     ip_const_returns += 1
                                     changed = True
                                     round_changed = True

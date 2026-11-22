@@ -176,6 +176,35 @@ class BinaryStructureAuditor:
                     metrics["dysymtab_present"] = True
                     metrics["nextdefsym"] = nextdef
                     metrics["nundefsym"] = nundef
+            elif cmd in (0x22, 0x80000022):  # LC_DYLD_INFO / LC_DYLD_INFO_ONLY
+                if cmdsize >= 48:
+                    _rob, _rsz, boff, bsz = struct.unpack("<IIII", macho_bytes[offset+8:offset+24])
+                    bind_syms = []
+                    if boff + bsz <= len(macho_bytes) and bsz > 0:
+                        bstream = macho_bytes[boff : boff + bsz]
+                        p = 0
+                        cur_sym = ""
+                        while p < len(bstream):
+                            op = bstream[p] & 0xF0
+                            p += 1
+                            if op == 0x00:  # BIND_OPCODE_DONE
+                                break
+                            elif op == 0x40:  # BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM
+                                z = bstream.find(b"\x00", p)
+                                if z == -1:
+                                    break
+                                raw_s = bstream[p:z].decode("utf-8", errors="ignore")
+                                cur_sym = raw_s[1:] if raw_s.startswith("_") else raw_s
+                                p = z + 1
+                            elif op in (0x70, 0x80, 0xA0, 0xC0):  # ULEB128 single operand
+                                while p < len(bstream) and (bstream[p] & 0x80):
+                                    p += 1
+                                p += 1
+                            elif op == 0x90:  # BIND_OPCODE_DO_BIND
+                                if cur_sym:
+                                    bind_syms.append(cur_sym)
+                    metrics["dyld_bind_symbols"] = bind_syms
+                    metrics["dyld_bind_count"] = len(bind_syms)
             elif cmd == 0x1D:  # LC_CODE_SIGNATURE (Apple Silicon XNU Ad-Hoc CodeDirectory)
                 if cmdsize >= 16:
                     import hashlib

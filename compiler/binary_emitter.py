@@ -812,6 +812,39 @@ class StandaloneBinaryEmitter:
     # 6. MACH-O 64-BIT (macOS x86-64 & Apple Silicon ARM64 + AD-HOC CODESIGN)
     # =========================================================================
 
+    @staticmethod
+    def _encode_uleb128(value: int) -> bytes:
+        out = bytearray()
+        v = max(0, int(value))
+        while True:
+            byte = v & 0x7F
+            v >>= 7
+            if v:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                break
+        return bytes(out)
+
+    @classmethod
+    def _build_macho_dyld_bind_opcodes(cls, imported_symbols: List[str], data_seg_index: int = 2) -> bytes:
+        """
+        Builds dyld bind opcodes (`LC_DYLD_INFO_ONLY`) binding each imported symbol
+        to consecutive 8-byte pointer slots in `__DATA,__got` via ordinal 1 (`libSystem.B.dylib`).
+        """
+        ops = bytearray()
+        ops.append(0x11)  # BIND_OPCODE_SET_DYLIB_ORDINAL_IMM (ordinal=1)
+        ops.append(0x70 | (data_seg_index & 0x0F))  # BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+        ops.extend(cls._encode_uleb128(0))
+        ops.append(0x51)  # BIND_OPCODE_SET_TYPE_IMM (BIND_TYPE_POINTER = 1)
+        for sym in imported_symbols:
+            m_sym = sym if sym.startswith("_") else f"_{sym}"
+            ops.append(0x40)  # BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM (flags=0)
+            ops.extend(m_sym.encode("ascii") + b"\x00")
+            ops.append(0x90)  # BIND_OPCODE_DO_BIND
+        ops.append(0x00)  # BIND_OPCODE_DONE
+        return bytes(ops)
+
     def build_macho64(
         self,
         exit_code: int = 0,
@@ -821,10 +854,12 @@ class StandaloneBinaryEmitter:
         load_dylibs: Optional[List[str]] = None,
         imported_symbols: Optional[List[str]] = None,
         exported_symbols: Optional[Dict[str, int]] = None,
+        os_import_stubs: Optional[Dict[str, int]] = None,
     ) -> bytes:
         """
         Synthesizes a 64-bit Mach-O standalone executable (`MH_EXECUTE`) for macOS.
-        Supports optional `LC_LOAD_DYLINKER` + `LC_LOAD_DYLIB` (`0x0C`) + `LC_SYMTAB` + `LC_DYSYMTAB`.
+        Supports `LC_LOAD_DYLINKER` + `LC_LOAD_DYLIB` (`0x0C`) + `LC_SYMTAB` + `LC_DYSYMTAB` +
+        `__DATA,__got` + `LC_DYLD_INFO_ONLY` (`0x80000022`) bind opcodes.
         On Apple Silicon (`arm64`), embeds `__LINKEDIT` + XNU `LC_CODE_SIGNATURE` (`0x1D`)
         with SHA-256 page hashes (`CS_SuperBlob` `0xFADE0CC0`).
         """
@@ -852,6 +887,34 @@ class StandaloneBinaryEmitter:
         text_file_end = self._align_up(code_offset + len(padded_code), page_size)
         text_vmsize = text_file_end
 
+        ordered_imports = sorted(set(imported_symbols or (os_import_stubs.keys() if os_import_stubs else [])))
+        need_got = bool(os_import_stubs and ordered_imports)
+        data_vmaddr = 0x100000000 + text_vmsize
+        data_fileoff = text_file_end
+        got_raw_size = len(ordered_imports) * 8 if need_got else 0
+        data_filesize = self._align_up(got_raw_size, page_size) if need_got else 0
+        data_vmsize = data_filesize
+
+        if need_got and os_import_stubs:
+            got_vaddr_map = {sym: data_vmaddr + idx * 8 for idx, sym in enumerate(ordered_imports)}
+            patched_raw = bytearray(raw_code)
+            for sym, stub_off in os_import_stubs.items():
+                if sym not in got_vaddr_map:
+                    continue
+                if is_arm64:
+                    if stub_off + 12 <= len(patched_raw):
+                        patched_raw[stub_off : stub_off + 12] = self._encode_a64_got_stub(
+                            code_vaddr + stub_off,
+                            got_vaddr_map[sym],
+                        )
+                else:
+                    if stub_off + 6 <= len(patched_raw):
+                        stub_rip = code_vaddr + stub_off + 6
+                        disp = got_vaddr_map[sym] - stub_rip
+                        patched_raw[stub_off : stub_off + 6] = b"\xff\x25" + struct.pack("<i", disp)
+            raw_code = bytes(patched_raw)
+            padded_code = raw_code.ljust(self._align_up(max(1, len(raw_code)), 16), b"\x00")
+
         dylib_cmds: List[bytes] = []
         if load_dylibs:
             dyld_raw = b"/usr/lib/dyld\x00"
@@ -862,9 +925,15 @@ class StandaloneBinaryEmitter:
                 d_sz = self._align_up(24 + len(d_raw), 8)
                 dylib_cmds.append(struct.pack("<IIIIII", 0x0C, d_sz, 24, 2, 0x010000, 0x010000) + d_raw.ljust(d_sz - 24, b"\x00"))
 
-        need_symtab = bool(imported_symbols or exported_symbols)
-        need_dysymtab = bool(imported_symbols)
-        need_linkedit = is_arm64 or need_symtab
+        need_symtab = bool(ordered_imports or exported_symbols)
+        need_dysymtab = bool(ordered_imports)
+        need_dyld_info = bool(need_got and load_dylibs)
+        need_linkedit = is_arm64 or need_symtab or need_dyld_info
+
+        linkedit_fileoff = text_file_end + data_filesize
+        bind_opcodes = self._build_macho_dyld_bind_opcodes(ordered_imports, data_seg_index=2) if need_dyld_info else b""
+        bind_pad = bind_opcodes.ljust(self._align_up(len(bind_opcodes), 8), b"\x00") if bind_opcodes else b""
+        bind_off = linkedit_fileoff if bind_pad else 0
 
         symtab_bytes = bytearray()
         strtab_bytes = bytearray(b"\x00")
@@ -880,8 +949,8 @@ class StandaloneBinaryEmitter:
                 strtab_bytes.extend(m_sym.encode("utf-8") + b"\x00")
                 symtab_bytes.extend(struct.pack("<IBBHQ", s_off, 0x0F, 1, 0, code_vaddr + int(sym_off)))  # N_EXT | N_SECT
                 n_ext_def += 1
-        if imported_symbols:
-            for sym in imported_symbols:
+        if ordered_imports:
+            for sym in ordered_imports:
                 if sym in defined_names:
                     continue
                 m_sym = sym if sym.startswith("_") else f"_{sym}"
@@ -892,39 +961,43 @@ class StandaloneBinaryEmitter:
         nsyms = n_ext_def + n_undef
         symtab_pad = bytes(symtab_bytes)
         strtab_pad = bytes(strtab_bytes).ljust(self._align_up(len(strtab_bytes), 8), b"\x00")
-        linkedit_data = symtab_pad + strtab_pad if need_symtab else b""
+        linkedit_data = (bind_pad + symtab_pad + strtab_pad) if (need_symtab or need_dyld_info) else b""
         if is_arm64 and linkedit_data:
             rem16 = (-len(linkedit_data)) & 15
             linkedit_data += b"\x00" * rem16
 
-        symoff = text_file_end
-        stroff = text_file_end + len(symtab_pad)
+        symoff = linkedit_fileoff + len(bind_pad)
+        stroff = symoff + len(symtab_pad)
 
         cmd1_size = 72        # __PAGEZERO
         cmd2_size = 72 + 80   # __TEXT + __text
+        cmd_data_size = (72 + 80) if need_got else 0
         cmd3_size = 24        # LC_MAIN
         cmd_linkedit_size = 72 if need_linkedit else 0
+        cmd_dyld_info_size = 48 if need_dyld_info else 0
         cmd_symtab_size = 24 if need_symtab else 0
         cmd_dysymtab_size = 80 if need_dysymtab else 0
         cmd_codesig_size = 16 if is_arm64 else 0
 
         ncmds = (
             3
+            + (1 if need_got else 0)
             + len(dylib_cmds)
             + (1 if need_linkedit else 0)
+            + (1 if need_dyld_info else 0)
             + (1 if need_symtab else 0)
             + (1 if need_dysymtab else 0)
             + (1 if is_arm64 else 0)
         )
         sizeofcmds = (
-            cmd1_size + cmd2_size + cmd3_size
+            cmd1_size + cmd2_size + cmd_data_size + cmd3_size
             + sum(len(c) for c in dylib_cmds)
-            + cmd_linkedit_size + cmd_symtab_size + cmd_dysymtab_size + cmd_codesig_size
+            + cmd_linkedit_size + cmd_dyld_info_size + cmd_symtab_size + cmd_dysymtab_size + cmd_codesig_size
         )
 
         # Pre-calculate codesign size for __LINKEDIT if ARM64
         page_shift = 14 if is_arm64 else 12
-        codesig_off = text_file_end + len(linkedit_data)
+        codesig_off = linkedit_fileoff + len(linkedit_data)
         dummy_unsigned = b"\x00" * codesig_off
         est_sig = build_macho_adhoc_codesign_blob(dummy_unsigned, page_shift=page_shift) if is_arm64 else b""
 
@@ -953,6 +1026,21 @@ class StandaloneBinaryEmitter:
             code_vaddr, len(raw_code), code_offset, 2, 0, 0, 0x80000400, 0, 0, 0
         )
 
+        cmd_data_bytes = b""
+        if need_got:
+            cmd_data = struct.pack(
+                "<II16sQQQQIIII",
+                0x19, cmd_data_size, b"__DATA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+                data_vmaddr, data_vmsize, data_fileoff, data_filesize, 3, 3, 1, 0
+            )
+            sec_got = struct.pack(
+                "<16s16sQQIIIIIIII",
+                b"__got\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+                b"__DATA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+                data_vmaddr, got_raw_size, data_fileoff, 3, 0, 0, 0x06, 0, 0, 0  # S_NON_LAZY_SYMBOL_POINTERS
+            )
+            cmd_data_bytes = cmd_data + sec_got
+
         actual_entry = code_offset + (entry_offset if entry_offset is not None else 0)
         cmd_main = struct.pack("<IIQQ", 0x80000028, cmd3_size, actual_entry, 0)
 
@@ -960,15 +1048,25 @@ class StandaloneBinaryEmitter:
         for dc in dylib_cmds:
             extra_cmds.extend(dc)
         if need_linkedit:
-            linkedit_vmaddr = 0x100000000 + text_vmsize
+            linkedit_vmaddr = 0x100000000 + text_vmsize + data_vmsize
             linkedit_fsize = len(linkedit_data) + len(est_sig)
             linkedit_vmsize = self._align_up(max(1, linkedit_fsize), page_size)
             extra_cmds.extend(struct.pack(
                 "<II16sQQQQIIII",
                 0x19, 72, b"__LINKEDIT\x00\x00\x00\x00\x00\x00",
                 linkedit_vmaddr, linkedit_vmsize,
-                text_file_end, linkedit_fsize,
+                linkedit_fileoff, linkedit_fsize,
                 1, 1, 0, 0
+            ))
+        if need_dyld_info:
+            extra_cmds.extend(struct.pack(
+                "<IIIIIIIIIIII",
+                0x80000022, 48,  # LC_DYLD_INFO_ONLY
+                0, 0,            # rebase_off, rebase_size
+                bind_off, len(bind_opcodes),
+                0, 0,            # weak_bind_off, weak_bind_size
+                0, 0,            # lazy_bind_off, lazy_bind_size
+                0, 0,            # export_off, export_size
             ))
         if need_symtab:
             extra_cmds.extend(struct.pack("<IIIIII", 0x02, 24, symoff, nsyms, stroff, len(strtab_pad)))
@@ -977,13 +1075,15 @@ class StandaloneBinaryEmitter:
         if is_arm64:
             extra_cmds.extend(struct.pack("<IIII", 0x1D, 16, codesig_off, len(est_sig)))
 
-        all_headers = (header + cmd_pagezero + cmd_text + sec_text + cmd_main + bytes(extra_cmds)).ljust(code_offset, b"\x00")
-        unsigned_img = (all_headers + padded_code).ljust(text_file_end, b"\x00") + linkedit_data
+        all_headers = (header + cmd_pagezero + cmd_text + sec_text + cmd_data_bytes + cmd_main + bytes(extra_cmds)).ljust(code_offset, b"\x00")
+        text_section_img = (all_headers + padded_code).ljust(text_file_end, b"\x00")
+        data_section_img = b"\x00" * data_filesize
+        unsigned_img = text_section_img + data_section_img + linkedit_data
 
         if is_arm64:
             real_sig = build_macho_adhoc_codesign_blob(unsigned_img, page_shift=page_shift)
             return unsigned_img + real_sig
-        if need_symtab:
+        if need_symtab or need_dyld_info:
             return unsigned_img
         return unsigned_img[:code_offset + len(raw_code)]
 
@@ -1801,6 +1901,7 @@ class StandaloneBinaryEmitter:
                 load_dylibs=["/usr/lib/libSystem.B.dylib"],
                 imported_symbols=imported_funcs,
                 exported_symbols=exported_symbols,
+                os_import_stubs=os_import_stubs,
             )
         else:
             raise ValueError(f"Dynamic linked executables unsupported for format: {target_format}")
