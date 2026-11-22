@@ -189,21 +189,20 @@ class ThreadLocalArenaPool:
         self._arena_bytes = arena_bytes
         self._tls = threading.local()
         self._registry_lock = threading.Lock()
-        self._arenas: Dict[int, CoalescingHeapArena] = {}
+        self._arenas: List[CoalescingHeapArena] = []
 
     def get_arena(self) -> CoalescingHeapArena:
         arena = getattr(self._tls, "arena", None)
         if arena is None:
             arena = CoalescingHeapArena(initial_bytes=self._arena_bytes)
             self._tls.arena = arena
-            tid = threading.get_ident()
             with self._registry_lock:
-                self._arenas[tid] = arena
+                self._arenas.append(arena)
         return arena
 
     def stats(self) -> Dict[str, int]:
         with self._registry_lock:
-            arenas = list(self._arenas.values())
+            arenas = list(self._arenas)
         return {
             "thread_arenas": len(arenas),
             "active_allocations": sum(len(a._alloc_sizes) for a in arenas),
@@ -215,7 +214,7 @@ class ThreadLocalArenaPool:
 
     def release_all(self):
         with self._registry_lock:
-            for arena in self._arenas.values():
+            for arena in self._arenas:
                 arena.free_all()
             self._arenas.clear()
         self._tls = threading.local()
