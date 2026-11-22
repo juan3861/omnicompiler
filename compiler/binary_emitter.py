@@ -1280,6 +1280,7 @@ class StandaloneBinaryEmitter:
                 custom_code=custom_code,
                 arch="arm64",
                 entry_offset=entry_offset,
+                load_dylibs=["/usr/lib/libSystem.B.dylib"],
                 exported_symbols=exported_symbols,
             )
         else:
