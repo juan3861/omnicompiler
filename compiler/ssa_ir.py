@@ -337,6 +337,7 @@ class AstToSsaLowering:
         self,
         struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None,
         global_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
+        global_return_types: Optional[Dict[str, str]] = None,
     ):
         self.var_versions: Dict[str, int] = {}
         self._block_counter: int = 0
@@ -354,6 +355,7 @@ class AstToSsaLowering:
         self.struct_meta: Dict[str, Tuple[int, int]] = {}
         self._var_struct_types: Dict[str, str] = {}
         self.global_luts: Dict[str, Tuple[str, Tuple[Any, ...]]] = dict(global_luts or {})
+        self.global_return_types: Dict[str, str] = dict(global_return_types or {})
 
     _CABI_SIZE_ALIGN: Dict[str, Tuple[int, int]] = {
         "i8": (1, 1), "u8": (1, 1),
@@ -1878,7 +1880,8 @@ class AstToSsaLowering:
                     return res
                 else:
                     arg_vars = [self._lower_expr(a) for a in node.args]
-                    res = self._next_var("call")
+                    ret_ty = self.global_return_types.get(fname, "i64")
+                    res = self._next_var("call", var_type=ret_ty)
                     self._emit(res, "call", [fname] + arg_vars, line=line)
                     return res
             elif isinstance(node.func, ast.Attribute):
@@ -2192,9 +2195,14 @@ def lower_ast_to_ssa(
     optimize: bool = False,
     struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None,
     global_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
+    global_return_types: Optional[Dict[str, str]] = None,
 ) -> SSAFunction:
     """Lowers an AST FunctionDef, Module (first FunctionDef), or expression into Omni-SSA."""
-    lowering = AstToSsaLowering(struct_layouts=struct_layouts, global_luts=global_luts)
+    lowering = AstToSsaLowering(
+        struct_layouts=struct_layouts,
+        global_luts=global_luts,
+        global_return_types=global_return_types,
+    )
     if isinstance(node, ast.Module):
         lowering.register_structs_from_statements(node.body)
         lowering.register_luts_from_statements(node.body)

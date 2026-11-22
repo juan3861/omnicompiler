@@ -27,7 +27,7 @@ from compiler.binary_emitter import StandaloneBinaryEmitter
 from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator
 from compiler.ssa_ir import lower_ast_to_ssa
 from compiler.native_codegen import NativeCodeGenerator, CompiledFunctionArtifact
-from compiler.debug_info_emitter import DwarfV5Emitter, emit_win64_pdata_xdata
+from compiler.debug_info_emitter import DwarfV5Emitter, emit_win64_pdata_xdata, emit_win64_multi_pdata_xdata
 from evolution.mcts_hardware_optimizer import AlphaDevMCTSOptimizer
 from evolution.omni_mutator import apply_omni_mutations
 from validation.smt_refinement import SmtRefinementVerifier
@@ -631,10 +631,20 @@ class OmniRepoCompiler:
         primary_source_file = "omni_module.py"
         defined_symbols_across_mods: Set[str] = set()
 
+        global_return_types: Dict[str, str] = {}
+        for m in manifests:
+            for exp in m.exports:
+                if getattr(exp, "return_type", None) in ("float", "f64", "double"):
+                    global_return_types[exp.name] = "f64"
+        for fn_n, f_ast in all_ast_funcs.items():
+            ret_ann = getattr(f_ast, "returns", None)
+            if isinstance(ret_ann, ast.Name) and ret_ann.id in ("float", "f64", "double"):
+                global_return_types[fn_n] = "f64"
+
         # Stage 4.9: ThinLTO Whole-Program Inter-Procedural Optimization Index
         from compiler.ip_sccp_gvn import clone_ssa_function
         struct_luts_sig = hashlib.sha256(
-            repr((sorted(global_struct_layouts.items()), sorted(global_luts.items()))).encode("utf-8")
+            repr((sorted(global_struct_layouts.items()), sorted(global_luts.items()), sorted(global_return_types.items()))).encode("utf-8")
         ).hexdigest()
         fn_ast_digests: Dict[str, str] = {
             fname: hashlib.sha256(ast.dump(fdef).encode("utf-8")).hexdigest()
@@ -658,6 +668,7 @@ class OmniRepoCompiler:
                                 optimize=True,
                                 struct_layouts=global_struct_layouts,
                                 global_luts=global_luts,
+                                global_return_types=global_return_types,
                             )
                             summary = thin_lto_opt.build_function_summary(f_name, r_name, f_ast, s_fn)
                             self._salsa_summary_cache[sum_key] = (s_fn, summary)
@@ -743,6 +754,7 @@ class OmniRepoCompiler:
                         optimize=True,
                         struct_layouts=global_struct_layouts,
                         global_luts=global_luts,
+                        global_return_types=global_return_types,
                     )
                     ssa_fn.source_file = src_file
 
@@ -1512,6 +1524,30 @@ class OmniRepoCompiler:
                 "function_emitters": homeostasis_function_emitters,
                 "hybrid_emitters_used": hybrid_emitters_used,
                 "heterogeneous_link": heterogeneous_link,
+                "cross_emitter_summaries": {
+                    fn_n: {
+                        "emitter": homeostasis_function_emitters.get(fn_n, "native"),
+                        "return_type": getattr(s_fn, "return_type", "i64"),
+                        "is_pure": not any(
+                            inst.opcode in ("store", "store_off", "call")
+                            for blk in s_fn.blocks for inst in blk.instructions
+                        ),
+                        "reads_memory": any(
+                            inst.opcode in ("load", "load_off", "lut_load")
+                            for blk in s_fn.blocks for inst in blk.instructions
+                        ),
+                        "writes_memory": any(
+                            inst.opcode in ("store", "store_off")
+                            for blk in s_fn.blocks for inst in blk.instructions
+                        ),
+                        "callees": sorted({
+                            str(inst.operands[0])
+                            for blk in s_fn.blocks for inst in blk.instructions
+                            if inst.opcode == "call" and inst.operands
+                        }),
+                    }
+                    for fn_n, s_fn in sorted(ssa_program.items())
+                },
                 "llvm_target_triple": (target_llvm.target_triple if target_llvm is not None else self.llvm.target_triple),
                 "binary_emitter_engine": homeostasis_emitter_used,
             }
@@ -1701,21 +1737,51 @@ class OmniRepoCompiler:
                 code_size=max(1, len(combined_code)),
                 base_address=0x1000,
             )
+            subprogram_dies: List[Dict[str, Any]] = []
+            for sym_name, g_off in sorted(global_syms.items()):
+                if sym_name.startswith("__"):
+                    continue
+                if sym_name in compiled_artifacts:
+                    sz = max(1, len(compiled_artifacts[sym_name].code_bytes))
+                    ln = compiled_artifacts[sym_name].line_table[0][1] if compiled_artifacts[sym_name].line_table else 1
+                else:
+                    ast_f = all_ast_funcs.get(sym_name) or all_ast_funcs.get(sym_name.split("__spec_", 1)[0])
+                    ln = max(1, int(getattr(ast_f, "lineno", 1) or 1)) if ast_f is not None else 1
+                    sz = 16
+                subprogram_dies.append({
+                    "name": sym_name,
+                    "low_pc": 0x1000 + g_off,
+                    "high_pc": 0x1000 + g_off + sz,
+                    "line": ln,
+                })
+            dwarf_info_bytes, dwarf_abbrev_bytes = self.dwarf_emitter.emit_debug_info_with_subprograms(
+                unit_name=primary_source_file,
+                low_pc=0x1000,
+                high_pc=0x1000 + max(1, len(combined_code)),
+                subprograms=subprogram_dies,
+            )
             results["stages"]["debug_info"] = {
                 "dwarf_version": 5,
                 "debug_line_bytes": len(dwarf_line_bytes),
+                "debug_info_bytes": len(dwarf_info_bytes),
+                "debug_abbrev_bytes": len(dwarf_abbrev_bytes),
+                "subprograms_count": len(subprogram_dies),
                 "line_mappings_count": len(all_line_entries),
             }
-            if effective_os == "windows" and effective_arch == "x86_64" and entry_export in compiled_artifacts:
-                ent_art = compiled_artifacts[entry_export]
-                if not ent_art.leaf_register_mode:
-                    pdata_xdata_pair = emit_win64_pdata_xdata(
-                        func_rva=0x1000 + entry_off,
-                        code_size=len(ent_art.code_bytes),
-                        prologue_size=ent_art.prologue_size,
-                        stack_frame_size=ent_art.stack_frame_size,
-                        saved_regs=ent_art.saved_nonvolatile_regs,
-                    )
+            if effective_os == "windows" and effective_arch == "x86_64":
+                pdata_entries: List[Dict[str, Any]] = []
+                for sym_name, ent_art in compiled_artifacts.items():
+                    if not ent_art.leaf_register_mode and sym_name in global_syms:
+                        pdata_entries.append({
+                            "func_rva": 0x1000 + global_syms[sym_name],
+                            "code_size": len(ent_art.code_bytes),
+                            "prologue_size": ent_art.prologue_size,
+                            "stack_frame_size": ent_art.stack_frame_size,
+                            "saved_regs": ent_art.saved_nonvolatile_regs,
+                        })
+                if pdata_entries:
+                    pdata_xdata_pair = emit_win64_multi_pdata_xdata(pdata_entries)
+                    results["stages"]["debug_info"]["win64_pdata_entries"] = len(pdata_entries)
 
         # Stage 7: Multi-Symbol Binary Emission
         _timings_ms["stage6_link_unicorn_debug"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)

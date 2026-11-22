@@ -459,14 +459,16 @@ class StandaloneBinaryEmitter:
             # Re-point RUNTIME_FUNCTION.UnwindInfoAddress to rva_pdata + aligned(len(pdata_raw))
             xdata_off_in_sec = self._align_up(len(pdata_raw), 8)
             patched_pdata = bytearray(pdata_raw)
+            fn_rva_shift = base_fn_rva - 0x1000
             for p_off in range(0, len(patched_pdata), 12):
                 if p_off + 12 <= len(patched_pdata):
-                    b_rva, e_rva, _ = struct.unpack_from("<III", patched_pdata, p_off)
-                    # Shift function RVAs by +0x10 (DllMain stub offset) if relative to 0x1000
-                    if b_rva == 0x1000:
-                        b_rva = base_fn_rva
-                        e_rva = base_fn_rva + (e_rva - 0x1000)
-                    struct.pack_into("<III", patched_pdata, p_off, b_rva, e_rva, rva_pdata + xdata_off_in_sec)
+                    b_rva, e_rva, u_off = struct.unpack_from("<III", patched_pdata, p_off)
+                    # Shift function RVAs by +0x10 (DllMain stub offset) when emitted relative to 0x1000
+                    if b_rva >= 0x1000:
+                        b_rva += fn_rva_shift
+                        e_rva += fn_rva_shift
+                    rel_xdata_off = u_off if u_off < len(xdata_raw) else 0
+                    struct.pack_into("<III", patched_pdata, p_off, b_rva, e_rva, rva_pdata + xdata_off_in_sec + rel_xdata_off)
             combined_unwind = bytes(patched_pdata).ljust(xdata_off_in_sec, b"\x00") + xdata_raw
             raw_pdata_len = len(combined_unwind)
             raw_pdata = combined_unwind.ljust(self._align_up(max(1, raw_pdata_len), file_align), b"\x00")

@@ -354,6 +354,57 @@ class DwarfV5Emitter:
         debug_info = struct.pack("<I", len(cu_body)) + cu_body
         return debug_info, abbrev
 
+    def emit_debug_info_with_subprograms(
+        self,
+        unit_name: str,
+        producer: str = "OmniCompiler 1.0",
+        low_pc: int = 0x1000,
+        high_pc: int = 0x1100,
+        subprograms: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[bytes, bytes]:
+        """
+        Emits DWARF v5 `.debug_info` + `.debug_abbrev` containing a `DW_TAG_compile_unit`
+        and child `DW_TAG_subprogram` (`0x2E`) DIEs for every compiled function.
+        """
+        subs = subprograms or []
+        if not subs:
+            return self.emit_debug_info_cu(unit_name, producer=producer, low_pc=low_pc, high_pc=high_pc)
+
+        # abbrev 1: DW_TAG_compile_unit (0x11), DW_CHILDREN_yes (1)
+        # abbrev 2: DW_TAG_subprogram (0x2E), DW_CHILDREN_no (0):
+        #   DW_AT_name (0x03, string=0x08), DW_AT_low_pc (0x11, addr=0x01),
+        #   DW_AT_high_pc (0x12, addr=0x01), DW_AT_decl_line (0x3B, data4=0x06)
+        abbrev = bytes([
+            0x01, 0x11, 0x01,
+            0x25, 0x08,
+            0x03, 0x08,
+            0x11, 0x01,
+            0x12, 0x01,
+            0x00, 0x00,
+            0x02, 0x2E, 0x00,
+            0x03, 0x08,
+            0x11, 0x01,
+            0x12, 0x01,
+            0x3B, 0x06,
+            0x00, 0x00,
+            0x00,
+        ])
+
+        die = bytearray()
+        die.append(0x01)
+        die.extend(producer.encode("utf-8") + b"\x00")
+        die.extend(unit_name.encode("utf-8") + b"\x00")
+        die.extend(struct.pack("<QQ", low_pc, high_pc))
+        for sp in subs:
+            die.append(0x02)
+            die.extend(str(sp["name"]).encode("utf-8") + b"\x00")
+            die.extend(struct.pack("<QQI", int(sp["low_pc"]), int(sp["high_pc"]), max(1, int(sp.get("line", 1)))))
+        die.append(0x00)  # end of CU children
+
+        cu_body = struct.pack("<HBBI", 5, 0x01, 8, 0) + bytes(die)
+        debug_info = struct.pack("<I", len(cu_body)) + cu_body
+        return debug_info, abbrev
+
 
 # ==============================================================================
 # Windows x64 `.pdata` & `.xdata` Exception / Stack-Unwind Emitter
@@ -419,6 +470,33 @@ def emit_win64_pdata_xdata(
     # RUNTIME_FUNCTION: BeginAddress, EndAddress, UnwindInfoAddress
     pdata = struct.pack("<III", func_rva, func_rva + code_size, xdata_rva)
     return pdata, bytes(xdata)
+
+
+def emit_win64_multi_pdata_xdata(entries: List[Dict[str, Any]]) -> Tuple[bytes, bytes]:
+    """
+    Synthesizes sorted multi-function Win64 `.pdata` (`RUNTIME_FUNCTION[]`) and packed
+    4-byte-aligned `.xdata` (`UNWIND_INFO` v1) blobs across all functions in a linked binary.
+    `UnwindInfoAddress` in `.pdata` stores the relative offset inside `.xdata`.
+    """
+    sorted_entries = sorted(entries, key=lambda e: int(e["func_rva"]))
+    pdata_all = bytearray()
+    xdata_all = bytearray()
+    for ent in sorted_entries:
+        xdata_rel_off = len(xdata_all)
+        p_one, x_one = emit_win64_pdata_xdata(
+            func_rva=int(ent["func_rva"]),
+            code_size=max(1, int(ent["code_size"])),
+            prologue_size=int(ent.get("prologue_size", 4)),
+            stack_frame_size=int(ent.get("stack_frame_size", 0)),
+            saved_regs=ent.get("saved_regs") or [],
+            xdata_rva=xdata_rel_off,
+        )
+        pdata_all.extend(p_one)
+        xdata_all.extend(x_one)
+        rem4 = (-len(xdata_all)) & 3
+        if rem4:
+            xdata_all.extend(b"\x00" * rem4)
+    return bytes(pdata_all), bytes(xdata_all)
 
 
 def decode_win64_pdata(pdata: bytes, xdata: bytes) -> List[Dict[str, Any]]:
