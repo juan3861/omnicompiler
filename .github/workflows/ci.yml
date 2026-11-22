@@ -94,9 +94,11 @@ jobs:
 
     - name: Run ARM64 Mach-O, Linker & Hardware Atomic Tests on Apple Silicon
       run: |
-        python run_c69_tests.py
-        python run_c70_tests.py
-        python run_c75_tests.py
-        python -c "import subprocess, tempfile, os; from compiler.binary_emitter import StandaloneBinaryEmitter; td = tempfile.mkdtemp(); p = StandaloneBinaryEmitter().emit_standalone_binary(os.path.join(td, 'omni_arm64_real'), target_format='arm64_macho', exit_code=42); rc = subprocess.run([p]).returncode; print('Apple Silicon ARM64 Mach-O exit:', rc); assert rc == 42"
+        python -m unittest -v \
+          tests.test_alpha_c69_arm64_rodata_macho_exec_and_transitive_ipsccp.TestAlphaC69Arm64RodataMachoExecAndTransitiveIpSccp.test_01_arm64_page21_lo12_rodata_relocations_across_elf_coff_and_macho \
+          tests.test_alpha_c69_arm64_rodata_macho_exec_and_transitive_ipsccp.TestAlphaC69Arm64RodataMachoExecAndTransitiveIpSccp.test_02_dynamic_macho_executable_and_arm64_entry_offset_audit \
+          tests.test_alpha_c70_macho_dyld_bind_and_f64_ipsccp.TestAlphaC70MachoDyldBindAndF64IpSccp.test_01_macho64_x86_64_and_arm64_dyld_bind_opcodes_and_got_patching \
+          tests.test_alpha_c75_atomics_multithread_and_arm64_ci.TestAlphaC75AtomicsMultithreadAndArm64Ci.test_02_arm64_llsc_atomic_kernels_unicorn_execution
+        python -c "import subprocess, tempfile, os; from compiler.binary_emitter import StandaloneBinaryEmitter; td = tempfile.mkdtemp(); p = StandaloneBinaryEmitter().emit_standalone_binary(os.path.join(td, 'omni_arm64_real'), target_format='arm64_macho', exit_code=42); os.chmod(p, 0o755); rc = subprocess.run([p]).returncode; print('Apple Silicon ARM64 Mach-O exit:', rc); assert rc == 42"
 
 
