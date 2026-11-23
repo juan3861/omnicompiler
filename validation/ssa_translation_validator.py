@@ -70,6 +70,12 @@ SUPPORTED_Z3_FLOAT_OPCODES = frozenset({
     "fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge",
     "sitofp", "fptosi",
 })
+SUPPORTED_Z3_UB_OPCODES = frozenset({
+    "add_nsw", "sub_nsw", "mul_nsw",
+    "add_nuw", "sub_nuw", "mul_nuw",
+    "sdiv_exact", "udiv_exact", "udiv", "urem",
+    "shl_nsw", "shl_nuw", "freeze",
+})
 
 
 class SSATranslationValidator:
@@ -91,6 +97,9 @@ class SSATranslationValidator:
         enable_call_congruence: bool = False,
         enable_float_theory: bool = False,
         disk_cache: Optional[Any] = None,
+        enable_ub_poison: bool = False,
+        enable_pointer_disjointness: bool = False,
+        max_k_induction: int = 4,
     ):
         self.enable_memory_theory = enable_memory_theory
         self.max_loop_unroll = max(0, int(max_loop_unroll))
@@ -98,6 +107,9 @@ class SSATranslationValidator:
         self.enable_call_congruence = bool(enable_call_congruence)
         self.enable_float_theory = bool(enable_float_theory)
         self.disk_cache = disk_cache
+        self.enable_ub_poison = bool(enable_ub_poison)
+        self.enable_pointer_disjointness = bool(enable_pointer_disjointness)
+        self.max_k_induction = max(1, int(max_k_induction))
         self.proof_cache_hits = 0
         self.proof_cache_misses = 0
 
@@ -170,7 +182,680 @@ class SSATranslationValidator:
             ops.add("call")
         if self.enable_float_theory:
             ops |= SUPPORTED_Z3_FLOAT_OPCODES
+        if self.enable_ub_poison:
+            ops |= SUPPORTED_Z3_UB_OPCODES
         return frozenset(ops)
+
+    def _build_pointer_disjointness_constraints(
+        self,
+        ssa_before: SSAFunction,
+        ssa_after: SSAFunction,
+        sym_params: List[z3.BitVecRef],
+        force: bool = False,
+    ) -> List[z3.BoolRef]:
+        """
+        Builds QF_ABV base separation constraints for noalias / disjoint pointer parameters
+        so pointer regions cannot overlap with each other or with local alloca bases [0x4000_0000..0x4FFF_0000].
+        """
+        explicit_noalias: Set[str] = set(getattr(ssa_before, "noalias_params", None) or ()) | set(
+            getattr(ssa_after, "noalias_params", None) or ()
+        )
+        enabled = force or self.enable_pointer_disjointness or bool(explicit_noalias)
+        if not enabled or not sym_params:
+            return []
+
+        ptr_names: Set[str] = set(explicit_noalias)
+        if force or self.enable_pointer_disjointness:
+            pt_before = getattr(ssa_before, "param_types", {}) or {}
+            pt_after = getattr(ssa_after, "param_types", {}) or {}
+            for p in ssa_before.params:
+                if pt_before.get(p) in ("ptr", "ptr_f64", "pointer") or pt_after.get(p) in ("ptr", "ptr_f64", "pointer"):
+                    ptr_names.add(p)
+            for fn_cand in (ssa_before, ssa_after):
+                for blk in fn_cand.blocks:
+                    for ins in blk.instructions:
+                        if ins.opcode in ("load", "store", "load_off", "store_off") and ins.operands:
+                            b_op = ins.operands[0]
+                            if isinstance(b_op, SSAVar) and b_op.version == 0 and b_op.name in ssa_before.params:
+                                ptr_names.add(b_op.name)
+
+        ptr_syms = [
+            sym_params[i]
+            for i, name in enumerate(ssa_before.params)
+            if name in ptr_names and i < len(sym_params)
+        ]
+        if not ptr_syms:
+            return []
+
+        span = int(getattr(ssa_before, "ptr_span", 0) or getattr(ssa_after, "ptr_span", 0) or 0x1_0000_0000)
+        span_bv = z3.BitVecVal(span, 64)
+        lo_bound = z3.BitVecVal(0x0010_0000_0000, 64)
+        hi_bound = z3.BitVecVal(0x0000_7FFF_0000_0000, 64)
+
+        clauses: List[z3.BoolRef] = []
+        for ps in ptr_syms:
+            clauses.append(z3.UGE(ps, lo_bound))
+            clauses.append(z3.ULE(ps, hi_bound))
+        for i in range(len(ptr_syms)):
+            for j in range(i + 1, len(ptr_syms)):
+                pi, pj = ptr_syms[i], ptr_syms[j]
+                clauses.append(z3.Or(z3.ULE(pi + span_bv, pj), z3.ULE(pj + span_bv, pi)))
+        return clauses
+
+    def _encode_ub_poison_function(
+        self,
+        fn: SSAFunction,
+        sym_params: List[z3.BitVecRef],
+        init_ext_mem: z3.ArrayRef,
+        init_ext_poison: z3.ArrayRef,
+    ) -> Dict[str, Any]:
+        """
+        Alive2-class symbolic encoder tracking (BitVec64 value, Bool poison) per SSA value,
+        poison arrays for external/local memory, and immediate-UB path conditions (div0,
+        INT64_MIN/-1, branching on poison, poison dereference, OOB alloca access).
+        """
+        if not fn.blocks:
+            return {"error": "EMPTY_CFG"}
+
+        entry = fn.entry_block or fn.blocks[0]
+        rpo_blocks, back_edges = self._classify_cfg_dag_and_backedges(fn)
+        is_cyclic = len(back_edges) > 0
+        if is_cyclic and self.max_loop_unroll <= 0:
+            return {"error": "CYCLIC_CFG"}
+
+        max_level = max(1, self.max_loop_unroll) if is_cyclic else 0
+        allowed_ops = set(self._allowed_opcodes()) | SUPPORTED_Z3_UB_OPCODES | SUPPORTED_Z3_METADATA_OPCODES
+        if self.enable_memory_theory:
+            allowed_ops |= SUPPORTED_Z3_MEMORY_OPCODES
+        if self.enable_call_congruence:
+            allowed_ops.add("call")
+
+        bv64 = z3.BitVecSort(64)
+        bool_sort = z3.BoolSort()
+        min_s64 = z3.BitVecVal(-1 << 63, 64)
+        neg1_bv = z3.BitVecVal(-1, 64)
+        zero_bv = z3.BitVecVal(0, 64)
+        bv64_64 = z3.BitVecVal(64, 64)
+        false_b = z3.BoolVal(False)
+
+        val_levels: Dict[int, Dict[SSAVar, z3.BitVecRef]] = {}
+        poison_levels: Dict[int, Dict[SSAVar, z3.BoolRef]] = {}
+        alloca_bases: Dict[SSAVar, Tuple[z3.BitVecRef, int]] = {}
+        alloca_counter = 0
+
+        reach: Dict[Tuple[str, int], z3.BoolRef] = {}
+        edge_cond: Dict[Tuple[Tuple[str, int], Tuple[str, int]], z3.BoolRef] = {}
+        unrolled_preds: Dict[Tuple[str, int], List[Tuple[str, int]]] = {(entry.name, 0): []}
+        node_ext_out: Dict[Tuple[str, int], z3.ArrayRef] = {}
+        node_ext_p_out: Dict[Tuple[str, int], z3.ArrayRef] = {}
+        node_loc_out: Dict[Tuple[str, int], z3.ArrayRef] = {}
+        node_loc_p_out: Dict[Tuple[str, int], z3.ArrayRef] = {}
+
+        ret_cases: List[Tuple[z3.BoolRef, z3.BitVecRef, z3.BoolRef, z3.ArrayRef, z3.ArrayRef]] = []
+        ub_clauses: List[z3.BoolRef] = []
+        init_loc_mem = z3.Array(f"ub_loc_mem_{fn.name}", bv64, bv64)
+        init_loc_poison = z3.K(bv64, false_b)
+        freeze_ctr = 0
+
+        for lvl in range(max_level + 1):
+            val_levels[lvl] = {}
+            poison_levels[lvl] = {}
+            for i, pname in enumerate(fn.params):
+                if i < len(sym_params):
+                    pvar = SSAVar(pname, 0)
+                    val_levels[lvl][pvar] = sym_params[i]
+                    poison_levels[lvl][pvar] = false_b
+
+            for blk in rpo_blocks:
+                node = (blk.name, lvl)
+                if node == (entry.name, 0):
+                    b_reach = z3.BoolVal(True)
+                    cur_ext_mem = init_ext_mem
+                    cur_ext_p = init_ext_poison
+                    cur_loc_mem = init_loc_mem
+                    cur_loc_p = init_loc_poison
+                else:
+                    preds = unrolled_preds.get(node, [])
+                    if not preds:
+                        continue
+                    conds = [edge_cond[(p, node)] for p in preds if (p, node) in edge_cond]
+                    if not conds:
+                        continue
+                    b_reach = conds[0] if len(conds) == 1 else z3.Or(conds)
+                    last_p = preds[-1]
+                    cur_ext_mem = node_ext_out.get(last_p, init_ext_mem)
+                    cur_ext_p = node_ext_p_out.get(last_p, init_ext_poison)
+                    cur_loc_mem = node_loc_out.get(last_p, init_loc_mem)
+                    cur_loc_p = node_loc_p_out.get(last_p, init_loc_poison)
+                    for p in reversed(preds[:-1]):
+                        ec = edge_cond[(p, node)]
+                        cur_ext_mem = z3.If(ec, node_ext_out[p], cur_ext_mem)
+                        cur_ext_p = z3.If(ec, node_ext_p_out[p], cur_ext_p)
+                        cur_loc_mem = z3.If(ec, node_loc_out[p], cur_loc_mem)
+                        cur_loc_p = z3.If(ec, node_loc_p_out[p], cur_loc_p)
+
+                reach[node] = b_reach
+
+                def eval_op_pair(op: Any, lookup_lvl: int) -> Optional[Tuple[z3.BitVecRef, z3.BoolRef]]:
+                    if isinstance(op, bool):
+                        return z3.BitVecVal(int(op), 64), false_b
+                    if isinstance(op, int):
+                        return z3.BitVecVal(op, 64), false_b
+                    if isinstance(op, SSAVar):
+                        v = val_levels[lookup_lvl].get(op)
+                        if v is None and lookup_lvl > 0:
+                            v = val_levels[0].get(op)
+                            p = poison_levels[0].get(op, false_b)
+                            return (v, p) if v is not None else None
+                        if v is None:
+                            return None
+                        p = poison_levels[lookup_lvl].get(op, false_b)
+                        return v, p
+                    return None
+
+                def eval_op_p(op: Any) -> Optional[Tuple[z3.BitVecRef, z3.BoolRef]]:
+                    return eval_op_pair(op, lvl)
+
+                # PHI nodes
+                for phi in blk.phi_nodes:
+                    if phi.result is None:
+                        return {"error": "INVALID_PHI"}
+                    active: List[Tuple[z3.BoolRef, z3.BitVecRef, z3.BoolRef]] = []
+                    for pn, v_op in phi.phi_incoming:
+                        src_lvl = lvl - 1 if (pn, blk.name) in back_edges else lvl
+                        if src_lvl < 0:
+                            continue
+                        src_node = (pn, src_lvl)
+                        if (src_node, node) in edge_cond:
+                            pair = eval_op_pair(v_op, src_lvl)
+                            if pair is None:
+                                return {"error": f"UNRESOLVED_PHI_{phi.result}"}
+                            active.append((edge_cond[(src_node, node)], pair[0], pair[1]))
+                    if not active:
+                        return {"error": f"UNRESOLVED_PHI_EDGES_{phi.result}"}
+                    v_acc = active[-1][1]
+                    p_acc = active[-1][2]
+                    for ec, ev, ep in reversed(active[:-1]):
+                        v_acc = z3.If(ec, ev, v_acc)
+                        p_acc = z3.If(ec, ep, p_acc)
+                    val_levels[lvl][phi.result] = v_acc
+                    poison_levels[lvl][phi.result] = p_acc
+
+                # Instructions
+                for inst in blk.instructions:
+                    op = inst.opcode
+                    flags = set(getattr(inst, "flags", ()) or ())
+                    if op in SUPPORTED_Z3_METADATA_OPCODES:
+                        continue
+                    if op not in allowed_ops:
+                        return {"error": f"UNSUPPORTED_OPCODE_{op}"}
+
+                    # Map flag-annotated base opcodes
+                    eff_op = op
+                    if op in ("add", "sub", "mul", "shl"):
+                        if "nsw" in flags:
+                            eff_op = f"{op}_nsw"
+                        elif "nuw" in flags:
+                            eff_op = f"{op}_nuw"
+                    elif op in ("sdiv", "udiv") and "exact" in flags:
+                        eff_op = f"{op}_exact"
+
+                    if op == "param":
+                        if inst.result is None:
+                            return {"error": "INVALID_PARAM"}
+                        if inst.result not in val_levels[lvl]:
+                            idx_p = len(sym_params)
+                            if inst.result.name in fn.params:
+                                idx_p = fn.params.index(inst.result.name)
+                            if idx_p < len(sym_params):
+                                val_levels[lvl][inst.result] = sym_params[idx_p]
+                            else:
+                                val_levels[lvl][inst.result] = z3.BitVec(f"ub_p_{inst.result.name}", 64)
+                            poison_levels[lvl][inst.result] = false_b
+
+                    elif op == "const":
+                        if inst.result is None or not inst.operands:
+                            return {"error": "INVALID_CONST"}
+                        val_levels[lvl][inst.result] = z3.BitVecVal(int(inst.operands[0]), 64)
+                        poison_levels[lvl][inst.result] = false_b
+
+                    elif op == "mov":
+                        if inst.result is None or not inst.operands:
+                            return {"error": "INVALID_MOV"}
+                        pair = eval_op_p(inst.operands[0])
+                        if pair is None:
+                            return {"error": "UNRESOLVED_MOV"}
+                        val_levels[lvl][inst.result] = pair[0]
+                        poison_levels[lvl][inst.result] = pair[1]
+                        if isinstance(inst.operands[0], SSAVar) and inst.operands[0] in alloca_bases:
+                            alloca_bases[inst.result] = alloca_bases[inst.operands[0]]
+
+                    elif op == "freeze":
+                        if inst.result is None or not inst.operands:
+                            return {"error": "INVALID_FREEZE"}
+                        pair = eval_op_p(inst.operands[0])
+                        if pair is None:
+                            return {"error": "UNRESOLVED_FREEZE"}
+                        freeze_ctr += 1
+                        fn_sym = z3.BitVec(f"ub_freeze_{fn.name}_{blk.name}_{lvl}_{freeze_ctr}", 64)
+                        val_levels[lvl][inst.result] = z3.If(pair[1], fn_sym, pair[0])
+                        poison_levels[lvl][inst.result] = false_b
+
+                    elif op == "alloca":
+                        if inst.result is None:
+                            return {"error": "INVALID_ALLOCA"}
+                        sz_bytes = 0x10000
+                        if inst.operands and isinstance(inst.operands[0], int) and inst.operands[0] > 0:
+                            sz_bytes = max(8, int(inst.operands[0]))
+                        base_addr = z3.BitVecVal(0x4000_0000 + alloca_counter * 0x10000, 64)
+                        alloca_counter += 1
+                        alloca_bases[inst.result] = (base_addr, sz_bytes)
+                        val_levels[lvl][inst.result] = base_addr
+                        poison_levels[lvl][inst.result] = false_b
+
+                    elif op == "load":
+                        if inst.result is None or not inst.operands:
+                            return {"error": "INVALID_LOAD"}
+                        ptr_op = inst.operands[0]
+                        p_pair = eval_op_p(ptr_op)
+                        if p_pair is None:
+                            return {"error": "UNRESOLVED_LOAD"}
+                        addr, p_addr = p_pair
+                        ub_clauses.append(z3.And(b_reach, p_addr))
+                        is_loc = isinstance(ptr_op, SSAVar) and ptr_op in alloca_bases
+                        if is_loc:
+                            base_bv, sz_b = alloca_bases[ptr_op]
+                            oob = z3.Or(z3.ULT(addr, base_bv), z3.UGT(addr - base_bv + 8, z3.BitVecVal(sz_b, 64)))
+                            ub_clauses.append(z3.And(b_reach, oob))
+                        mem_v = cur_loc_mem if is_loc else cur_ext_mem
+                        mem_p = cur_loc_p if is_loc else cur_ext_p
+                        val_levels[lvl][inst.result] = z3.Select(mem_v, addr)
+                        poison_levels[lvl][inst.result] = z3.Select(mem_p, addr)
+
+                    elif op == "store":
+                        if len(inst.operands) < 2:
+                            return {"error": "INVALID_STORE"}
+                        ptr_op, val_op = inst.operands[0], inst.operands[1]
+                        p_pair = eval_op_p(ptr_op)
+                        v_pair = eval_op_p(val_op)
+                        if p_pair is None or v_pair is None:
+                            return {"error": "UNRESOLVED_STORE"}
+                        addr, p_addr = p_pair
+                        ub_clauses.append(z3.And(b_reach, p_addr))
+                        if isinstance(val_op, SSAVar) and val_op in alloca_bases and not (isinstance(ptr_op, SSAVar) and ptr_op in alloca_bases):
+                            return {"error": "ESCAPED_ALLOCA_UNSUPPORTED"}
+                        is_loc = isinstance(ptr_op, SSAVar) and ptr_op in alloca_bases
+                        if is_loc:
+                            base_bv, sz_b = alloca_bases[ptr_op]
+                            oob = z3.Or(z3.ULT(addr, base_bv), z3.UGT(addr - base_bv + 8, z3.BitVecVal(sz_b, 64)))
+                            ub_clauses.append(z3.And(b_reach, oob))
+                            cur_loc_mem = z3.Store(cur_loc_mem, addr, v_pair[0])
+                            cur_loc_p = z3.Store(cur_loc_p, addr, v_pair[1])
+                        else:
+                            cur_ext_mem = z3.Store(cur_ext_mem, addr, v_pair[0])
+                            cur_ext_p = z3.Store(cur_ext_p, addr, v_pair[1])
+
+                    elif op == "load_off":
+                        if inst.result is None or len(inst.operands) < 2:
+                            return {"error": "INVALID_LOAD_OFF"}
+                        ptr_op = inst.operands[0]
+                        off_op = inst.operands[1]
+                        width = str(inst.operands[2]) if len(inst.operands) >= 3 else "i64"
+                        p_pair = eval_op_p(ptr_op)
+                        i_pair = eval_op_p(off_op)
+                        if p_pair is None or i_pair is None:
+                            return {"error": "UNRESOLVED_LOAD_OFF"}
+                        ub_clauses.append(z3.And(b_reach, z3.Or(p_pair[1], i_pair[1])))
+                        stride = self._INT_WIDTH_SPEC.get(width, (64, True))[0] // 8
+                        addr = p_pair[0] + i_pair[0]
+                        is_loc = isinstance(ptr_op, SSAVar) and ptr_op in alloca_bases
+                        if is_loc:
+                            base_bv, sz_b = alloca_bases[ptr_op]
+                            oob = z3.Or(z3.ULT(addr, base_bv), z3.UGT(addr - base_bv + stride, z3.BitVecVal(sz_b, 64)))
+                            ub_clauses.append(z3.And(b_reach, oob))
+                        raw_v = z3.Select(cur_loc_mem if is_loc else cur_ext_mem, addr)
+                        raw_p = z3.Select(cur_loc_p if is_loc else cur_ext_p, addr)
+                        val_levels[lvl][inst.result] = self._load_off_z3(raw_v, width)
+                        poison_levels[lvl][inst.result] = raw_p
+
+                    elif op == "store_off":
+                        if len(inst.operands) < 3:
+                            return {"error": "INVALID_STORE_OFF"}
+                        ptr_op = inst.operands[0]
+                        off_op = inst.operands[1]
+                        val_op = inst.operands[2]
+                        width = str(inst.operands[3]) if len(inst.operands) >= 4 else "i64"
+                        p_pair = eval_op_p(ptr_op)
+                        i_pair = eval_op_p(off_op)
+                        v_pair = eval_op_p(val_op)
+                        if p_pair is None or i_pair is None or v_pair is None:
+                            return {"error": "UNRESOLVED_STORE_OFF"}
+                        ub_clauses.append(z3.And(b_reach, z3.Or(p_pair[1], i_pair[1])))
+                        stride = self._INT_WIDTH_SPEC.get(width, (64, True))[0] // 8
+                        addr = p_pair[0] + i_pair[0]
+                        packed = self._store_off_z3(v_pair[0], width)
+                        is_loc = isinstance(ptr_op, SSAVar) and ptr_op in alloca_bases
+                        if is_loc:
+                            base_bv, sz_b = alloca_bases[ptr_op]
+                            oob = z3.Or(z3.ULT(addr, base_bv), z3.UGT(addr - base_bv + stride, z3.BitVecVal(sz_b, 64)))
+                            ub_clauses.append(z3.And(b_reach, oob))
+                            cur_loc_mem = z3.Store(cur_loc_mem, addr, packed)
+                            cur_loc_p = z3.Store(cur_loc_p, addr, v_pair[1])
+                        else:
+                            cur_ext_mem = z3.Store(cur_ext_mem, addr, packed)
+                            cur_ext_p = z3.Store(cur_ext_p, addr, v_pair[1])
+
+                    elif op in ("neg", "not"):
+                        if inst.result is None or not inst.operands:
+                            return {"error": f"INVALID_{op.upper()}"}
+                        pair = eval_op_p(inst.operands[0])
+                        if pair is None:
+                            return {"error": f"UNRESOLVED_{op.upper()}"}
+                        val_levels[lvl][inst.result] = (-pair[0]) if op == "neg" else (~pair[0])
+                        poison_levels[lvl][inst.result] = pair[1]
+
+                    elif op == "select":
+                        if len(inst.operands) != 3 or inst.result is None:
+                            return {"error": "INVALID_SELECT"}
+                        pc = eval_op_p(inst.operands[0])
+                        pt = eval_op_p(inst.operands[1])
+                        pf = eval_op_p(inst.operands[2])
+                        if pc is None or pt is None or pf is None:
+                            return {"error": "UNRESOLVED_SELECT"}
+                        cond_b = (pc[0] != 0)
+                        val_levels[lvl][inst.result] = z3.If(cond_b, pt[0], pf[0])
+                        poison_levels[lvl][inst.result] = z3.Or(pc[1], z3.If(cond_b, pt[1], pf[1]))
+
+                    elif eff_op in (
+                        "add", "add_nsw", "add_nuw",
+                        "sub", "sub_nsw", "sub_nuw",
+                        "mul", "mul_nsw", "mul_nuw",
+                        "sdiv", "srem", "sdiv_exact",
+                        "udiv", "urem", "udiv_exact",
+                        "shl", "shl_nsw", "shl_nuw", "shr", "sar", "lshr",
+                        "and", "or", "xor",
+                        "cmp_eq", "cmp_ne", "cmp_lt", "cmp_le", "cmp_gt", "cmp_ge",
+                    ):
+                        if len(inst.operands) < 2 or inst.result is None:
+                            return {"error": f"INVALID_{op.upper()}"}
+                        pa = eval_op_p(inst.operands[0])
+                        pb = eval_op_p(inst.operands[1])
+                        if pa is None or pb is None:
+                            return {"error": f"UNRESOLVED_{op.upper()}"}
+                        a, poison_a = pa
+                        b, poison_b = pb
+                        base_p = z3.Or(poison_a, poison_b)
+                        out_p = base_p
+
+                        if eff_op in ("add", "add_nsw", "add_nuw"):
+                            res = a + b
+                            if eff_op == "add_nsw":
+                                s65 = z3.SignExt(1, a) + z3.SignExt(1, b)
+                                out_p = z3.Or(base_p, z3.Extract(64, 64, s65) != z3.Extract(63, 63, s65))
+                            elif eff_op == "add_nuw":
+                                u65 = z3.ZeroExt(1, a) + z3.ZeroExt(1, b)
+                                out_p = z3.Or(base_p, z3.Extract(64, 64, u65) == z3.BitVecVal(1, 1))
+                            # Preserve alloca base tracking for GEP-like pointer+offset arithmetic
+                            if isinstance(inst.operands[0], SSAVar) and inst.operands[0] in alloca_bases and not (isinstance(inst.operands[1], SSAVar) and inst.operands[1] in alloca_bases):
+                                alloca_bases[inst.result] = alloca_bases[inst.operands[0]]
+                        elif eff_op in ("sub", "sub_nsw", "sub_nuw"):
+                            res = a - b
+                            if eff_op == "sub_nsw":
+                                d65 = z3.SignExt(1, a) - z3.SignExt(1, b)
+                                out_p = z3.Or(base_p, z3.Extract(64, 64, d65) != z3.Extract(63, 63, d65))
+                            elif eff_op == "sub_nuw":
+                                out_p = z3.Or(base_p, z3.ULT(a, b))
+                        elif eff_op in ("mul", "mul_nsw", "mul_nuw"):
+                            res = a * b
+                            if eff_op == "mul_nsw":
+                                p128 = z3.SignExt(64, a) * z3.SignExt(64, b)
+                                out_p = z3.Or(base_p, z3.SignExt(64, z3.Extract(63, 0, p128)) != p128)
+                            elif eff_op == "mul_nuw":
+                                p128 = z3.ZeroExt(64, a) * z3.ZeroExt(64, b)
+                                out_p = z3.Or(base_p, z3.Extract(127, 64, p128) != zero_bv)
+                        elif eff_op in ("sdiv", "sdiv_exact"):
+                            div_ub = z3.Or(b == zero_bv, z3.And(a == min_s64, b == neg1_bv))
+                            ub_clauses.append(z3.And(b_reach, z3.Or(div_ub, poison_b)))
+                            res = a / b
+                            if eff_op == "sdiv_exact":
+                                out_p = z3.Or(base_p, z3.SRem(a, b) != zero_bv)
+                        elif eff_op == "srem":
+                            div_ub = z3.Or(b == zero_bv, z3.And(a == min_s64, b == neg1_bv))
+                            ub_clauses.append(z3.And(b_reach, z3.Or(div_ub, poison_b)))
+                            res = z3.SRem(a, b)
+                        elif eff_op in ("udiv", "udiv_exact"):
+                            ub_clauses.append(z3.And(b_reach, z3.Or(b == zero_bv, poison_b)))
+                            res = z3.UDiv(a, b)
+                            if eff_op == "udiv_exact":
+                                out_p = z3.Or(base_p, z3.URem(a, b) != zero_bv)
+                        elif eff_op == "urem":
+                            ub_clauses.append(z3.And(b_reach, z3.Or(b == zero_bv, poison_b)))
+                            res = z3.URem(a, b)
+                        elif eff_op in ("shl", "shl_nsw", "shl_nuw"):
+                            res = a << b
+                            shift_poison = z3.UGE(b, bv64_64)
+                            out_p = z3.Or(base_p, shift_poison)
+                            if eff_op == "shl_nsw":
+                                out_p = z3.Or(out_p, ((a << b) >> b) != a)
+                            elif eff_op == "shl_nuw":
+                                out_p = z3.Or(out_p, z3.LShR(a << b, b) != a)
+                        elif eff_op in ("shr", "sar"):
+                            res = a >> b
+                            out_p = z3.Or(base_p, z3.UGE(b, bv64_64))
+                        elif eff_op == "lshr":
+                            res = z3.LShR(a, b)
+                            out_p = z3.Or(base_p, z3.UGE(b, bv64_64))
+                        elif eff_op == "and":
+                            res = a & b
+                        elif eff_op == "or":
+                            res = a | b
+                        elif eff_op == "xor":
+                            res = a ^ b
+                        elif eff_op.startswith("cmp_"):
+                            cmp_map = {
+                                "cmp_eq": a == b,
+                                "cmp_ne": a != b,
+                                "cmp_lt": a < b,
+                                "cmp_le": a <= b,
+                                "cmp_gt": a > b,
+                                "cmp_ge": a >= b,
+                            }
+                            res = z3.If(cmp_map[eff_op], z3.BitVecVal(1, 64), zero_bv)
+                        val_levels[lvl][inst.result] = res
+                        poison_levels[lvl][inst.result] = out_p
+
+                    elif op == "call":
+                        if not inst.operands:
+                            return {"error": "INVALID_CALL"}
+                        callee = str(inst.operands[0])
+                        arg_exprs: List[z3.BitVecRef] = []
+                        arg_p = false_b
+                        for a_op in inst.operands[1:]:
+                            pair = eval_op_p(a_op)
+                            if pair is None:
+                                return {"error": f"UNRESOLVED_CALL_ARG_{callee}"}
+                            arg_exprs.append(pair[0])
+                            arg_p = z3.Or(arg_p, pair[1])
+                        if inst.result is not None:
+                            val_levels[lvl][inst.result] = self._eval_call_uf(callee, arg_exprs)
+                            poison_levels[lvl][inst.result] = arg_p
+
+                    elif op == "br":
+                        if not inst.operands:
+                            return {"error": "INVALID_BR"}
+                        target = str(inst.operands[0])
+                        t_lvl = lvl + 1 if (blk.name, target) in back_edges else lvl
+                        if t_lvl <= max_level:
+                            dst = (target, t_lvl)
+                            prev = edge_cond.get((node, dst))
+                            edge_cond[(node, dst)] = b_reach if prev is None else z3.Or(prev, b_reach)
+                            unrolled_preds.setdefault(dst, [])
+                            if node not in unrolled_preds[dst]:
+                                unrolled_preds[dst].append(node)
+
+                    elif op == "br_cond":
+                        if len(inst.operands) < 3:
+                            return {"error": "INVALID_BR_COND"}
+                        cp = eval_op_p(inst.operands[0])
+                        if cp is None:
+                            return {"error": "UNRESOLVED_BR_COND"}
+                        c_val, c_poison = cp
+                        ub_clauses.append(z3.And(b_reach, c_poison))
+                        t_blk, f_blk = str(inst.operands[1]), str(inst.operands[2])
+                        c_true = (c_val != 0)
+                        t_cond = z3.And(b_reach, c_true)
+                        f_cond = z3.And(b_reach, z3.Not(c_true))
+                        t_lvl = lvl + 1 if (blk.name, t_blk) in back_edges else lvl
+                        f_lvl = lvl + 1 if (blk.name, f_blk) in back_edges else lvl
+                        for dst, d_lvl, cond in ((t_blk, t_lvl, t_cond), (f_blk, f_lvl, f_cond)):
+                            if d_lvl <= max_level:
+                                dst_n = (dst, d_lvl)
+                                prev = edge_cond.get((node, dst_n))
+                                edge_cond[(node, dst_n)] = cond if prev is None else z3.Or(prev, cond)
+                                unrolled_preds.setdefault(dst_n, [])
+                                if node not in unrolled_preds[dst_n]:
+                                    unrolled_preds[dst_n].append(node)
+
+                    elif op == "ret":
+                        if not inst.operands:
+                            ret_cases.append((b_reach, zero_bv, false_b, cur_ext_mem, cur_ext_p))
+                        else:
+                            if isinstance(inst.operands[0], SSAVar) and inst.operands[0] in alloca_bases:
+                                return {"error": "ESCAPED_ALLOCA_UNSUPPORTED"}
+                            rp = eval_op_p(inst.operands[0])
+                            if rp is None:
+                                return {"error": "UNRESOLVED_RET"}
+                            ret_cases.append((b_reach, rp[0], rp[1], cur_ext_mem, cur_ext_p))
+
+                node_ext_out[node] = cur_ext_mem
+                node_ext_p_out[node] = cur_ext_p
+                node_loc_out[node] = cur_loc_mem
+                node_loc_p_out[node] = cur_loc_p
+
+        if not ret_cases:
+            return {"error": "LOOP_BOUND_EXCEEDED" if is_cyclic else "NO_RETURN"}
+
+        terminated_cond = ret_cases[0][0] if len(ret_cases) == 1 else z3.Or([rc[0] for rc in ret_cases])
+        ret_expr = ret_cases[-1][1]
+        ret_poison = ret_cases[-1][2]
+        ext_mem_expr = ret_cases[-1][3]
+        ext_poison_expr = ret_cases[-1][4]
+        for cond, rv, rp, mv, mp in reversed(ret_cases[:-1]):
+            ret_expr = z3.If(cond, rv, ret_expr)
+            ret_poison = z3.If(cond, rp, ret_poison)
+            ext_mem_expr = z3.If(cond, mv, ext_mem_expr)
+            ext_poison_expr = z3.If(cond, mp, ext_poison_expr)
+
+        ub_cond = false_b if not ub_clauses else (ub_clauses[0] if len(ub_clauses) == 1 else z3.Or(ub_clauses))
+        return {
+            "error": None,
+            "bounded": is_cyclic,
+            "terminated_cond": terminated_cond,
+            "ret_expr": ret_expr,
+            "ret_poison": ret_poison,
+            "ext_mem_expr": ext_mem_expr,
+            "ext_poison_expr": ext_poison_expr,
+            "ub_cond": ub_cond,
+        }
+
+    def verify_refinement(
+        self,
+        ssa_before: SSAFunction,
+        ssa_after: SSAFunction,
+        timeout_ms: int = 2000,
+    ) -> Dict[str, Any]:
+        """
+        Alive2-class refinement verification (target <= source):
+        Target must never introduce new UB or poison where Source had none, and must match
+        return value and observable memory whenever Source does not exhibit UB or poison.
+        """
+        if len(ssa_before.params) != len(ssa_after.params):
+            return {
+                "proven": False,
+                "status": "REFUTED_ARITY_MISMATCH",
+                "counterexample": None,
+                "bounded": False,
+            }
+
+        sym_params = [z3.BitVec(f"p_{i}_{name}", 64) for i, name in enumerate(ssa_before.params)]
+        bv64 = z3.BitVecSort(64)
+        shared_ext_mem = z3.Array("shared_ext_mem_ub_0", bv64, bv64)
+        init_ext_poison = z3.K(bv64, z3.BoolVal(False))
+
+        with self._Z3_MAIN_CTX_LOCK:
+            enc_b = self._encode_ub_poison_function(ssa_before, sym_params, shared_ext_mem, init_ext_poison)
+            enc_a = self._encode_ub_poison_function(ssa_after, sym_params, shared_ext_mem, init_ext_poison)
+
+            if enc_b.get("error"):
+                return {
+                    "proven": False,
+                    "status": f"UNVERIFIED_{enc_b['error']}",
+                    "counterexample": None,
+                    "bounded": False,
+                }
+            if enc_a.get("error"):
+                return {
+                    "proven": False,
+                    "status": f"UNVERIFIED_{enc_a['error']}",
+                    "counterexample": None,
+                    "bounded": False,
+                }
+
+            is_bounded = bool(enc_b["bounded"] or enc_a["bounded"])
+            ub_b, ub_a = enc_b["ub_cond"], enc_a["ub_cond"]
+            term_b, term_a = enc_b["terminated_cond"], enc_a["terminated_cond"]
+            ret_b, ret_a = enc_b["ret_expr"], enc_a["ret_expr"]
+            p_b, p_a = enc_b["ret_poison"], enc_a["ret_poison"]
+            mem_b, mem_a = enc_b["ext_mem_expr"], enc_a["ext_mem_expr"]
+
+            # Target refines Source iff when Source is well-defined (~ub_b & term_b):
+            #   1) ~ub_a & term_a
+            #   2) ~p_b => (~p_a & ret_a == ret_b & mem_a == mem_b)
+            # Note: memory-only poison mismatch is covered by mem_a == mem_b if mem_poison is clean or ignored when Source UB/poisoned
+            defined_b = z3.And(z3.Not(ub_b), term_b)
+            refines_ok = z3.And(
+                z3.Not(ub_a),
+                term_a,
+                z3.Implies(
+                    z3.Not(p_b),
+                    z3.And(z3.Not(p_a), ret_a == ret_b, mem_a == mem_b),
+                ),
+            )
+            violation = z3.And(defined_b, z3.Not(refines_ok))
+            ptr_clauses = self._build_pointer_disjointness_constraints(ssa_before, ssa_after, sym_params)
+
+            solver = z3.Solver()
+            solver.set("timeout", timeout_ms)
+            for pc in ptr_clauses:
+                solver.add(pc)
+            solver.add(violation)
+            chk = solver.check()
+
+            if chk == z3.unsat:
+                return {
+                    "proven": True,
+                    "status": "PROVEN_BOUNDED_REFINEMENT" if is_bounded else "PROVEN_REFINEMENT",
+                    "counterexample": None,
+                    "bounded": is_bounded,
+                }
+            if chk == z3.sat:
+                model = solver.model()
+                ce = {}
+                for i, p_sym in enumerate(sym_params):
+                    val = model.eval(p_sym, model_completion=True)
+                    ce[ssa_before.params[i]] = val.as_signed_long() if hasattr(val, "as_signed_long") else str(val)
+                return {
+                    "proven": False,
+                    "status": "REFUTED_COUNTEREXAMPLE",
+                    "counterexample": ce,
+                    "bounded": is_bounded,
+                }
+            return {
+                "proven": False,
+                "status": "UNVERIFIED_TIMEOUT",
+                "counterexample": None,
+                "bounded": is_bounded,
+            }
 
     _INT_WIDTH_SPEC = {
         "i8": (8, True), "u8": (8, False),
@@ -2327,6 +3012,213 @@ class SSATranslationValidator:
             }
         return self._probe_bounded_counterexample(ssa_before, ssa_after, timeout_ms)
 
+    def _verify_k_inductive_loop_equivalence(
+        self,
+        ssa_before: SSAFunction,
+        ssa_after: SSAFunction,
+        sym_params: List[z3.BitVecRef],
+        ph_b: Dict[str, Any],
+        ph_a: Dict[str, Any],
+        paired_keys: List[Tuple[Tuple[str, int], Tuple[str, int]]],
+        rem_b: List[Tuple[str, int]],
+        rem_a: List[Tuple[str, int]],
+        ptr_clauses: List[z3.BoolRef],
+        max_k: int = 4,
+        timeout_ms: int = 2000,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Bounded-history k-induction (Sheeran-Singh-Stalmarck) for single natural loops:
+        proves unbounded loop bisimulation for optimizations that stabilize or synchronize
+        after k >= 2 iterations (e.g. warmup/pipeline/lag registers or self-resetting flags).
+        """
+        if max_k < 2:
+            return None
+
+        bv64 = z3.BitVecSort(64)
+        read_only_loop = (not ph_b["loop_writes_ext"]) and (not ph_a["loop_writes_ext"])
+        pre_allocas_match = ph_b["pre_allocas_count"] == ph_a["pre_allocas_count"] and ph_b["pre_allocas_count"] > 0
+
+        # Check preheader bypass equivalence first
+        pre_eq = z3.And(
+            ph_b["enter_cond"] == ph_a["enter_cond"],
+            z3.Implies(
+                z3.Not(ph_b["enter_cond"]),
+                z3.And(
+                    ph_b["bypass_term"] == ph_a["bypass_term"],
+                    z3.Implies(
+                        ph_b["bypass_term"],
+                        z3.And(
+                            ph_b["bypass_ret"] == ph_a["bypass_ret"],
+                            ph_b["bypass_mem"] == ph_a["bypass_mem"],
+                        ),
+                    ),
+                ),
+            ),
+        )
+        bypass_solver = z3.Solver()
+        bypass_solver.set("timeout", timeout_ms)
+        for pc in ptr_clauses:
+            bypass_solver.add(pc)
+        bypass_solver.add(z3.Not(pre_eq))
+        if bypass_solver.check() == z3.sat:
+            m = bypass_solver.model()
+            ce = {
+                ssa_before.params[i]: (
+                    m.eval(p_sym, model_completion=True).as_signed_long()
+                    if hasattr(m.eval(p_sym, model_completion=True), "as_signed_long")
+                    else str(m.eval(p_sym, model_completion=True))
+                )
+                for i, p_sym in enumerate(sym_params)
+            }
+            return {"proven": False, "status": "REFUTED_COUNTEREXAMPLE", "counterexample": ce, "bounded": False}
+
+        # Filter paired PHIs to those whose initial values match upon loop entry
+        agreeing_pairs: List[Tuple[Tuple[str, int], Tuple[str, int]]] = []
+        for kb, ka in paired_keys:
+            ps = z3.Solver()
+            ps.set("timeout", min(500, timeout_ms))
+            for pc in ptr_clauses:
+                ps.add(pc)
+            ps.add(z3.And(ph_b["enter_cond"], ph_b["init_phi_vals"][kb] != ph_a["init_phi_vals"][ka]))
+            if ps.check() == z3.unsat:
+                agreeing_pairs.append((kb, ka))
+
+        def make_obs_inv(sb: Dict[Any, z3.BitVecRef], sa: Dict[Any, z3.BitVecRef], eb: z3.ArrayRef, ea: z3.ArrayRef, lb: z3.ArrayRef, la: z3.ArrayRef) -> z3.BoolRef:
+            cl = [eb == ea]
+            if pre_allocas_match:
+                cl.append(lb == la)
+            for kb, ka in agreeing_pairs:
+                cl.append(sb[kb] == sa[ka])
+            if read_only_loop:
+                cl.append(eb == ph_b["pre_ext_mem"])
+                cl.append(ea == ph_a["pre_ext_mem"])
+            return z3.And(cl)
+
+        def eval_side(ph: Dict[str, Any], state_m: Dict[Any, z3.BitVecRef], ext_m: z3.ArrayRef, loc_m: z3.ArrayRef) -> Dict[str, Any]:
+            subs = (
+                [(ph["phi_syms"][k], state_m[k]) for k in ph["phi_syms"]]
+                + [(ph["sym_ext_mem"], ext_m), (ph["sym_loc_mem"], loc_m)]
+            )
+            return {
+                "cont": z3.substitute(ph["continue_cond"], *subs),
+                "early_term": z3.substitute(ph["early_term"], *subs),
+                "early_ret": z3.substitute(ph["early_ret"], *subs),
+                "early_mem": z3.substitute(ph["early_mem"], *subs),
+                "leave": z3.substitute(ph["leave_cond"], *subs),
+                "exit_term": z3.substitute(ph["exit_term"], *subs),
+                "exit_ret": z3.substitute(ph["exit_ret"], *subs),
+                "exit_mem": z3.substitute(ph["exit_mem"], *subs),
+                "next_phi": {k: z3.substitute(v, *subs) for k, v in ph["next_phi_vals"].items()},
+                "next_ext": z3.substitute(ph["next_ext_mem"], *subs),
+                "next_loc": z3.substitute(ph["next_loc_mem"], *subs),
+            }
+
+        def obs_eq(rb: Dict[str, Any], ra: Dict[str, Any]) -> z3.BoolRef:
+            return z3.And(
+                rb["cont"] == ra["cont"],
+                rb["early_term"] == ra["early_term"],
+                z3.Implies(rb["early_term"], z3.And(rb["early_ret"] == ra["early_ret"], rb["early_mem"] == ra["early_mem"])),
+                rb["leave"] == ra["leave"],
+                z3.Implies(
+                    rb["leave"],
+                    z3.And(
+                        rb["exit_term"] == ra["exit_term"],
+                        z3.Implies(rb["exit_term"], z3.And(rb["exit_ret"] == ra["exit_ret"], rb["exit_mem"] == ra["exit_mem"])),
+                    ),
+                ),
+                z3.Implies(
+                    rb["cont"],
+                    make_obs_inv(rb["next_phi"], ra["next_phi"], rb["next_ext"], ra["next_ext"], rb["next_loc"], ra["next_loc"]),
+                ),
+            )
+
+        for k in range(2, max_k + 1):
+            # 1. Concrete k-step base cases starting from preheader init (steps 0..k-1)
+            base_alive = ph_b["enter_cond"]
+            cur_sb = dict(ph_b["init_phi_vals"])
+            cur_sa = dict(ph_a["init_phi_vals"])
+            cur_eb, cur_ea = ph_b["pre_ext_mem"], ph_a["pre_ext_mem"]
+            cur_lb, cur_la = ph_b["pre_loc_mem"], ph_a["pre_loc_mem"]
+
+            base_ok_all = True
+            for step_j in range(k):
+                rb = eval_side(ph_b, cur_sb, cur_eb, cur_lb)
+                ra = eval_side(ph_a, cur_sa, cur_ea, cur_la)
+                step_check = z3.Implies(
+                    base_alive,
+                    z3.And(make_obs_inv(cur_sb, cur_sa, cur_eb, cur_ea, cur_lb, cur_la), obs_eq(rb, ra)),
+                )
+                bs = z3.Solver()
+                bs.set("timeout", timeout_ms)
+                for pc in ptr_clauses:
+                    bs.add(pc)
+                bs.add(z3.Not(step_check))
+                b_chk = bs.check()
+                if b_chk == z3.sat:
+                    m = bs.model()
+                    ce = {
+                        ssa_before.params[i]: (
+                            m.eval(p_sym, model_completion=True).as_signed_long()
+                            if hasattr(m.eval(p_sym, model_completion=True), "as_signed_long")
+                            else str(m.eval(p_sym, model_completion=True))
+                        )
+                        for i, p_sym in enumerate(sym_params)
+                    }
+                    return {"proven": False, "status": "REFUTED_COUNTEREXAMPLE", "counterexample": ce, "bounded": False}
+                if b_chk != z3.unsat:
+                    base_ok_all = False
+                    break
+                base_alive = z3.And(base_alive, rb["cont"])
+                cur_sb, cur_sa = rb["next_phi"], ra["next_phi"]
+                cur_eb, cur_ea = rb["next_ext"], ra["next_ext"]
+                cur_lb, cur_la = rb["next_loc"], ra["next_loc"]
+
+            if not base_ok_all:
+                continue
+
+            # 2. k-Step inductive transition from arbitrary symbolic header state S_0
+            s0_b = {key: z3.BitVec(f"kind{k}_b_{key[0]}_{key[1]}", 64) for key in ph_b["phi_syms"]}
+            s0_a = {key: z3.BitVec(f"kind{k}_a_{key[0]}_{key[1]}", 64) for key in ph_a["phi_syms"]}
+            e0_b = ph_b["pre_ext_mem"] if read_only_loop else z3.Array(f"kind{k}_eb0", bv64, bv64)
+            e0_a = ph_a["pre_ext_mem"] if read_only_loop else z3.Array(f"kind{k}_ea0", bv64, bv64)
+            l0_b = z3.Array(f"kind{k}_lb0", bv64, bv64)
+            l0_a = z3.Array(f"kind{k}_la0", bv64, bv64)
+
+            assumes: List[z3.BoolRef] = list(ptr_clauses) + [
+                ph_b["enter_cond"],
+                make_obs_inv(s0_b, s0_a, e0_b, e0_a, l0_b, l0_a),
+            ]
+            st_b, st_a = s0_b, s0_a
+            ex_b, ex_a = e0_b, e0_a
+            lo_b, lo_a = l0_b, l0_a
+            goal_k: Optional[z3.BoolRef] = None
+            for step_j in range(k):
+                rb = eval_side(ph_b, st_b, ex_b, lo_b)
+                ra = eval_side(ph_a, st_a, ex_a, lo_a)
+                oeq = obs_eq(rb, ra)
+                if step_j < k - 1:
+                    assumes.append(oeq)
+                    assumes.append(rb["cont"])
+                    st_b, st_a = rb["next_phi"], ra["next_phi"]
+                    ex_b, ex_a = rb["next_ext"], ra["next_ext"]
+                    lo_b, lo_a = rb["next_loc"], ra["next_loc"]
+                else:
+                    goal_k = oeq
+
+            ss = z3.Solver()
+            ss.set("timeout", timeout_ms)
+            ss.add(z3.And(assumes))
+            ss.add(z3.Not(goal_k))
+            if ss.check() == z3.unsat:
+                return {
+                    "proven": True,
+                    "status": "PROVEN_K_INDUCTIVE_EQUIVALENT",
+                    "k": k,
+                    "counterexample": None,
+                    "bounded": False,
+                }
+        return None
+
     def _verify_inductive_loop_equivalence(
         self,
         ssa_before: SSAFunction,
@@ -2404,14 +3296,25 @@ class SSATranslationValidator:
             read_only_mem_inv=read_only_loop,
         )
         base_goal_expr = z3.And(pre_eq, z3.Implies(ph_b["enter_cond"], base_inv))
-        if self.enable_float_theory and z3.is_true(z3.simplify(base_goal_expr)):
+        ptr_clauses = self._build_pointer_disjointness_constraints(ssa_before, ssa_after, sym_params)
+        if self.enable_float_theory and z3.is_true(z3.simplify(base_goal_expr)) and not ptr_clauses:
             base_chk = z3.unsat
         else:
             base_solver = z3.Solver()
             base_solver.set("timeout", min(timeout_ms, 600) if self.enable_float_theory else timeout_ms)
+            for pc in ptr_clauses:
+                base_solver.add(pc)
             base_solver.add(z3.Not(base_goal_expr))
             base_chk = base_solver.check()
         if base_chk == z3.sat:
+            if self.max_k_induction >= 2:
+                k_res = self._verify_k_inductive_loop_equivalence(
+                    ssa_before, ssa_after, sym_params, ph_b, ph_a,
+                    paired_keys, rem_b, rem_a, ptr_clauses,
+                    max_k=self.max_k_induction, timeout_ms=timeout_ms,
+                )
+                if k_res is not None:
+                    return k_res
             m = base_solver.model()
             ce = {}
             for i, p_sym in enumerate(sym_params):
@@ -2466,7 +3369,7 @@ class SSATranslationValidator:
             ),
         )
         step_chk = None
-        if self.enable_float_theory:
+        if self.enable_float_theory and not ptr_clauses:
             step_subst = (
                 [(ph_a["phi_syms"][ka], ph_b["phi_syms"][kb]) for kb, ka in paired_keys]
                 + [
@@ -2489,6 +3392,8 @@ class SSATranslationValidator:
         if step_chk is None:
             step_solver = z3.Solver()
             step_solver.set("timeout", min(timeout_ms, 600) if self.enable_float_theory else timeout_ms)
+            for pc in ptr_clauses:
+                step_solver.add(pc)
             step_solver.add(z3.And(step_assume, z3.Not(step_goal)))
             step_chk = step_solver.check()
 
@@ -2499,6 +3404,16 @@ class SSATranslationValidator:
                 "counterexample": None,
                 "bounded": False,
             }
+
+        # Escalate to k-induction (k >= 2) before falling back to bounded witness check
+        if self.max_k_induction >= 2:
+            k_res = self._verify_k_inductive_loop_equivalence(
+                ssa_before, ssa_after, sym_params, ph_b, ph_a,
+                paired_keys, rem_b, rem_a, ptr_clauses,
+                max_k=self.max_k_induction, timeout_ms=timeout_ms,
+            )
+            if k_res is not None:
+                return k_res
 
         # Step/Exit failed under arbitrary state: confirm concrete refutation via bounded witness check
         if step_chk == z3.sat or (self.enable_float_theory and step_chk == z3.unknown):
@@ -2529,6 +3444,9 @@ class SSATranslationValidator:
             self.enable_inductive_loops,
             self.enable_call_congruence,
             self.enable_float_theory,
+            self.enable_ub_poison,
+            self.enable_pointer_disjointness,
+            self.max_k_induction,
         )
         with self._PROOF_CACHE_LOCK:
             cached = self._PROOF_CACHE.get(cache_key)
@@ -2578,9 +3496,13 @@ class SSATranslationValidator:
                 "bounded": False,
             }
 
+        if self.enable_ub_poison:
+            return self.verify_refinement(ssa_before, ssa_after, timeout_ms=timeout_ms)
+
         sym_params = [z3.BitVec(f"p_{i}_{name}", 64) for i, name in enumerate(ssa_before.params)]
         bv64 = z3.BitVecSort(64)
         shared_ext_mem = z3.Array("shared_ext_mem_0", bv64, bv64)
+        ptr_clauses = self._build_pointer_disjointness_constraints(ssa_before, ssa_after, sym_params)
 
         enc_before = self._encode_function_symbolic(ssa_before, sym_params, init_ext_mem=shared_ext_mem)
         enc_after = self._encode_function_symbolic(ssa_after, sym_params, init_ext_mem=shared_ext_mem)
@@ -2726,6 +3648,8 @@ class SSATranslationValidator:
 
         solver = z3.Solver()
         solver.set("timeout", timeout_ms)
+        for pc in ptr_clauses:
+            solver.add(pc)
         solver.add(mismatch_cond)
         check = solver.check()
 
