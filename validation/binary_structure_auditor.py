@@ -412,6 +412,8 @@ class BinaryStructureAuditor:
             arch = "x86-64"
         elif machine == "EM_AARCH64":
             arch = "ARM64"
+        elif machine in ("EM_RISCV", 243):
+            arch = "RISC-V 64"
         else:
             arch = str(machine)
 

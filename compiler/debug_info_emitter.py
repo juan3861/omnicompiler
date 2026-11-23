@@ -371,6 +371,9 @@ class DwarfV5Emitter:
             return self.emit_debug_info_cu(unit_name, producer=producer, low_pc=low_pc, high_pc=high_pc)
 
         # abbrev 1: DW_TAG_compile_unit (0x11), DW_CHILDREN_yes (1)
+        #   DW_AT_producer (0x25, string=0x08), DW_AT_name (0x03, string=0x08),
+        #   DW_AT_low_pc (0x11, addr=0x01), DW_AT_high_pc (0x12, addr=0x01),
+        #   DW_AT_stmt_list (0x10, sec_offset=0x17)
         # abbrev 2: DW_TAG_subprogram (0x2E), DW_CHILDREN_no (0):
         #   DW_AT_name (0x03, string=0x08), DW_AT_low_pc (0x11, addr=0x01),
         #   DW_AT_high_pc (0x12, addr=0x01), DW_AT_decl_line (0x3B, data4=0x06)
@@ -380,6 +383,7 @@ class DwarfV5Emitter:
             0x03, 0x08,
             0x11, 0x01,
             0x12, 0x01,
+            0x10, 0x17,
             0x00, 0x00,
             0x02, 0x2E, 0x00,
             0x03, 0x08,
@@ -394,7 +398,7 @@ class DwarfV5Emitter:
         die.append(0x01)
         die.extend(producer.encode("utf-8") + b"\x00")
         die.extend(unit_name.encode("utf-8") + b"\x00")
-        die.extend(struct.pack("<QQ", low_pc, high_pc))
+        die.extend(struct.pack("<QQI", low_pc, high_pc, 0))
         for sp in subs:
             die.append(0x02)
             die.extend(str(sp["name"]).encode("utf-8") + b"\x00")

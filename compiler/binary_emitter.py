@@ -810,6 +810,52 @@ class StandaloneBinaryEmitter:
         prog_header = struct.pack("<IIQQQQQQ", 1, 7, 0, vaddr, vaddr, total_size, total_size, 0x1000)
         return elf_header + prog_header + bytes(code)
 
+    def build_riscv64_elf(
+        self,
+        exit_code: int = 0,
+        custom_code: Optional[bytes] = None,
+        entry_offset: Optional[int] = None,
+    ) -> bytes:
+        """Emits a standalone Linux RISC-V 64 (`e_machine = 0xF3`) ELF64 executable."""
+        vaddr = self.VADDR_ELF
+        hdr_entry_offset = 64 + 56  # EHDR + 1 PHDR
+        entry_addr = vaddr + hdr_entry_offset
+
+        code = bytearray()
+        if custom_code:
+            # JAL ra, fn; LI a7, 93; ECALL (sys_exit with returned a0)
+            fn_off = int(entry_offset or 0)
+            jal_disp = 12 + fn_off
+            imm = jal_disp & 0x1FFFFF
+            jal_ra = (
+                (((imm >> 20) & 1) << 31)
+                | (((imm >> 1) & 0x3FF) << 21)
+                | (((imm >> 11) & 1) << 20)
+                | (((imm >> 12) & 0xFF) << 12)
+                | (1 << 7)
+                | 0x6F
+            )
+            addi_a7_93 = ((93 & 0xFFF) << 20) | (0 << 15) | (0 << 12) | (17 << 7) | 0x13
+            ecall = 0x00000073
+            code.extend(struct.pack("<III", jal_ra, addi_a7_93, ecall))
+            code.extend(custom_code)
+        else:
+            addi_a0 = ((int(exit_code) & 0xFFF) << 20) | (0 << 15) | (0 << 12) | (10 << 7) | 0x13
+            addi_a7_93 = ((93 & 0xFFF) << 20) | (0 << 15) | (0 << 12) | (17 << 7) | 0x13
+            ecall = 0x00000073
+            code.extend(struct.pack("<III", addi_a0, addi_a7_93, ecall))
+
+        total_size = hdr_entry_offset + len(code)
+        elf_ident = b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 8)
+        elf_header = struct.pack(
+            "<16sHHIQQQIHHHHHH",
+            elf_ident,
+            2, 0xF3, 1, entry_addr, 64, 0, 0x00000005,
+            64, 56, 1, 64, 0, 0,
+        )
+        prog_header = struct.pack("<IIQQQQQQ", 1, 7, 0, vaddr, vaddr, total_size, total_size, 0x1000)
+        return elf_header + prog_header + bytes(code)
+
     def build_arm64_pe(
         self,
         exit_code: int = 0,
@@ -1346,6 +1392,24 @@ class StandaloneBinaryEmitter:
             data = self.build_elf64(custom_code=custom_code, exit_code=exit_code, entry_offset=entry_offset)
         elif target_format == "arm64_elf":
             data = self.build_arm64_elf(exit_code=exit_code, custom_code=custom_code, entry_offset=entry_offset)
+        elif target_format in ("riscv64_elf", "riscv_elf"):
+            data = self.build_riscv64_elf(exit_code=exit_code, custom_code=custom_code, entry_offset=entry_offset)
+        elif target_format in ("spirv", "spv"):
+            if not output_path.endswith(".spv"):
+                output_path += ".spv"
+            if custom_code:
+                data = custom_code
+            else:
+                from compiler.ssa_ir import BasicBlock, SSAFunction, SSAInstruction, SSAVar
+                from compiler.spirv_emitter import SPIRVEmitter
+                fn = SSAFunction("spv_exit", [])
+                blk = BasicBlock("entry")
+                rv = SSAVar("r", 1)
+                blk.add_instruction(SSAInstruction(rv, "const", [exit_code]))
+                blk.add_instruction(SSAInstruction(None, "ret", [rv]))
+                fn.blocks = [blk]
+                fn.entry_block = blk
+                data = SPIRVEmitter().emit_spirv_binary(fn)
         elif target_format == "arm64_pe":
             if not output_path.endswith(".exe"):
                 output_path += ".exe"

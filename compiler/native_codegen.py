@@ -3430,7 +3430,7 @@ class Arm64CodeGenerator:
 
 
 class NativeCodeGenerator:
-    """Unified Multi-Architecture Codegen Dispatcher (`x86_64` & `arm64`)."""
+    """Unified Multi-Architecture Codegen Dispatcher (`x86_64`, `arm64`, `riscv64`)."""
 
     def __init__(
         self,
@@ -3442,8 +3442,14 @@ class NativeCodeGenerator:
         self.target_os = target_os
         self.x64 = X64CodeGenerator(target_os=target_os, enable_avx512=enable_avx512)
         self.arm64 = Arm64CodeGenerator()
+        self._riscv64 = None
 
     def compile_ssa(self, fn: SSAFunction) -> CompiledFunctionArtifact:
         if self.arch in ("arm64", "aarch64"):
             return self.arm64.compile_function(fn)
+        if self.arch in ("riscv64", "rv64", "riscv"):
+            if self._riscv64 is None:
+                from compiler.riscv64_codegen import Riscv64CodeGenerator
+                self._riscv64 = Riscv64CodeGenerator(target_os=self.target_os or "linux")
+            return self._riscv64.compile_function(fn)
         return self.x64.compile_function(fn)
