@@ -301,13 +301,13 @@ def _x64_mov_rr(dst: str, src: str) -> bytes:
     return bytes([rex, 0x89, modrm])
 
 
-def _x64_mov_ri(dst: str, imm: int) -> bytes:
+def _x64_mov_ri(dst: str, imm: int, preserve_flags: bool = False) -> bytes:
     d_hi, d_lo = X64_REGS[dst]
     # Normalize to signed 64-bit
     imm64 = imm & 0xFFFFFFFFFFFFFFFF
     if imm64 >= (1 << 63):
         imm64 -= (1 << 64)
-    if imm64 == 0:
+    if imm64 == 0 and not preserve_flags:
         rex = 0x48 | (d_hi << 2) | d_hi
         modrm = 0xC0 | (d_lo << 3) | d_lo
         return bytes([rex, 0x31, modrm])
@@ -317,6 +317,30 @@ def _x64_mov_ri(dst: str, imm: int) -> bytes:
         return bytes([rex, 0xC7, modrm]) + struct.pack("<i", imm64)
     rex = 0x48 | d_hi
     return bytes([rex, 0xB8 + d_lo]) + struct.pack("<q", imm64)
+
+
+def _x64_lea_add_imm(dst: str, base: str, disp: int) -> bytes:
+    d_hi, d_lo = X64_REGS[dst]
+    b_hi, b_lo = X64_REGS[base]
+    rex = 0x48 | (d_hi << 2) | b_hi
+    if -128 <= disp <= 127:
+        if b_lo == 4:
+            return bytes([rex, 0x8D, 0x44 | (d_lo << 3), 0x24]) + struct.pack("<b", disp)
+        return bytes([rex, 0x8D, 0x40 | (d_lo << 3) | b_lo]) + struct.pack("<b", disp)
+    if b_lo == 4:
+        return bytes([rex, 0x8D, 0x84 | (d_lo << 3), 0x24]) + struct.pack("<i", disp)
+    return bytes([rex, 0x8D, 0x80 | (d_lo << 3) | b_lo]) + struct.pack("<i", disp)
+
+
+def _x64_lea_add_rr(dst: str, base: str, idx: str) -> bytes:
+    d_hi, d_lo = X64_REGS[dst]
+    b_hi, b_lo = X64_REGS[base]
+    i_hi, i_lo = X64_REGS[idx]
+    rex = 0x48 | (d_hi << 2) | (i_hi << 1) | b_hi
+    sib = (i_lo << 3) | b_lo
+    if b_lo == 5:
+        return bytes([rex, 0x8D, 0x44 | (d_lo << 3), sib, 0x00])
+    return bytes([rex, 0x8D, 0x04 | (d_lo << 3), sib])
 
 
 def _x64_load_rbp(dst: str, disp: int) -> bytes:
@@ -964,9 +988,9 @@ class X64CodeGenerator:
             else:
                 buf.emit(_x64_store_rbp(slot_map[res_var], src_reg))
 
-        def emit_phi_copies_for_edge(pred_name: str, succ_block: BasicBlock):
+        def _build_phi_copy_seq(pred_name: str, succ_block: BasicBlock) -> Tuple[List[Tuple[Any, Any]], Set[Any]]:
             if not succ_block.phi_nodes:
-                return
+                return [], set()
             copies: List[Tuple[Any, Any]] = []
             for phi in succ_block.phi_nodes:
                 if phi.result is None:
@@ -1021,17 +1045,34 @@ class X64CodeGenerator:
                     copies.append((dst_loc, src_loc))
 
             seq = _sequentialize_parallel_copies(copies, "r11" if pure_leaf_mode else ("reg", "r11"))
+            written: Set[Any] = set()
+            for dst_loc, src_loc in seq:
+                if dst_loc == src_loc:
+                    continue
+                if pure_leaf_mode:
+                    written.add(("reg", dst_loc))
+                else:
+                    written.add(dst_loc)
+                    if (
+                        (isinstance(src_loc, tuple) and src_loc[0] in ("imm", "slot"))
+                    ):
+                        written.add(("reg", "rax"))
+            return seq, written
+
+        def emit_phi_copies_for_edge(pred_name: str, succ_block: BasicBlock, preserve_flags: bool = False):
+            if not succ_block.phi_nodes:
+                return
+            seq, _ = _build_phi_copy_seq(pred_name, succ_block)
             for dst_loc, src_loc in seq:
                 if pure_leaf_mode:
                     if isinstance(src_loc, tuple) and src_loc[0] == "imm":
-                        buf.emit(_x64_mov_ri(dst_loc, src_loc[1]))
+                        buf.emit(_x64_mov_ri(dst_loc, src_loc[1], preserve_flags=preserve_flags))
                     else:
                         buf.emit(_x64_mov_rr(dst_loc, src_loc))
                 else:
-                    # General slot/reg move via rax
                     if isinstance(src_loc, tuple) and src_loc[0] == "imm":
                         val_reg = "rax"
-                        buf.emit(_x64_mov_ri("rax", src_loc[1]))
+                        buf.emit(_x64_mov_ri("rax", src_loc[1], preserve_flags=preserve_flags))
                     elif isinstance(src_loc, tuple) and src_loc[0] == "reg":
                         val_reg = src_loc[1]
                     else:
@@ -1042,6 +1083,50 @@ class X64CodeGenerator:
                         buf.emit(_x64_mov_rr(dst_loc[1], val_reg))
                     else:
                         buf.emit(_x64_store_rbp(dst_loc[1], val_reg))
+
+        def _var_loc(v: Any) -> Optional[Tuple[str, Any]]:
+            if not isinstance(v, SSAVar) or v in inlined_consts:
+                return None
+            if pure_leaf_mode:
+                return ("reg", reg_map[v]) if v in reg_map else None
+            if leaf_mode:
+                if v in reg_map:
+                    return ("reg", reg_map[v])
+                if v in slot_map:
+                    return ("slot", slot_map[v])
+                return None
+            return ("slot", slot_map[v]) if v in slot_map else None
+
+        def _self_loop_pre_jcc_safe(blk: BasicBlock, false_bb: Optional[BasicBlock]) -> bool:
+            _, written = _build_phi_copy_seq(blk.name, blk)
+            if not written:
+                return True
+            if ("reg", "rax") in written or ("reg", "r11") in written:
+                return False
+            phi_res_vars = {p.result for p in blk.phi_nodes if p.result is not None}
+            if false_bb is not None:
+                for fp in false_bb.phi_nodes:
+                    for bn, val in fp.phi_incoming:
+                        if bn == blk.name:
+                            loc = _var_loc(val)
+                            if loc in written or (isinstance(val, SSAVar) and val in phi_res_vars):
+                                return False
+            for other_b in fn.blocks:
+                if other_b is blk:
+                    continue
+                for op_p in other_b.phi_nodes:
+                    for bn, val in op_p.phi_incoming:
+                        if other_b is false_bb and bn == blk.name:
+                            continue
+                        if isinstance(val, SSAVar):
+                            if val in phi_res_vars or _var_loc(val) in written:
+                                return False
+                for ins_o in other_b.instructions:
+                    for operand in ins_o.operands:
+                        if isinstance(operand, SSAVar):
+                            if operand in phi_res_vars or _var_loc(operand) in written:
+                                return False
+            return True
 
         block_map: Dict[str, BasicBlock] = {b.name: b for b in fn.blocks}
         edge_trampolines: List[Tuple[str, str, BasicBlock]] = []
@@ -1202,8 +1287,12 @@ class X64CodeGenerator:
                         if c_imm1 is None and c_imm0 is not None:
                             op0, op1, c_imm1 = op1, op0, c_imm0
                         if c_imm1 is not None and isinstance(op0, SSAVar) and op0 in reg_map and op0 not in inlined_consts:
-                            buf.emit(_x64_mov_rr(dst_r, reg_map[op0]))
-                            buf.emit(_x64_alu_ri32(alu_ext, dst_r, c_imm1))
+                            r0 = reg_map[op0]
+                            if op == "add" and dst_r != r0:
+                                buf.emit(_x64_lea_add_imm(dst_r, r0, c_imm1))
+                            else:
+                                buf.emit(_x64_mov_rr(dst_r, r0))
+                                buf.emit(_x64_alu_ri32(alu_ext, dst_r, c_imm1))
                             continue
                         if (
                             isinstance(op0, SSAVar) and op0 in reg_map and op0 not in inlined_consts
@@ -1211,8 +1300,11 @@ class X64CodeGenerator:
                         ):
                             r0, r1 = reg_map[op0], reg_map[op1]
                             if dst_r != r1:
-                                buf.emit(_x64_mov_rr(dst_r, r0))
-                                buf.emit(_x64_alu_rr(alu_byte, dst_r, r1))
+                                if op == "add" and dst_r != r0 and r1 not in ("rsp", "r12"):
+                                    buf.emit(_x64_lea_add_rr(dst_r, r0, r1))
+                                else:
+                                    buf.emit(_x64_mov_rr(dst_r, r0))
+                                    buf.emit(_x64_alu_rr(alu_byte, dst_r, r1))
                                 continue
                             elif op != "sub":
                                 # dst_r == r1 and op is commutative: op dst_r, r0!
@@ -1421,14 +1513,28 @@ class X64CodeGenerator:
                         true_name, false_name = str(fused_br.operands[1]), str(fused_br.operands[2])
                         next_blk_name = fn.blocks[idx_b + 1].name if (idx_b + 1 < len(fn.blocks)) else None
                         true_bb = block_map.get(true_name)
-                        if true_name == next_blk_name and (true_bb is None or not true_bb.phi_nodes):
+                        false_bb = block_map.get(false_name)
+                        if true_name == block.name and (true_bb is None or _self_loop_pre_jcc_safe(block, false_bb)):
+                            if true_bb is not None and len(true_bb.phi_nodes) > 0:
+                                emit_phi_copies_for_edge(block.name, true_bb, preserve_flags=True)
+                            buf.jcc(self.SETCC_BYTES[op] - 0x10, f".L_bb_{true_name}")
+                            if false_bb is not None and len(false_bb.phi_nodes) > 0:
+                                emit_phi_copies_for_edge(block.name, false_bb)
+                            if next_blk_name != false_name:
+                                buf.jmp(f".L_bb_{false_name}")
+                        elif true_name == block.name and true_bb is not None and len(true_bb.phi_nodes) > 0:
+                            inv_jcc = (self.SETCC_BYTES[op] ^ 0x01) - 0x10
+                            f_lbl = branch_target_label(block.name, false_name)
+                            buf.jcc(inv_jcc, f_lbl)
+                            emit_phi_copies_for_edge(block.name, true_bb, preserve_flags=False)
+                            buf.jmp(f".L_bb_{true_name}")
+                        elif true_name == next_blk_name and (true_bb is None or not true_bb.phi_nodes):
                             inv_jcc = (self.SETCC_BYTES[op] ^ 0x01) - 0x10
                             f_lbl = branch_target_label(block.name, false_name)
                             buf.jcc(inv_jcc, f_lbl)
                         else:
                             t_lbl = branch_target_label(block.name, true_name)
                             buf.jcc(self.SETCC_BYTES[op] - 0x10, t_lbl)
-                            false_bb = block_map.get(false_name)
                             if false_bb is not None and len(false_bb.phi_nodes) > 0:
                                 emit_phi_copies_for_edge(block.name, false_bb)
                             if next_blk_name != false_name:

@@ -644,6 +644,9 @@ class OmniRepoCompiler:
         irc_coalesced_moves = 0
         polyhedral_tiled_loops = 0
         unrolled_loops = 0
+        rotated_loops = 0
+        slp_clusters_formed = 0
+        pgo_profiled_functions = 0
         gvn_eliminated_exprs = 0
         sccp_folded_branches = 0
         specialized_functions = 0
@@ -912,10 +915,13 @@ class OmniRepoCompiler:
                     except Exception:
                         pass
 
-                    # 5. Loop Unrolling Pass
+                    # 5. PGO-Calibrated Loop Unrolling Pass
                     try:
+                        from compiler.pgo_optimizer import ProfileGuidedOptimizer
                         from compiler.polyhedral_tiler import LoopUnrollPass
-                        ssa_fn, unroll_stats = LoopUnrollPass(unroll_factor=host_unroll_factor).unroll_function(ssa_fn)
+                        pgo_prof = ProfileGuidedOptimizer().collect_ssa_profile(ssa_fn)
+                        eff_unroll = max(host_unroll_factor, pgo_prof.recommended_unroll)
+                        ssa_fn, unroll_stats = LoopUnrollPass(unroll_factor=eff_unroll).unroll_function(ssa_fn)
                         unrolled_loops += unroll_stats.get("unrolled_loops", 0)
                     except Exception:
                         pass
@@ -983,6 +989,9 @@ class OmniRepoCompiler:
                 "devirtualized_calls": 0,
                 "tco_converted_calls": 0,
                 "reordered_blocks": 0,
+                "rotated_loops": 0,
+                "slp_clusters_formed": 0,
+                "pgo_profiled_functions": 0,
             }
 
             def _run_local(fn_obj, pass_callable, counter_key=None):
@@ -1044,11 +1053,29 @@ class OmniRepoCompiler:
             except Exception:
                 pass
             try:
-                from compiler.tco_and_layout import BlockLayoutPass
-                s_fn, c_val = _run_local(s_fn, BlockLayoutPass().run_on_function, "reordered_blocks")
-                local_stats["reordered_blocks"] += c_val
+                from compiler.polyhedral_tiler import SLPVectorizationPass
+                s_fn, c_val = _run_local(s_fn, SLPVectorizationPass().run_on_function, "slp_clusters_formed")
+                local_stats["slp_clusters_formed"] += c_val
             except Exception:
                 pass
+            try:
+                from compiler.polyhedral_tiler import LoopRotationPass
+                s_fn, rot_st = LoopRotationPass().run_on_function(s_fn)
+                local_stats["rotated_loops"] += rot_st.get("rotated_loops", 0)
+            except Exception:
+                pass
+            try:
+                from compiler.pgo_optimizer import ProfileGuidedOptimizer
+                s_fn, c_val = _run_local(s_fn, ProfileGuidedOptimizer().optimize_with_profile, "reordered_blocks")
+                local_stats["reordered_blocks"] += c_val
+                local_stats["pgo_profiled_functions"] += 1
+            except Exception:
+                try:
+                    from compiler.tco_and_layout import BlockLayoutPass
+                    s_fn, c_val = _run_local(s_fn, BlockLayoutPass().run_on_function, "reordered_blocks")
+                    local_stats["reordered_blocks"] += c_val
+                except Exception:
+                    pass
 
             return f_name, s_fn, local_stats
 
@@ -1076,6 +1103,9 @@ class OmniRepoCompiler:
             devirtualized_calls += st["devirtualized_calls"]
             tco_converted_calls += st["tco_converted_calls"]
             reordered_blocks += st["reordered_blocks"]
+            rotated_loops += st["rotated_loops"]
+            slp_clusters_formed += st["slp_clusters_formed"]
+            pgo_profiled_functions += st["pgo_profiled_functions"]
             ssa_program[fn_name] = ssa_fn
             if fn_name in ssa_opt_keys:
                 self._salsa_ssa_cache[ssa_opt_keys[fn_name]] = clone_ssa_function(ssa_fn)
@@ -1208,6 +1238,9 @@ class OmniRepoCompiler:
                 "irc_coalesced_moves": irc_coalesced_moves,
                 "polyhedral_tiled_loops": polyhedral_tiled_loops,
                 "unrolled_loops": unrolled_loops,
+                "rotated_loops": rotated_loops,
+                "slp_clusters_formed": slp_clusters_formed,
+                "pgo_profiled_functions": pgo_profiled_functions,
                 "gvn_eliminated_exprs": gvn_eliminated_exprs,
                 "sccp_folded_branches": sccp_folded_branches,
                 "specialized_functions": specialized_functions,
@@ -1709,6 +1742,9 @@ class OmniRepoCompiler:
             "irc_coalesced_moves": irc_coalesced_moves,
             "polyhedral_tiled_loops": polyhedral_tiled_loops,
             "unrolled_loops": unrolled_loops,
+            "rotated_loops": rotated_loops,
+            "slp_clusters_formed": slp_clusters_formed,
+            "pgo_profiled_functions": pgo_profiled_functions,
             "gvn_eliminated_exprs": gvn_eliminated_exprs,
             "sccp_folded_branches": sccp_folded_branches,
             "specialized_functions": specialized_functions,
