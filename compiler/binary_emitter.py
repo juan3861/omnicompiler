@@ -1136,6 +1136,65 @@ class StandaloneBinaryEmitter:
             return unsigned_img
         return unsigned_img[:code_offset + len(raw_code)]
 
+    @staticmethod
+    def _uleb128(val: int) -> bytes:
+        out = bytearray()
+        while True:
+            byte = val & 0x7F
+            val >>= 7
+            if val != 0:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                break
+        return bytes(out)
+
+    @classmethod
+    def _build_macho_export_trie(cls, exports_list: List[Tuple[str, int]], code_vaddr: int) -> bytes:
+        """Builds a canonical Mach-O ULEB128 export trie for dyld4 dlsym resolution."""
+        # Prefix tree nodes: [edges_dict, terminal_offset_or_None]
+        root: List[Any] = [{}, None]
+        for sym_name, sym_off in exports_list:
+            mname = sym_name if sym_name.startswith("_") else f"_{sym_name}"
+            node = root
+            # Group full edge per symbol under unique suffix if not sharing prefix
+            cur_edges = node[0]
+            if mname not in cur_edges:
+                cur_edges[mname] = [{}, code_vaddr + int(sym_off)]
+
+        # Order nodes: root + sorted children
+        nodes: List[List[Any]] = [root]
+        child_order: List[Tuple[str, int]] = []
+        for edge_str in sorted(root[0].keys()):
+            child_idx = len(nodes)
+            nodes.append(root[0][edge_str])
+            child_order.append((edge_str, child_idx))
+
+        offsets = [0] * len(nodes)
+        for _ in range(4):
+            cur_off = 0
+            serialized_nodes: List[bytes] = []
+            for idx_n, nd in enumerate(nodes):
+                offsets[idx_n] = cur_off
+                term = nd[1]
+                buf = bytearray()
+                if term is not None:
+                    term_info = cls._uleb128(0) + cls._uleb128(term)
+                    buf.extend(cls._uleb128(len(term_info)))
+                    buf.extend(term_info)
+                else:
+                    buf.append(0)
+                if idx_n == 0:
+                    buf.append(len(child_order))
+                    for edge_s, c_idx in child_order:
+                        buf.extend(edge_s.encode("utf-8") + b"\x00")
+                        buf.extend(cls._uleb128(offsets[c_idx]))
+                else:
+                    buf.append(0)
+                serialized_nodes.append(bytes(buf))
+                cur_off += len(buf)
+        return b"".join(serialized_nodes)
+
     def build_macho64_dylib(
         self,
         func_code: bytes,
@@ -1146,7 +1205,9 @@ class StandaloneBinaryEmitter:
     ) -> bytes:
         """
         Synthesizes a 64-bit Mach-O dynamic shared library (`MH_DYLIB`) with:
-          - `LC_SYMTAB (0x02)` multi-symbol `nlist_64` export table (`_symbol` ABI convention)
+          - `LC_DYLD_INFO_ONLY` ULEB128 export trie (`dyld4` `dlsym` compatible)
+          - `LC_SYMTAB (0x02)` + `LC_DYSYMTAB (0x0B)` multi-symbol `nlist_64` export table (`_symbol` ABI)
+          - `LC_BUILD_VERSION (0x32)` (`PLATFORM_MACOS`)
           - `__LINKEDIT` segment
           - On `arm64`: XNU Ad-Hoc `LC_CODE_SIGNATURE (0x1D)` (`CS_SuperBlob` `0xFADE0CC0`).
         """
@@ -1165,7 +1226,7 @@ class StandaloneBinaryEmitter:
             exports_map["omni_compute"] = 0
         sorted_exports = sorted(exports_map.items(), key=lambda kv: kv[0])
 
-        # Build Mach-O nlist_64 symbol table + string table
+        # Build Mach-O nlist_64 symbol table + string table + ULEB128 export trie
         strtab = bytearray(b"\x00")
         symtab = bytearray()
         for sym_name, sym_off in sorted_exports:
@@ -1174,7 +1235,9 @@ class StandaloneBinaryEmitter:
             strtab.extend(macho_sym.encode("utf-8") + b"\x00")
             # nlist_64: n_strx(I), n_type(B=0x0F N_EXT|N_SECT), n_sect(B=1), n_desc(H=0), n_value(Q)
             symtab.extend(struct.pack("<IBBHQ", n_strx, 0x0F, 1, 0, code_vaddr + int(sym_off)))
-        strtab_padded = bytes(strtab).ljust(self._align_up(len(strtab), 16), b"\x00")
+        strtab_padded = bytes(strtab).ljust(self._align_up(len(strtab), 8), b"\x00")
+        raw_trie = self._build_macho_export_trie(sorted_exports, code_vaddr)
+        trie_padded = raw_trie.ljust(self._align_up(len(raw_trie), 8), b"\x00")
 
         padded_code = func_code.ljust(self._align_up(max(1, len(func_code)), 16), b"\x00")
         text_file_end = self._align_up(code_offset + len(padded_code), page_size)
@@ -1182,7 +1245,8 @@ class StandaloneBinaryEmitter:
 
         symoff = text_file_end
         stroff = symoff + len(symtab)
-        after_syms_off = self._align_up(stroff + len(strtab_padded), 16)
+        trie_off = stroff + len(strtab_padded)
+        after_syms_off = self._align_up(trie_off + len(trie_padded), 16)
 
         install_name = (dylib_name or f"lib{export_name}.dylib").encode("utf-8") + b"\x00"
         padded_name = install_name.ljust(self._align_up(len(install_name), 8), b"\x00")
@@ -1190,11 +1254,17 @@ class StandaloneBinaryEmitter:
 
         cmd_text_size = 72 + 80
         cmd_linkedit_size = 72
+        cmd_dyld_info_size = 48
         cmd_symtab_size = 24
+        cmd_dysymtab_size = 80
+        cmd_buildver_size = 24
         cmd_codesig_size = 16 if is_arm64 else 0
 
-        ncmds = 5 if is_arm64 else 4
-        sizeofcmds = cmd_text_size + cmd_linkedit_size + cmd_id_size + cmd_symtab_size + cmd_codesig_size
+        ncmds = 8 if is_arm64 else 7
+        sizeofcmds = (
+            cmd_text_size + cmd_linkedit_size + cmd_id_size + cmd_dyld_info_size
+            + cmd_symtab_size + cmd_dysymtab_size + cmd_buildver_size + cmd_codesig_size
+        )
 
         est_sig = build_macho_adhoc_codesign_blob(b"\x00" * after_syms_off, page_shift=page_shift) if is_arm64 else b""
         linkedit_filesize = (after_syms_off - text_file_end) + len(est_sig)
@@ -1203,7 +1273,7 @@ class StandaloneBinaryEmitter:
         header = struct.pack(
             "<IIIIIIII",
             0xFEEDFACF, cpu_type, cpu_subtype,
-            0x6, ncmds, sizeofcmds, 0x00200085, 0
+            0x6, ncmds, sizeofcmds, 0x00100085, 0
         )
 
         cmd_text = struct.pack(
@@ -1224,14 +1294,28 @@ class StandaloneBinaryEmitter:
             text_file_end, linkedit_filesize,
             1, 1, 0, 0
         )
-        cmd_id = struct.pack("<IIIIII", 0x0D, cmd_id_size, 24, 1, 0x00010000, 0x00010000) + padded_name
+        cmd_id = struct.pack("<IIIIII", 0x0D, cmd_id_size, 24, 2, 0x00010000, 0x00010000) + padded_name
+        cmd_dyld_info = struct.pack(
+            "<IIIIIIIIIIII",
+            0x80000022, cmd_dyld_info_size,
+            0, 0,
+            0, 0,
+            0, 0,
+            0, 0,
+            trie_off, len(raw_trie),
+        )
         cmd_symtab = struct.pack("<IIIIII", 0x02, cmd_symtab_size, symoff, len(sorted_exports), stroff, len(strtab_padded))
+        cmd_dysymtab = struct.pack("<20I", 0x0B, cmd_dysymtab_size, 0, 0, 0, len(sorted_exports), len(sorted_exports), 0, *([0] * 12))
+        cmd_buildver = struct.pack("<IIIIII", 0x32, cmd_buildver_size, 1, 0x000B0000, 0x000B0000, 0)
 
         extra_cmds = struct.pack("<IIII", 0x1D, 16, after_syms_off, len(est_sig)) if is_arm64 else b""
 
-        all_headers = (header + cmd_text + sec_text + cmd_linkedit + cmd_id + cmd_symtab + extra_cmds).ljust(code_offset, b"\x00")
+        all_headers = (
+            header + cmd_text + sec_text + cmd_linkedit + cmd_id
+            + cmd_dyld_info + cmd_symtab + cmd_dysymtab + cmd_buildver + extra_cmds
+        ).ljust(code_offset, b"\x00")
         text_img = (all_headers + padded_code).ljust(text_file_end, b"\x00")
-        unsigned_dylib = (text_img + bytes(symtab) + strtab_padded).ljust(after_syms_off, b"\x00")
+        unsigned_dylib = (text_img + bytes(symtab) + strtab_padded + trie_padded).ljust(after_syms_off, b"\x00")
 
         if is_arm64:
             real_sig = build_macho_adhoc_codesign_blob(unsigned_dylib, page_shift=page_shift)

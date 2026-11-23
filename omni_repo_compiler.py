@@ -379,8 +379,15 @@ class OmniRepoCompiler:
                 normalized_homeo_overrides[str(o_fn)] = eng_norm
 
         results: Dict[str, Any] = {"stages": {}}
-        effective_os = (target_os.lower() if target_os else ("windows" if sys.platform == "win32" else "linux"))
-        effective_arch = (target_arch.lower() if target_arch else "x86_64")
+        if target_os:
+            effective_os = "macos" if target_os.lower() == "darwin" else target_os.lower()
+        else:
+            effective_os = "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "linux")
+        if target_arch:
+            effective_arch = "arm64" if target_arch.lower() in ("arm64", "aarch64") else target_arch.lower()
+        else:
+            import platform as _plat
+            effective_arch = "arm64" if _plat.machine().lower() in ("arm64", "aarch64") else "x86_64"
         if resolved_backend == "gcc":
             if not self.gcc.is_available:
                 raise RuntimeError("GCC backend selected, but neither ELF64 gcc nor canary-verified COFF compiler is available.")
@@ -616,7 +623,7 @@ class OmniRepoCompiler:
         }
         native_compilable_syms = _compute_native_compilable_set(compilable_ast_pool)
         from compiler.native_codegen import detect_host_simd_features
-        host_os_name = "windows" if sys.platform == "win32" else "linux"
+        host_os_name = "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "linux")
         host_avx512 = bool(
             effective_arch == "x86_64"
             and effective_os == host_os_name

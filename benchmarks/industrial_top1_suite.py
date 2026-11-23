@@ -142,11 +142,16 @@ def run_industrial_suite() -> Dict[str, Any]:
 
         compiler = OmniRepoCompiler()
         omni_out = os.path.join(td, "omni_kernels")
+        import platform as _plat
+        host_os = "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "linux")
+        host_arch = "arm64" if _plat.machine().lower() in ("arm64", "aarch64") else "x86_64"
         t0 = time.perf_counter()
         comp_res = compiler.compile_repositories(
             [repo_dir],
             output_path=omni_out,
             target_format="shared_lib",
+            target_os=host_os,
+            target_arch=host_arch,
             entry_export="omni_bench_dispatch",
             export_all=True,
         )
@@ -159,7 +164,7 @@ def run_industrial_suite() -> Dict[str, Any]:
         ref_compile_s: Optional[float] = None
         if cc:
             c_path = os.path.join(td, "ref_kernels.c")
-            ref_ext = ".dll" if sys.platform == "win32" else ".so"
+            ref_ext = ".dll" if sys.platform == "win32" else (".dylib" if sys.platform == "darwin" else ".so")
             ref_so = os.path.join(td, f"ref_kernels{ref_ext}")
             with open(c_path, "w", encoding="utf-8") as f:
                 f.write(_C_REFERENCE_SRC)
@@ -178,7 +183,7 @@ def run_industrial_suite() -> Dict[str, Any]:
             ("_crypto_fnv_mix_kernel", 2, 2000, crypto_fnv_mix_kernel(2000)),
         ]
 
-        if sys.platform in ("win32", "linux") and os.path.exists(omni_art):
+        if sys.platform in ("win32", "linux", "darwin") and os.path.exists(omni_art):
             omni_lib = ctypes.CDLL(omni_art)
             try:
                 dispatch_fn = getattr(omni_lib, "omni_bench_dispatch")
