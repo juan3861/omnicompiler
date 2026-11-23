@@ -631,6 +631,7 @@ class OmniRepoCompiler:
         smt_verified_rewrites = 0
         thin_lto_inlines = 0
         thin_lto_const_folds = 0
+        scev_reductions = 0
         vectorized_loops = 0
         promoted_stack_allocs = 0
         irc_coalesced_moves = 0
@@ -864,6 +865,14 @@ class OmniRepoCompiler:
                             thin_lto_const_folds += lto_stats.get("folded_constants", 0)
                         except Exception:
                             pass
+
+                    # 1.5 Scalar Evolution (SCEV) & Closed-Form Loop Reduction
+                    try:
+                        from compiler.scev_analyzer import SCEVAnalyzer
+                        ssa_fn, scev_stats = SCEVAnalyzer().analyze_function(ssa_fn)
+                        scev_reductions += scev_stats.get("closed_form_reductions", 0)
+                    except Exception:
+                        pass
 
                     # 2. Loop Auto-Vectorizer
                     try:
@@ -1180,6 +1189,7 @@ class OmniRepoCompiler:
                 "smt_verified_rewrites": smt_verified_rewrites,
                 "thin_lto_inlines": thin_lto_inlines,
                 "thin_lto_const_folds": thin_lto_const_folds,
+                "scev_reductions": scev_reductions,
                 "vectorized_loops": vectorized_loops,
                 "vla_simd_metadata": vla_meta_wasm,
                 "promoted_stack_allocs": promoted_stack_allocs,
@@ -1680,6 +1690,7 @@ class OmniRepoCompiler:
             "smt_verified_rewrites": smt_verified_rewrites,
             "thin_lto_inlines": thin_lto_inlines,
             "thin_lto_const_folds": thin_lto_const_folds,
+            "scev_reductions": scev_reductions,
             "vectorized_loops": vectorized_loops,
             "vla_simd_metadata": vla_simd_metadata,
             "promoted_stack_allocs": promoted_stack_allocs,

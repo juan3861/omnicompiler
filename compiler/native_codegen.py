@@ -20,6 +20,43 @@ from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar, ana
 from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator, IteratedRegisterCoalescingAllocator
 
 
+# ---------------------------------------------------------------------------
+# Hacker's Delight / Granlund-Montgomery Magic Multiplier for Fast Division
+# ---------------------------------------------------------------------------
+def compute_magic_signed_64(d: int) -> Tuple[int, int]:
+    """Compute Granlund-Montgomery/Hacker's Delight magic multiplier and shift for 64-bit signed division."""
+    assert d != 0 and abs(d) != 1
+    two63 = 1 << 63
+    ad = abs(d)
+    t = two63 + (1 if d < 0 else 0)
+    anc = t - 1 - (t % ad)
+    p = 63
+    q1 = two63 // anc
+    r1 = two63 - q1 * anc
+    q2 = two63 // ad
+    r2 = two63 - q2 * ad
+    while True:
+        p += 1
+        q1 = 2 * q1
+        r1 = 2 * r1
+        if r1 >= anc:
+            q1 += 1
+            r1 -= anc
+        q2 = 2 * q2
+        r2 = 2 * r2
+        if r2 >= ad:
+            q2 += 1
+            r2 -= ad
+        delta = ad - r2
+        if not (q1 < delta or (q1 == delta and r1 == 0)):
+            break
+    mag = q2 + 1
+    if d < 0:
+        mag = -mag
+    shift = p - 64
+    return mag, shift
+
+
 @dataclass
 class CodegenRelocation:
     offset: int
@@ -514,6 +551,18 @@ class X64CodeGenerator:
                 for op in inst.operands:
                     register_var(op)
 
+        # Map constant integers for fast reciprocal division
+        const_int_map: Dict[SSAVar, int] = {}
+        for b in fn.blocks:
+            for inst in b.instructions:
+                if inst.opcode.lower() == "const" and isinstance(inst.result, SSAVar):
+                    if inst.operands:
+                        c_val = inst.operands[0]
+                        if isinstance(c_val, int) and not isinstance(c_val, bool):
+                            const_int_map[inst.result] = c_val
+                        elif isinstance(c_val, str) and (c_val.isdigit() or (c_val.startswith("-") and c_val[1:].isdigit())):
+                            const_int_map[inst.result] = int(c_val)
+
         # Determine Leaf Register-Resident Mode vs General Stack-Frame Mode via George & Appel IRC
         alloca_insts = [inst for b in fn.blocks for inst in b.instructions if inst.opcode == "alloca"]
         has_alloca = len(alloca_insts) > 0
@@ -894,11 +943,112 @@ class X64CodeGenerator:
                     write_result_from_reg(inst.result, "rax")
 
                 elif op in ("div", "sdiv", "srem"):
-                    resolve_operand_to_reg(inst.operands[0], "rax")
-                    resolve_operand_to_reg(inst.operands[1], "r11")
-                    buf.emit(b"\x48\x99")          # cqo (sign-extend rax -> rdx:rax)
-                    buf.emit(b"\x49\xf7\xfb")      # idiv r11
-                    write_result_from_reg(inst.result, "rax" if op != "srem" else "rdx")
+                    def _get_const_int(operand: Any) -> Optional[int]:
+                        if isinstance(operand, int) and not isinstance(operand, bool):
+                            return operand
+                        if isinstance(operand, str):
+                            s = operand.strip()
+                            if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+                                return int(s)
+                        if isinstance(operand, SSAVar):
+                            return const_int_map.get(operand)
+                        return None
+
+                    c_div = _get_const_int(inst.operands[1]) if len(inst.operands) > 1 else None
+                    if c_div is not None and c_div != 0:
+                        if c_div == 1:
+                            resolve_operand_to_reg(inst.operands[0], "rax")
+                            if op == "srem":
+                                buf.emit(b"\x48\x31\xc0")  # xor rax, rax
+                            write_result_from_reg(inst.result, "rax")
+                        elif c_div == -1:
+                            resolve_operand_to_reg(inst.operands[0], "rax")
+                            if op == "srem":
+                                buf.emit(b"\x48\x31\xc0")  # xor rax, rax
+                            else:
+                                buf.emit(b"\x48\xf7\xd8")  # neg rax
+                            write_result_from_reg(inst.result, "rax")
+                        elif c_div > 1 and (c_div & (c_div - 1)) == 0:
+                            # Fast Power of 2 Division (2, 4, 8, 16, ...)
+                            k = c_div.bit_length() - 1
+                            resolve_operand_to_reg(inst.operands[0], "rax")
+                            if k == 1:
+                                if op in ("div", "sdiv"):
+                                    buf.emit(b"\x48\x89\xc1")          # mov rcx, rax
+                                    buf.emit(b"\x48\xc1\xe9\x3f")      # shr rcx, 63
+                                    buf.emit(_x64_alu_rr(0x01, "rax", "rcx")) # add rax, rcx
+                                    buf.emit(b"\x48\xd1\xf8")          # sar rax, 1
+                                    write_result_from_reg(inst.result, "rax")
+                                else:
+                                    buf.emit(b"\x48\x89\xc2")          # mov rdx, rax
+                                    buf.emit(b"\x48\x89\xc1")          # mov rcx, rax
+                                    buf.emit(b"\x48\xc1\xe9\x3f")      # shr rcx, 63
+                                    buf.emit(_x64_alu_rr(0x01, "rax", "rcx")) # add rax, rcx
+                                    buf.emit(b"\x48\xd1\xf8")          # sar rax, 1 (rax = q)
+                                    buf.emit(b"\x48\xd1\xe0")          # shl rax, 1 (rax = q * 2)
+                                    buf.emit(_x64_alu_rr(0x29, "rdx", "rax")) # sub rdx, rax (rdx = x - q*2)
+                                    buf.emit(_x64_mov_rr("rax", "rdx"))       # mov rax, rdx
+                                    write_result_from_reg(inst.result, "rax")
+                            else:
+                                if op in ("div", "sdiv"):
+                                    buf.emit(b"\x48\x89\xc1")          # mov rcx, rax
+                                    buf.emit(b"\x48\xc1\xf9\x3f")      # sar rcx, 63
+                                    buf.emit(bytes([0x48, 0xc1, 0xe9, 64 - k])) # shr rcx, 64 - k
+                                    buf.emit(_x64_alu_rr(0x01, "rax", "rcx"))   # add rax, rcx
+                                    buf.emit(bytes([0x48, 0xc1, 0xf8, k]))       # sar rax, k
+                                    write_result_from_reg(inst.result, "rax")
+                                else:
+                                    buf.emit(b"\x48\x89\xc2")          # mov rdx, rax
+                                    buf.emit(b"\x48\x89\xc1")          # mov rcx, rax
+                                    buf.emit(b"\x48\xc1\xf9\x3f")      # sar rcx, 63
+                                    buf.emit(bytes([0x48, 0xc1, 0xe9, 64 - k])) # shr rcx, 64 - k
+                                    buf.emit(_x64_alu_rr(0x01, "rax", "rcx"))   # add rax, rcx
+                                    buf.emit(bytes([0x48, 0xc1, 0xf8, k]))       # sar rax, k
+                                    buf.emit(bytes([0x48, 0xc1, 0xe0, k]))       # shl rax, k
+                                    buf.emit(_x64_alu_rr(0x29, "rdx", "rax"))   # sub rdx, rax
+                                    buf.emit(_x64_mov_rr("rax", "rdx"))         # mov rax, rdx
+                                    write_result_from_reg(inst.result, "rax")
+                        elif c_div > 0:
+                            # Fast Granlund-Montgomery Reciprocal Division
+                            M_u, s = compute_magic_signed_64(c_div)
+                            M_signed = M_u if M_u < (1 << 63) else M_u - (1 << 64)
+                            resolve_operand_to_reg(inst.operands[0], "rax")
+                            buf.emit(_x64_mov_rr("rcx", "rax"))         # save original x in rcx
+                            buf.emit(_x64_mov_ri("r11", M_signed))
+                            buf.emit(b"\x49\xf7\xeb")                   # imul r11 -> rdx:rax
+                            if M_u >= (1 << 63):
+                                buf.emit(_x64_alu_rr(0x01, "rdx", "rcx")) # add rdx, rcx
+                            if s > 0:
+                                if s == 1:
+                                    buf.emit(b"\x48\xd1\xfa")           # sar rdx, 1
+                                else:
+                                    buf.emit(bytes([0x48, 0xc1, 0xfa, s])) # sar rdx, s
+                            buf.emit(_x64_mov_rr("rax", "rcx"))         # copy original x to rax
+                            buf.emit(b"\x48\xc1\xe8\x3f")               # shr rax, 63
+                            buf.emit(_x64_alu_rr(0x01, "rdx", "rax"))   # add rdx, rax (rdx is quotient q)
+                            if op == "srem":
+                                buf.emit(_x64_mov_ri("r11", c_div))
+                                buf.emit(_x64_imul_rr("rdx", "r11"))      # rdx = q * c_div
+                                buf.emit(_x64_alu_rr(0x29, "rcx", "rdx")) # sub rcx, rdx (rcx = x - q*D)
+                                buf.emit(_x64_mov_rr("rax", "rcx"))
+                                write_result_from_reg(inst.result, "rax")
+                            else:
+                                buf.emit(_x64_mov_rr("rax", "rdx"))
+                                write_result_from_reg(inst.result, "rax")
+                        else:
+                            # Dynamic / Negative Divisor Fallback
+                            resolve_operand_to_reg(inst.operands[0], "rax")
+                            resolve_operand_to_reg(inst.operands[1], "r11")
+                            buf.emit(b"\x48\x99")          # cqo (sign-extend rax -> rdx:rax)
+                            buf.emit(b"\x49\xf7\xfb")      # idiv r11
+                            write_result_from_reg(inst.result, "rax" if op != "srem" else "rdx")
+                    else:
+                        # Dynamic Divisor Fallback
+                        resolve_operand_to_reg(inst.operands[0], "rax")
+                        resolve_operand_to_reg(inst.operands[1], "r11")
+                        buf.emit(b"\x48\x99")          # cqo (sign-extend rax -> rdx:rax)
+                        buf.emit(b"\x49\xf7\xfb")      # idiv r11
+                        write_result_from_reg(inst.result, "rax" if op != "srem" else "rdx")
 
                 elif op == "neg":
                     resolve_operand_to_reg(inst.operands[0], "rax")
