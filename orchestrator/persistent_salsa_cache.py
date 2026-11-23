@@ -124,5 +124,25 @@ class PersistentSalsaCache:
             finally:
                 conn.close()
 
+    def attach_cas(self, cas: Any) -> None:
+        self._cas = cas
+
+    def put_cas_artifact(self, key_str: str, raw_bytes: bytes) -> Optional[str]:
+        cas = getattr(self, "_cas", None)
+        if cas is None:
+            return None
+        digest = cas.put_blob(raw_bytes)
+        self.put_compiled_obj(f"cas::{key_str}", digest)
+        return digest
+
+    def get_cas_artifact(self, key_str: str) -> Optional[bytes]:
+        cas = getattr(self, "_cas", None)
+        if cas is None:
+            return None
+        digest = self.get_compiled_obj(f"cas::{key_str}")
+        if not digest or not cas.has_blob(digest):
+            return None
+        return cas.get_blob(digest)
+
     def close(self) -> None:
         pass
