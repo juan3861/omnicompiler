@@ -61,3 +61,31 @@ class PackagerEngine:
             evidence_file=evidence_file,
             created_at=datetime.now(timezone.utc).isoformat()
         )
+
+    def generate_slsa_provenance(
+        self,
+        subjects,
+        action_spec=None,
+        action_result=None,
+        cas=None,
+        sbom=None,
+        signer_seed=None,
+        out_path: str = None,
+    ):
+        """Produces a cryptographically signed in-toto v1 / SLSA Level 3 provenance attestation."""
+        import json
+        from packaging.slsa_provenance import SLSAProvenanceGenerator
+
+        gen = SLSAProvenanceGenerator(signer_seed=signer_seed)
+        envelope = gen.generate_and_sign(
+            subjects=subjects,
+            action_spec=action_spec,
+            action_result=action_result,
+            cas=cas,
+            sbom=sbom,
+        )
+        if out_path:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(envelope, sort_keys=True) + "\n")
+        return envelope, gen.public_key
