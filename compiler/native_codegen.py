@@ -11,6 +11,7 @@ Compiles Turing-complete multi-block `SSAFunction`s directly into executable mac
    - Full multi-block CFG lowering (`ADD`, `SUB`, `MUL`, `SDIV`, `MSUB`, `LSLV`, `ASRV`, `CMP`+`CSET`, `CSEL`, `CBNZ`/`B`, `BL` `ARM64_CALL26` relocations, `STP/LDP` + `RET`).
 """
 
+import heapq
 import sys
 import struct
 from dataclasses import dataclass, field
@@ -18,6 +19,112 @@ from typing import Dict, List, Tuple, Optional, Any, Set
 
 from compiler.ssa_ir import SSAFunction, BasicBlock, SSAInstruction, SSAVar, analyze_ssa_constant_offsets, is_contiguous_stride
 from compiler.regalloc_graph_coloring import ChaitinBriggsAllocator, IteratedRegisterCoalescingAllocator
+
+
+def _schedule_basic_block_instructions(
+    instructions: List[SSAInstruction],
+    var_use_counts: Optional[Dict[SSAVar, int]] = None,
+) -> List[SSAInstruction]:
+    """
+    Local Critical-Path DAG List Scheduler for SSA basic blocks.
+    Reorders pure arithmetic windows between memory/control-flow barriers to expose
+    instruction-level parallelism (hiding multi-cycle `mul`/`sdiv` latencies) while
+    strictly preserving RAW dependencies and single-use `cmp_* + br_cond` fusion pairs.
+    """
+    if len(instructions) < 4:
+        return instructions
+
+    _PURE_SCHED_OPS = frozenset({
+        "const", "fconst", "mov",
+        "add", "sub", "mul", "imul", "div", "sdiv", "srem",
+        "and", "or", "xor", "shl", "shr", "sar", "neg", "not",
+        "fadd", "fsub", "fmul", "fdiv", "fneg", "sitofp", "fptosi",
+        "cmp_eq", "cmp_ne", "cmp_lt", "cmp_le", "cmp_gt", "cmp_ge",
+    })
+    _LATENCY_TABLE = {
+        "div": 6, "sdiv": 6, "srem": 6, "fdiv": 6,
+        "mul": 3, "imul": 3, "fmul": 3, "fadd": 3, "fsub": 3,
+    }
+
+    out: List[SSAInstruction] = []
+    n = len(instructions)
+    i = 0
+    while i < n:
+        ins = instructions[i]
+        op = ins.opcode.lower()
+        # Leave terminators, memory/call ops, metadata, and pinned cmp+br_cond anchors as barriers
+        is_fused_cmp = (
+            op.startswith("cmp_")
+            and i + 1 < n
+            and instructions[i + 1].opcode.lower() == "br_cond"
+            and isinstance(ins.result, SSAVar)
+            and (var_use_counts is None or var_use_counts.get(ins.result, 0) == 1)
+        )
+        if op not in _PURE_SCHED_OPS or is_fused_cmp:
+            out.append(ins)
+            i += 1
+            continue
+
+        # Collect maximal pure arithmetic window
+        j = i
+        while j < n:
+            op_j = instructions[j].opcode.lower()
+            is_fused_j = (
+                op_j.startswith("cmp_")
+                and j + 1 < n
+                and instructions[j + 1].opcode.lower() == "br_cond"
+                and isinstance(instructions[j].result, SSAVar)
+                and (var_use_counts is None or var_use_counts.get(instructions[j].result, 0) == 1)
+            )
+            if op_j not in _PURE_SCHED_OPS or is_fused_j:
+                break
+            j += 1
+
+        win = instructions[i:j]
+        i = j
+        # Skip reordering if < 3 instructions or if window has no multi-cycle ops or matches packed tree pattern
+        has_multi_cycle = any(w.opcode.lower() in _LATENCY_TABLE for w in win)
+        if len(win) < 3 or not has_multi_cycle:
+            out.extend(win)
+            continue
+
+        # Build local RAW DAG
+        wlen = len(win)
+        local_def: Dict[SSAVar, int] = {}
+        preds: List[Set[int]] = [set() for _ in range(wlen)]
+        succs: List[List[int]] = [[] for _ in range(wlen)]
+        for idx_w, w_ins in enumerate(win):
+            for op_item in w_ins.operands:
+                if isinstance(op_item, SSAVar) and op_item in local_def:
+                    p_idx = local_def[op_item]
+                    if p_idx not in preds[idx_w]:
+                        preds[idx_w].add(p_idx)
+                        succs[p_idx].append(idx_w)
+            if isinstance(w_ins.result, SSAVar):
+                local_def[w_ins.result] = idx_w
+
+        # Compute critical path latency bottom-up
+        cp = [0] * wlen
+        for idx_w in range(wlen - 1, -1, -1):
+            lat = _LATENCY_TABLE.get(win[idx_w].opcode.lower(), 1)
+            cp[idx_w] = lat + (max(cp[s] for s in succs[idx_w]) if succs[idx_w] else 0)
+
+        in_deg = [len(preds[k]) for k in range(wlen)]
+        ready = [(-cp[k], k) for k in range(wlen) if in_deg[k] == 0]
+        heapq.heapify(ready)
+        scheduled: List[SSAInstruction] = []
+        while ready:
+            _, cur = heapq.heappop(ready)
+            scheduled.append(win[cur])
+            for s in succs[cur]:
+                in_deg[s] -= 1
+                if in_deg[s] == 0:
+                    heapq.heappush(ready, (-cp[s], s))
+        if len(scheduled) == wlen:
+            out.extend(scheduled)
+        else:
+            out.extend(win)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +252,10 @@ class X64LabelBuffer:
         self.emit(b"\x0f\x85\x00\x00\x00\x00")
         self.fixups.append((len(self.code) - 4, label))
 
+    def jcc(self, jcc_opcode2: int, label: str):
+        self.emit(bytes([0x0F, jcc_opcode2, 0x00, 0x00, 0x00, 0x00]))
+        self.fixups.append((len(self.code) - 4, label))
+
     def call_label(self, label: str):
         self.emit(b"\xe8\x00\x00\x00\x00")
         self.fixups.append((len(self.code) - 4, label))
@@ -236,12 +347,33 @@ def _x64_alu_rr(opcode_byte: int, dst: str, src: str) -> bytes:
     return bytes([rex, opcode_byte, modrm])
 
 
+def _x64_alu_ri32(ext_reg: int, dst: str, imm: int) -> bytes:
+    """Emit add(0)/or(1)/and(4)/sub(5)/xor(6)/cmp(7) dst, imm8/imm32."""
+    d_hi, d_lo = X64_REGS[dst]
+    rex = 0x48 | d_hi
+    modrm = 0xC0 | (ext_reg << 3) | d_lo
+    if -128 <= imm <= 127:
+        return bytes([rex, 0x83, modrm]) + struct.pack("<b", imm)
+    return bytes([rex, 0x81, modrm]) + struct.pack("<i", imm)
+
+
 def _x64_imul_rr(dst: str, src: str) -> bytes:
     d_hi, d_lo = X64_REGS[dst]
     s_hi, s_lo = X64_REGS[src]
     rex = 0x48 | (d_hi << 2) | s_hi
     modrm = 0xC0 | (d_lo << 3) | s_lo
     return bytes([rex, 0x0F, 0xAF, modrm])
+
+
+def _x64_imul_rri32(dst: str, src: str, imm: int) -> bytes:
+    """Emit 3-operand imul dst, src, imm8/imm32."""
+    d_hi, d_lo = X64_REGS[dst]
+    s_hi, s_lo = X64_REGS[src]
+    rex = 0x48 | (d_hi << 2) | s_hi
+    modrm = 0xC0 | (d_lo << 3) | s_lo
+    if -128 <= imm <= 127:
+        return bytes([rex, 0x6B, modrm]) + struct.pack("<b", imm)
+    return bytes([rex, 0x69, modrm]) + struct.pack("<i", imm)
 
 
 def _x64_test_rr(reg: str) -> bytes:
@@ -551,10 +683,21 @@ class X64CodeGenerator:
                 for op in inst.operands:
                     register_var(op)
 
-        # Map constant integers for fast reciprocal division
+        # Map constant integers for fast reciprocal division & immediate ALU folding
         const_int_map: Dict[SSAVar, int] = {}
+        var_use_counts: Dict[SSAVar, int] = {}
         for b in fn.blocks:
+            for phi in b.phi_nodes:
+                for op_item in phi.operands:
+                    if isinstance(op_item, SSAVar):
+                        var_use_counts[op_item] = var_use_counts.get(op_item, 0) + 1
+                for _, pv in phi.phi_incoming:
+                    if isinstance(pv, SSAVar):
+                        var_use_counts[pv] = var_use_counts.get(pv, 0) + 1
             for inst in b.instructions:
+                for op_item in inst.operands:
+                    if isinstance(op_item, SSAVar):
+                        var_use_counts[op_item] = var_use_counts.get(op_item, 0) + 1
                 if inst.opcode.lower() == "const" and isinstance(inst.result, SSAVar):
                     if inst.operands:
                         c_val = inst.operands[0]
@@ -562,6 +705,11 @@ class X64CodeGenerator:
                             const_int_map[inst.result] = c_val
                         elif isinstance(c_val, str) and (c_val.isdigit() or (c_val.startswith("-") and c_val[1:].isdigit())):
                             const_int_map[inst.result] = int(c_val)
+
+        # Pre-allocation Critical-Path DAG Scheduling (preserves liveness invariants!)
+        orig_block_insts = [(b, b.instructions) for b in fn.blocks]
+        for b, orig_ins in orig_block_insts:
+            b.instructions = _schedule_basic_block_instructions(orig_ins, var_use_counts)
 
         # Determine Leaf Register-Resident Mode vs General Stack-Frame Mode via George & Appel IRC
         alloca_insts = [inst for b in fn.blocks for inst in b.instructions if inst.opcode == "alloca"]
@@ -575,32 +723,74 @@ class X64CodeGenerator:
                 for inst in b.instructions
             )
         )
-        alloc = IteratedRegisterCoalescingAllocator(
-            LEAF_ALLOC_REGS,
-            abi="win64" if self.is_windows else "sysv64",
-        ).allocate(fn)
-        leaf_mode = (
+        has_mem_off = any(
+            ins.opcode.lower() in ("load_off", "store_off")
+            for b in fn.blocks
+            for ins in b.instructions
+        )
+        reg_eligible = (
             (not has_calls)
             and (not has_alloca)
             and (not has_f64)
-            and alloc["success"]
             and len(fn.params) <= len(self.param_regs)
         )
+
+        # Identify imm32-foldable constants before register allocation so they don't consume registers
+        _FOLDABLE_IMM_OPS = frozenset({
+            "add", "sub", "and", "or", "xor", "mul", "imul",
+            "div", "sdiv", "srem", *self.SETCC_BYTES.keys(),
+        })
+        inlined_consts: Set[SSAVar] = set()
+        if reg_eligible and (not has_mem_off) and const_int_map:
+            candidates = {
+                v for v, cval in const_int_map.items()
+                if -0x80000000 <= cval <= 0x7FFFFFFF
+            }
+            for b in fn.blocks:
+                for phi in b.phi_nodes:
+                    for op_item in phi.operands:
+                        candidates.discard(op_item)
+                    for _, pv in phi.phi_incoming:
+                        candidates.discard(pv)
+                for ins in b.instructions:
+                    iop = ins.opcode.lower()
+                    for idx_o, op_item in enumerate(ins.operands):
+                        if not isinstance(op_item, SSAVar) or op_item not in candidates:
+                            continue
+                        if iop not in _FOLDABLE_IMM_OPS or idx_o != 1:
+                            candidates.discard(op_item)
+            inlined_consts = candidates
+
+        alloc = IteratedRegisterCoalescingAllocator(
+            LEAF_ALLOC_REGS,
+            abi="win64" if self.is_windows else "sysv64",
+        ).allocate(fn, ignore_vars=inlined_consts if reg_eligible else None)
 
         reg_map: Dict[SSAVar, str] = {}
         slot_map: Dict[SSAVar, int] = {}
         alloca_map: Dict[SSAVar, int] = {}
         used_callee_saved: List[str] = []
 
-        if leaf_mode:
+        if reg_eligible and (alloc["success"] or not has_mem_off):
             reg_map = dict(alloc["color_map"])
-            for v in all_vars:
-                if v not in reg_map:
-                    reg_map[v] = "r8"
+            spilled_vars = [
+                v for v in all_vars
+                if v not in reg_map and v not in inlined_consts
+            ]
+            # Wait: only enter leaf_mode / pure_leaf_mode if colored; any uncolored go to slot_map!
+            leaf_mode = True
+            pure_leaf_mode = (len(spilled_vars) == 0)
             used_regs = set(reg_map.values())
             used_callee_saved = [r for r in self.callee_saved_pool if r in used_regs]
-            frame_size = 0
+            if pure_leaf_mode:
+                frame_size = 0
+            else:
+                for idx, v in enumerate(spilled_vars):
+                    slot_map[v] = -8 * (idx + 1)
+                frame_size = ((len(spilled_vars) * 8 + 15) // 16) * 16
         else:
+            leaf_mode = False
+            pure_leaf_mode = False
             for idx, v in enumerate(all_vars):
                 slot_map[v] = -8 * (idx + 1)
             current_disp = len(all_vars) * 8
@@ -624,7 +814,7 @@ class X64CodeGenerator:
         buf.mark(".L_func_entry")
 
         # --- Emit Prologue ---
-        if leaf_mode:
+        if pure_leaf_mode:
             for r in used_callee_saved:
                 buf.emit(_x64_push(r))
             prologue_size = len(buf.code)
@@ -636,6 +826,30 @@ class X64CodeGenerator:
                     param_copies.append((reg_map[p_var], self.param_regs[idx]))
             for dst_r, src_r in _sequentialize_parallel_copies(param_copies, "r11"):
                 buf.emit(_x64_mov_rr(dst_r, src_r))
+        elif leaf_mode:
+            # Hybrid Register + Spill Mode: rbp frame for spilled_vars + callee-saved pushes + reg params
+            buf.emit(b"\x55")              # push rbp
+            buf.emit(b"\x48\x89\xe5")      # mov rbp, rsp
+            if frame_size > 0:
+                if frame_size <= 127:
+                    buf.emit(b"\x48\x83\xec" + struct.pack("<B", frame_size))
+                else:
+                    buf.emit(b"\x48\x81\xec" + struct.pack("<I", frame_size))
+            for r in used_callee_saved:
+                buf.emit(_x64_push(r))
+            prologue_size = len(buf.code)
+            param_copies_h: List[Tuple[Any, Any]] = []
+            for idx, p_name in enumerate(fn.params):
+                p_var = SSAVar(p_name, 0)
+                if p_var in reg_map:
+                    param_copies_h.append((("reg", reg_map[p_var]), ("reg", self.param_regs[idx])))
+                elif p_var in slot_map:
+                    param_copies_h.append((("slot", slot_map[p_var]), ("reg", self.param_regs[idx])))
+            for dst_loc, src_loc in _sequentialize_parallel_copies(param_copies_h, ("reg", "r11")):
+                if dst_loc[0] == "reg":
+                    buf.emit(_x64_mov_rr(dst_loc[1], src_loc[1]))
+                else:
+                    buf.emit(_x64_store_rbp(dst_loc[1], src_loc[1]))
         else:
             buf.emit(b"\x55")              # push rbp
             buf.emit(b"\x48\x89\xe5")      # mov rbp, rsp
@@ -704,9 +918,18 @@ class X64CodeGenerator:
                 clean = s.lstrip("%")
                 op = SSAVar(clean, 0)
             if isinstance(op, SSAVar):
+                if op in inlined_consts and op in const_int_map:
+                    buf.emit(_x64_mov_ri(target_reg, const_int_map[op]))
+                    return
                 if leaf_mode:
-                    src_r = reg_map.get(op, "r8")
-                    buf.emit(_x64_mov_rr(target_reg, src_r))
+                    if op in reg_map:
+                        buf.emit(_x64_mov_rr(target_reg, reg_map[op]))
+                        return
+                    disp = slot_map.get(op)
+                    if disp is not None:
+                        buf.emit(_x64_load_rbp(target_reg, disp))
+                        return
+                    buf.emit(_x64_mov_rr(target_reg, "r8"))
                 else:
                     disp = slot_map.get(op)
                     if disp is not None:
@@ -716,12 +939,28 @@ class X64CodeGenerator:
                 return
             buf.emit(_x64_mov_ri(target_reg, 0))
 
+        def _get_imm32(op: Any) -> Optional[int]:
+            v = None
+            if isinstance(op, int) and not isinstance(op, bool):
+                v = op
+            elif isinstance(op, str):
+                s = op.strip()
+                if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+                    v = int(s)
+            elif isinstance(op, SSAVar) and op in const_int_map:
+                v = const_int_map[op]
+            if v is not None and -0x80000000 <= v <= 0x7FFFFFFF:
+                return v
+            return None
+
         def write_result_from_reg(res_var: Optional[SSAVar], src_reg: str) -> None:
             if res_var is None:
                 return
             if leaf_mode:
-                dst_r = reg_map[res_var]
-                buf.emit(_x64_mov_rr(dst_r, src_reg))
+                if res_var in reg_map:
+                    buf.emit(_x64_mov_rr(reg_map[res_var], src_reg))
+                elif res_var in slot_map:
+                    buf.emit(_x64_store_rbp(slot_map[res_var], src_reg))
             else:
                 buf.emit(_x64_store_rbp(slot_map[res_var], src_reg))
 
@@ -742,10 +981,26 @@ class X64CodeGenerator:
                 if chosen_val is None:
                     chosen_val = 0
 
-                if leaf_mode:
+                if pure_leaf_mode:
                     dst_loc = reg_map[phi.result]
                     if isinstance(chosen_val, SSAVar):
                         src_loc: Any = reg_map[chosen_val]
+                    elif isinstance(chosen_val, float):
+                        src_loc = ("imm", _f64_bits(chosen_val))
+                    elif isinstance(chosen_val, int):
+                        src_loc = ("imm", chosen_val)
+                    else:
+                        src_loc = ("imm", 0)
+                    copies.append((dst_loc, src_loc))
+                elif leaf_mode:
+                    dst_loc = ("reg", reg_map[phi.result]) if phi.result in reg_map else ("slot", slot_map[phi.result])
+                    if isinstance(chosen_val, SSAVar):
+                        if chosen_val in reg_map:
+                            src_loc = ("reg", reg_map[chosen_val])
+                        elif chosen_val in slot_map:
+                            src_loc = ("slot", slot_map[chosen_val])
+                        else:
+                            src_loc = ("imm", const_int_map.get(chosen_val, 0))
                     elif isinstance(chosen_val, float):
                         src_loc = ("imm", _f64_bits(chosen_val))
                     elif isinstance(chosen_val, int):
@@ -765,9 +1020,9 @@ class X64CodeGenerator:
                         src_loc = ("imm", 0)
                     copies.append((dst_loc, src_loc))
 
-            seq = _sequentialize_parallel_copies(copies, "r11" if leaf_mode else ("reg", "r11"))
+            seq = _sequentialize_parallel_copies(copies, "r11" if pure_leaf_mode else ("reg", "r11"))
             for dst_loc, src_loc in seq:
-                if leaf_mode:
+                if pure_leaf_mode:
                     if isinstance(src_loc, tuple) and src_loc[0] == "imm":
                         buf.emit(_x64_mov_ri(dst_loc, src_loc[1]))
                     else:
@@ -862,9 +1117,10 @@ class X64CodeGenerator:
         # --- Emit Basic Blocks ---
         for idx_b, block in enumerate(fn.blocks):
             buf.mark(f".L_bb_{block.name}")
+            block_insts = block.instructions
             blk_def_map: Dict[SSAVar, SSAInstruction] = {
                 b_ins.result: b_ins
-                for b_ins in block.instructions
+                for b_ins in block_insts
                 if isinstance(b_ins.result, SSAVar)
             }
 
@@ -881,8 +1137,8 @@ class X64CodeGenerator:
                 return is_contiguous_stride(fn_add_const, offs, 4)
 
             inst_idx = 0
-            while inst_idx < len(block.instructions):
-                inst = block.instructions[inst_idx]
+            while inst_idx < len(block_insts):
+                inst = block_insts[inst_idx]
                 inst_idx += 1
                 buf.record_line(inst.source_line)
                 op = inst.opcode.lower()
@@ -891,13 +1147,18 @@ class X64CodeGenerator:
                     continue
 
                 elif op in ("const", "fconst", "mov"):
-                    resolve_operand_to_reg(inst.operands[0], "rax")
-                    write_result_from_reg(inst.result, "rax")
+                    if op == "const" and isinstance(inst.result, SSAVar) and inst.result in inlined_consts:
+                        continue
+                    if leaf_mode and isinstance(inst.result, SSAVar) and inst.result in reg_map:
+                        resolve_operand_to_reg(inst.operands[0], reg_map[inst.result])
+                    else:
+                        resolve_operand_to_reg(inst.operands[0], "rax")
+                        write_result_from_reg(inst.result, "rax")
 
                 elif op in ("add", "sub", "and", "or", "xor"):
-                    if op in ("add", "and", "or", "xor") and inst_idx + 1 < len(block.instructions):
-                        ins_hi = block.instructions[inst_idx]
-                        ins_top = block.instructions[inst_idx + 1]
+                    if op in ("add", "and", "or", "xor") and inst_idx + 1 < len(block_insts):
+                        ins_hi = block_insts[inst_idx]
+                        ins_top = block_insts[inst_idx + 1]
                         if (
                             ins_hi.opcode.lower() == op
                             and ins_top.opcode.lower() == op
@@ -930,13 +1191,61 @@ class X64CodeGenerator:
                             buf.record_line(ins_top.source_line)
                             inst_idx += 2
                             continue
+
+                    alu_byte = {"add": 0x01, "sub": 0x29, "and": 0x21, "or": 0x09, "xor": 0x31}[op]
+                    alu_ext = {"add": 0, "or": 1, "and": 4, "sub": 5, "xor": 6}[op]
+                    if leaf_mode and isinstance(inst.result, SSAVar) and inst.result in reg_map:
+                        dst_r = reg_map[inst.result]
+                        op0, op1 = inst.operands[0], inst.operands[1]
+                        c_imm1 = _get_imm32(op1)
+                        c_imm0 = _get_imm32(op0) if op != "sub" else None
+                        if c_imm1 is None and c_imm0 is not None:
+                            op0, op1, c_imm1 = op1, op0, c_imm0
+                        if c_imm1 is not None and isinstance(op0, SSAVar) and op0 in reg_map and op0 not in inlined_consts:
+                            buf.emit(_x64_mov_rr(dst_r, reg_map[op0]))
+                            buf.emit(_x64_alu_ri32(alu_ext, dst_r, c_imm1))
+                            continue
+                        if (
+                            isinstance(op0, SSAVar) and op0 in reg_map and op0 not in inlined_consts
+                            and isinstance(op1, SSAVar) and op1 in reg_map and op1 not in inlined_consts
+                        ):
+                            r0, r1 = reg_map[op0], reg_map[op1]
+                            if dst_r != r1:
+                                buf.emit(_x64_mov_rr(dst_r, r0))
+                                buf.emit(_x64_alu_rr(alu_byte, dst_r, r1))
+                                continue
+                            elif op != "sub":
+                                # dst_r == r1 and op is commutative: op dst_r, r0!
+                                buf.emit(_x64_alu_rr(alu_byte, dst_r, r0))
+                                continue
                     resolve_operand_to_reg(inst.operands[0], "rax")
                     resolve_operand_to_reg(inst.operands[1], "r11")
-                    alu_byte = {"add": 0x01, "sub": 0x29, "and": 0x21, "or": 0x09, "xor": 0x31}[op]
                     buf.emit(_x64_alu_rr(alu_byte, "rax", "r11"))
                     write_result_from_reg(inst.result, "rax")
 
                 elif op in ("mul", "imul"):
+                    if leaf_mode and isinstance(inst.result, SSAVar) and inst.result in reg_map:
+                        dst_r = reg_map[inst.result]
+                        op0, op1 = inst.operands[0], inst.operands[1]
+                        c_imm1 = _get_imm32(op1)
+                        c_imm0 = _get_imm32(op0)
+                        if c_imm1 is None and c_imm0 is not None:
+                            op0, op1, c_imm1 = op1, op0, c_imm0
+                        if c_imm1 is not None and isinstance(op0, SSAVar) and op0 in reg_map and op0 not in inlined_consts:
+                            buf.emit(_x64_imul_rri32(dst_r, reg_map[op0], c_imm1))
+                            continue
+                        if (
+                            isinstance(op0, SSAVar) and op0 in reg_map and op0 not in inlined_consts
+                            and isinstance(op1, SSAVar) and op1 in reg_map and op1 not in inlined_consts
+                        ):
+                            r0, r1 = reg_map[op0], reg_map[op1]
+                            if dst_r != r1:
+                                buf.emit(_x64_mov_rr(dst_r, r0))
+                                buf.emit(_x64_imul_rr(dst_r, r1))
+                                continue
+                            else:
+                                buf.emit(_x64_imul_rr(dst_r, r0))
+                                continue
                     resolve_operand_to_reg(inst.operands[0], "rax")
                     resolve_operand_to_reg(inst.operands[1], "r11")
                     buf.emit(_x64_imul_rr("rax", "r11"))
@@ -1072,17 +1381,68 @@ class X64CodeGenerator:
                     write_result_from_reg(inst.result, "rax")
 
                 elif op in self.SETCC_BYTES:
-                    resolve_operand_to_reg(inst.operands[0], "rax")
-                    resolve_operand_to_reg(inst.operands[1], "r11")
-                    buf.emit(_x64_alu_rr(0x39, "rax", "r11"))  # cmp rax, r11
-                    buf.emit(bytes([0x0F, self.SETCC_BYTES[op], 0xC0]))  # setcc al
-                    buf.emit(b"\x48\x0f\xb6\xc0")              # movzx rax, al
-                    write_result_from_reg(inst.result, "rax")
+                    op0, op1 = inst.operands[0], inst.operands[1]
+                    def _emit_cmp(lhs: Any, rhs: Any) -> None:
+                        c_imm1 = _get_imm32(rhs)
+                        if (
+                            leaf_mode
+                            and isinstance(lhs, SSAVar) and lhs in reg_map and lhs not in inlined_consts
+                        ):
+                            if c_imm1 is not None:
+                                buf.emit(_x64_alu_ri32(7, reg_map[lhs], c_imm1))
+                                return
+                            if isinstance(rhs, SSAVar) and rhs in reg_map and rhs not in inlined_consts:
+                                buf.emit(_x64_alu_rr(0x39, reg_map[lhs], reg_map[rhs]))
+                                return
+                        resolve_operand_to_reg(lhs, "rax")
+                        if c_imm1 is not None:
+                            buf.emit(_x64_alu_ri32(7, "rax", c_imm1))
+                        else:
+                            resolve_operand_to_reg(rhs, "r11")
+                            buf.emit(_x64_alu_rr(0x39, "rax", "r11"))
+
+                    # Macro-op fusion: single-use cmp_* immediately followed by br_cond
+                    fused_br = (
+                        block_insts[inst_idx]
+                        if (
+                            inst_idx < len(block_insts)
+                            and block_insts[inst_idx].opcode.lower() == "br_cond"
+                            and isinstance(inst.result, SSAVar)
+                            and block_insts[inst_idx].operands
+                            and block_insts[inst_idx].operands[0] == inst.result
+                            and var_use_counts.get(inst.result, 0) == 1
+                        )
+                        else None
+                    )
+                    if fused_br is not None:
+                        inst_idx += 1
+                        buf.record_line(fused_br.source_line)
+                        _emit_cmp(op0, op1)
+                        true_name, false_name = str(fused_br.operands[1]), str(fused_br.operands[2])
+                        next_blk_name = fn.blocks[idx_b + 1].name if (idx_b + 1 < len(fn.blocks)) else None
+                        true_bb = block_map.get(true_name)
+                        if true_name == next_blk_name and (true_bb is None or not true_bb.phi_nodes):
+                            inv_jcc = (self.SETCC_BYTES[op] ^ 0x01) - 0x10
+                            f_lbl = branch_target_label(block.name, false_name)
+                            buf.jcc(inv_jcc, f_lbl)
+                        else:
+                            t_lbl = branch_target_label(block.name, true_name)
+                            buf.jcc(self.SETCC_BYTES[op] - 0x10, t_lbl)
+                            false_bb = block_map.get(false_name)
+                            if false_bb is not None and len(false_bb.phi_nodes) > 0:
+                                emit_phi_copies_for_edge(block.name, false_bb)
+                            if next_blk_name != false_name:
+                                buf.jmp(f".L_bb_{false_name}")
+                    else:
+                        _emit_cmp(op0, op1)
+                        buf.emit(bytes([0x0F, self.SETCC_BYTES[op], 0xC0]))  # setcc al
+                        buf.emit(b"\x48\x0f\xb6\xc0")              # movzx rax, al
+                        write_result_from_reg(inst.result, "rax")
 
                 elif op in ("fadd", "fsub", "fmul", "fdiv"):
-                    if op == "fadd" and inst_idx + 1 < len(block.instructions):
-                        ins_hi = block.instructions[inst_idx]
-                        ins_top = block.instructions[inst_idx + 1]
+                    if op == "fadd" and inst_idx + 1 < len(block_insts):
+                        ins_hi = block_insts[inst_idx]
+                        ins_top = block_insts[inst_idx + 1]
                         if (
                             ins_hi.opcode.lower() == "fadd"
                             and ins_top.opcode.lower() == "fadd"
@@ -1253,8 +1613,8 @@ class X64CodeGenerator:
                         buf.emit(b"\x49\x01\xcb")  # add r11, rcx
 
                     # 512-bit AVX-512 EVEX path for 8 contiguous 64-bit stores
-                    if self.enable_avx512 and width in ("i64", "u64", "f64") and inst_idx + 6 < len(block.instructions):
-                        oct64_sts = [inst] + [block.instructions[inst_idx + k_s] for k_s in range(7)]
+                    if self.enable_avx512 and width in ("i64", "u64", "f64") and inst_idx + 6 < len(block_insts):
+                        oct64_sts = [inst] + [block_insts[inst_idx + k_s] for k_s in range(7)]
                         if (
                             all(s.opcode.lower() == "store_off" and len(s.operands) >= 4 and str(s.operands[3]) == width and s.operands[0] == inst.operands[0] for s in oct64_sts[1:])
                             and is_contiguous_stride(fn_add_const, [s.operands[1] for s in oct64_sts], 8)
@@ -1297,10 +1657,10 @@ class X64CodeGenerator:
                                 inst_idx += 7
                                 continue
 
-                    if self.enable_avx2 and width in ("i64", "u64", "f64") and inst_idx + 2 < len(block.instructions):
-                        st1 = block.instructions[inst_idx]
-                        st2 = block.instructions[inst_idx + 1]
-                        st3 = block.instructions[inst_idx + 2]
+                    if self.enable_avx2 and width in ("i64", "u64", "f64") and inst_idx + 2 < len(block_insts):
+                        st1 = block_insts[inst_idx]
+                        st2 = block_insts[inst_idx + 1]
+                        st3 = block_insts[inst_idx + 2]
                         if (
                             st1.opcode.lower() == "store_off" and len(st1.operands) >= 4 and str(st1.operands[3]) == width
                             and st2.opcode.lower() == "store_off" and len(st2.operands) >= 4 and str(st2.operands[3]) == width
@@ -1364,8 +1724,8 @@ class X64CodeGenerator:
                             inst_idx += 3
                             continue
 
-                    if width in ("i64", "u64", "f64") and inst_idx < len(block.instructions):
-                        nxt_st = block.instructions[inst_idx]
+                    if width in ("i64", "u64", "f64") and inst_idx < len(block_insts):
+                        nxt_st = block_insts[inst_idx]
                         nxt_w = str(nxt_st.operands[3]) if (nxt_st.opcode.lower() == "store_off" and len(nxt_st.operands) >= 4) else ""
                         if (
                             nxt_st.opcode.lower() == "store_off"
@@ -1434,8 +1794,8 @@ class X64CodeGenerator:
                             inst_idx += 1
                             continue
 
-                    if self.enable_avx2 and width in ("i32", "u32", "f32") and inst_idx + 6 < len(block.instructions):
-                        oct_sts = [inst] + [block.instructions[inst_idx + k_s] for k_s in range(7)]
+                    if self.enable_avx2 and width in ("i32", "u32", "f32") and inst_idx + 6 < len(block_insts):
+                        oct_sts = [inst] + [block_insts[inst_idx + k_s] for k_s in range(7)]
                         if (
                             all(s.opcode.lower() == "store_off" and len(s.operands) >= 4 and str(s.operands[3]) == width and s.operands[0] == inst.operands[0] for s in oct_sts[1:])
                             and _are_contiguous_4b_oct([s.operands[1] for s in oct_sts])
@@ -1553,10 +1913,10 @@ class X64CodeGenerator:
                             inst_idx += 7
                             continue
 
-                    if width in ("i32", "u32", "f32") and inst_idx + 2 < len(block.instructions):
-                        st1 = block.instructions[inst_idx]
-                        st2 = block.instructions[inst_idx + 1]
-                        st3 = block.instructions[inst_idx + 2]
+                    if width in ("i32", "u32", "f32") and inst_idx + 2 < len(block_insts):
+                        st1 = block_insts[inst_idx]
+                        st2 = block_insts[inst_idx + 1]
+                        st3 = block_insts[inst_idx + 2]
                         if (
                             st1.opcode.lower() == "store_off" and len(st1.operands) >= 4 and str(st1.operands[3]) == width
                             and st2.opcode.lower() == "store_off" and len(st2.operands) >= 4 and str(st2.operands[3]) == width
@@ -1714,17 +2074,33 @@ class X64CodeGenerator:
 
                 elif op == "br":
                     succ_name = str(inst.operands[0])
-                    lbl = branch_target_label(block.name, succ_name)
-                    buf.jmp(lbl)
+                    succ_bb = block_map.get(succ_name)
+                    if succ_bb is not None and len(succ_bb.phi_nodes) > 0:
+                        emit_phi_copies_for_edge(block.name, succ_bb)
+                    is_fallthrough = (idx_b + 1 < len(fn.blocks) and fn.blocks[idx_b + 1].name == succ_name)
+                    if not is_fallthrough:
+                        buf.jmp(f".L_bb_{succ_name}")
 
                 elif op == "br_cond":
                     cond_op, true_name, false_name = inst.operands[0], str(inst.operands[1]), str(inst.operands[2])
-                    resolve_operand_to_reg(cond_op, "rax")
-                    buf.emit(_x64_test_rr("rax"))
-                    t_lbl = branch_target_label(block.name, true_name)
-                    f_lbl = branch_target_label(block.name, false_name)
-                    buf.jne(t_lbl)
-                    buf.jmp(f_lbl)
+                    if leaf_mode and isinstance(cond_op, SSAVar) and cond_op in reg_map and cond_op not in inlined_consts:
+                        buf.emit(_x64_test_rr(reg_map[cond_op]))
+                    else:
+                        resolve_operand_to_reg(cond_op, "rax")
+                        buf.emit(_x64_test_rr("rax"))
+                    next_blk_name = fn.blocks[idx_b + 1].name if (idx_b + 1 < len(fn.blocks)) else None
+                    true_bb = block_map.get(true_name)
+                    if true_name == next_blk_name and (true_bb is None or not true_bb.phi_nodes):
+                        f_lbl = branch_target_label(block.name, false_name)
+                        buf.jcc(0x84, f_lbl)  # je false_name, fallthrough true_name
+                    else:
+                        t_lbl = branch_target_label(block.name, true_name)
+                        buf.jne(t_lbl)
+                        false_bb = block_map.get(false_name)
+                        if false_bb is not None and len(false_bb.phi_nodes) > 0:
+                            emit_phi_copies_for_edge(block.name, false_bb)
+                        if next_blk_name != false_name:
+                            buf.jmp(f".L_bb_{false_name}")
 
                 elif op == "ret":
                     if inst.operands:
@@ -1749,10 +2125,20 @@ class X64CodeGenerator:
         buf.mark(".L_epilogue")
         if used_avx2_ymm:
             buf.emit(b"\xc5\xf8\x77")  # vzeroupper
-        if leaf_mode:
+        if pure_leaf_mode:
             for r in reversed(used_callee_saved):
                 buf.emit(_x64_pop(r))
             buf.emit(b"\xc3")
+        elif leaf_mode:
+            for r in reversed(used_callee_saved):
+                buf.emit(_x64_pop(r))
+            if frame_size > 0:
+                if frame_size <= 127:
+                    buf.emit(b"\x48\x83\xc4" + struct.pack("<B", frame_size))
+                else:
+                    buf.emit(b"\x48\x81\xc4" + struct.pack("<I", frame_size))
+            buf.emit(b"\x5d")  # pop rbp
+            buf.emit(b"\xc3")  # ret
         else:
             if frame_size > 0:
                 if frame_size <= 127:
@@ -1777,6 +2163,8 @@ class X64CodeGenerator:
                 buf.emit(c_bytes)
 
         final_bytes = buf.finalize()
+        for b, orig_ins in orig_block_insts:
+            b.instructions = orig_ins
         return CompiledFunctionArtifact(
             name=fn.name,
             arch="x86_64",
@@ -1785,9 +2173,9 @@ class X64CodeGenerator:
             relocations=buf.relocations,
             line_table=buf.line_table,
             stack_frame_size=frame_size,
-            saved_nonvolatile_regs=used_callee_saved if leaf_mode else ["rbp"],
+            saved_nonvolatile_regs=used_callee_saved if pure_leaf_mode else (["rbp"] + used_callee_saved if leaf_mode else ["rbp"]),
             prologue_size=prologue_size,
-            leaf_register_mode=leaf_mode,
+            leaf_register_mode=pure_leaf_mode or leaf_mode,
             coalesced_moves=alloc.get("coalesced_moves", 0),
             live_across_call_count=len(alloc.get("live_across_call", [])),
             code_end_offset=code_end_off,
@@ -2271,6 +2659,26 @@ class Arm64CodeGenerator:
                     reg_v(op)
 
         slot_idx_map: Dict[SSAVar, int] = {v: i for i, v in enumerate(all_vars)}
+        const_int_map_arm: Dict[SSAVar, int] = {}
+        for b in fn.blocks:
+            for inst in b.instructions:
+                if inst.opcode.lower() == "const" and isinstance(inst.result, SSAVar) and inst.operands:
+                    cv = inst.operands[0]
+                    if isinstance(cv, int) and not isinstance(cv, bool):
+                        const_int_map_arm[inst.result] = cv
+                    elif isinstance(cv, str) and (cv.isdigit() or (cv.startswith("-") and cv[1:].isdigit())):
+                        const_int_map_arm[inst.result] = int(cv)
+
+        def _arm_const_int(op: Any) -> Optional[int]:
+            if isinstance(op, int) and not isinstance(op, bool):
+                return op
+            if isinstance(op, str):
+                s = op.strip()
+                if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+                    return int(s)
+            if isinstance(op, SSAVar):
+                return const_int_map_arm.get(op)
+            return None
         alloca_insts = [inst for b in fn.blocks for inst in b.instructions if inst.opcode == "alloca"]
         alloca_map: Dict[SSAVar, int] = {}
         curr_disp = 16 + len(all_vars) * 8
@@ -2470,18 +2878,48 @@ class Arm64CodeGenerator:
                     load_op(inst.operands[1], 10)
                     code.extend(_a64_u32(0x9B0A7D29))  # MUL X9, X9, X10
                     store_res(inst.result, 9)
-                elif op in ("div", "sdiv"):
-                    load_op(inst.operands[0], 9)
-                    load_op(inst.operands[1], 10)
-                    code.extend(_a64_u32(0x9ACA0D29))  # SDIV X9, X9, X10
-                    store_res(inst.result, 9)
-                elif op == "srem":
-                    load_op(inst.operands[0], 9)
-                    load_op(inst.operands[1], 10)
-                    code.extend(_a64_u32(0x9ACA0D2B))  # SDIV X11, X9, X10
-                    # MSUB X9, X11, X10, X9 -> 0x9B0A8000 | (9 << 10) | (11 << 5) | 9
-                    code.extend(_a64_u32(0x9B0A8000 | (9 << 10) | (11 << 5) | 9))
-                    store_res(inst.result, 9)
+                elif op in ("div", "sdiv", "srem"):
+                    c_div = _arm_const_int(inst.operands[1]) if len(inst.operands) > 1 else None
+                    if c_div is not None and c_div > 1 and (c_div & (c_div - 1)) == 0 and c_div < (1 << 62):
+                        k = c_div.bit_length() - 1
+                        load_op(inst.operands[0], 9)
+                        code.extend(_a64_u32(0x9340FC00 | (63 << 16) | (9 << 5) | 10))          # ASR X10, X9, #63
+                        code.extend(_a64_u32(0xD340FC00 | ((64 - k) << 16) | (10 << 5) | 10))   # LSR X10, X10, #(64-k)
+                        code.extend(_a64_u32(0x8B0A012B))                                       # ADD X11, X9, X10
+                        code.extend(_a64_u32(0x9340FC00 | (k << 16) | (11 << 5) | 11))          # ASR X11, X11, #k
+                        if op == "srem":
+                            code.extend(_a64_u32(0xD3400000 | ((64 - k) << 16) | ((63 - k) << 10) | (11 << 5) | 10)) # LSL X10, X11, #k
+                            code.extend(_a64_u32(0xCB0A0129))                                   # SUB X9, X9, X10
+                            store_res(inst.result, 9)
+                        else:
+                            store_res(inst.result, 11)
+                    elif c_div is not None and c_div > 1:
+                        M_u, s = compute_magic_signed_64(c_div)
+                        M_signed = M_u if M_u < (1 << 63) else M_u - (1 << 64)
+                        load_op(inst.operands[0], 9)
+                        code.extend(_a64_mov_imm64(10, M_signed))
+                        code.extend(_a64_u32(0x9B407C00 | (10 << 16) | (9 << 5) | 11))          # SMULH X11, X9, X10
+                        if M_u >= (1 << 63):
+                            code.extend(_a64_u32(0x8B000000 | (9 << 16) | (11 << 5) | 11))      # ADD X11, X11, X9
+                        if s > 0:
+                            code.extend(_a64_u32(0x9340FC00 | (s << 16) | (11 << 5) | 11))      # ASR X11, X11, #s
+                        code.extend(_a64_u32(0xD340FC00 | (63 << 16) | (9 << 5) | 12))          # LSR X12, X9, #63
+                        code.extend(_a64_u32(0x8B000000 | (12 << 16) | (11 << 5) | 11))         # ADD X11, X11, X12
+                        if op == "srem":
+                            code.extend(_a64_mov_imm64(10, c_div))
+                            code.extend(_a64_u32(0x9B0A8000 | (9 << 10) | (11 << 5) | 9))       # MSUB X9, X11, X10, X9
+                            store_res(inst.result, 9)
+                        else:
+                            store_res(inst.result, 11)
+                    else:
+                        load_op(inst.operands[0], 9)
+                        load_op(inst.operands[1], 10)
+                        if op == "srem":
+                            code.extend(_a64_u32(0x9ACA0D2B))  # SDIV X11, X9, X10
+                            code.extend(_a64_u32(0x9B0A8000 | (9 << 10) | (11 << 5) | 9))
+                        else:
+                            code.extend(_a64_u32(0x9ACA0D29))  # SDIV X9, X9, X10
+                        store_res(inst.result, 9)
                 elif op == "shl":
                     load_op(inst.operands[0], 9)
                     load_op(inst.operands[1], 10)

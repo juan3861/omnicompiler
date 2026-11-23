@@ -474,10 +474,20 @@ class IteratedRegisterCoalescingAllocator:
                 return False
         return True
 
-    def allocate(self, fn: SSAFunction) -> Dict[str, Any]:
+    def allocate(self, fn: SSAFunction, ignore_vars: Optional[Set[SSAVar]] = None) -> Dict[str, Any]:
         cb = ChaitinBriggsAllocator(self.registers)
         igraph, ranges = cb.compute_liveness(fn)
-        live_across_call: Set[SSAVar] = set(cb._last_live_across_call)
+        if ignore_vars:
+            for iv in ignore_vars:
+                igraph.nodes.discard(iv)
+                igraph.adj.pop(iv, None)
+                igraph.move_affinity.pop(iv, None)
+                ranges.pop(iv, None)
+            for nbrs in igraph.adj.values():
+                nbrs.difference_update(ignore_vars)
+            for affs in igraph.move_affinity.values():
+                affs.difference_update(ignore_vars)
+        live_across_call: Set[SSAVar] = set(cb._last_live_across_call) - (ignore_vars or set())
 
         # Active interference adjacency map (mutated during Simplify/Coalesce)
         adj: Dict[SSAVar, Set[SSAVar]] = {u: set(nbrs) for u, nbrs in igraph.adj.items()}

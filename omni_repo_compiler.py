@@ -769,6 +769,11 @@ class OmniRepoCompiler:
                                 global_luts=global_luts,
                                 global_return_types=global_return_types,
                             )
+                            try:
+                                from compiler.scev_analyzer import SCEVAnalyzer
+                                s_fn, _ = SCEVAnalyzer().analyze_function(s_fn)
+                            except Exception:
+                                pass
                             summary = thin_lto_opt.build_function_summary(f_name, r_name, f_ast, s_fn)
                             self._salsa_summary_cache[sum_key] = (s_fn, summary)
                         thin_lto_opt.index.add_function(summary)
