@@ -135,6 +135,88 @@ class ContentAddressableStore:
                     os.remove(tmp_path)
                 raise
 
+    def put_merkle_tree(self, root_dir: str) -> Dict[str, Any]:
+        """
+        Ingests a filesystem directory into CAS as a canonical Bazel REAPI v2
+        Merkle Tree (`Directory` nodes + `Tree` root digest).
+        """
+        root_abs = os.path.realpath(root_dir)
+        children_by_hash: Dict[str, Dict[str, Any]] = {}
+        file_count = 0
+        total_bytes = 0
+
+        def _walk_dir(cur_dir: str) -> Tuple[str, Dict[str, Any]]:
+            nonlocal file_count, total_bytes
+            files_list: List[Dict[str, Any]] = []
+            dirs_list: List[Dict[str, Any]] = []
+            for entry in sorted(os.scandir(cur_dir), key=lambda e: e.name):
+                if entry.is_dir(follow_symlinks=False):
+                    sub_h, sub_node = _walk_dir(entry.path)
+                    children_by_hash[sub_h] = sub_node
+                    dirs_list.append({"name": entry.name, "digest": {"hash": sub_h, "size_bytes": len(json.dumps(sub_node, sort_keys=True).encode("utf-8"))}})
+                elif entry.is_file(follow_symlinks=False):
+                    with open(entry.path, "rb") as f:
+                        raw = f.read()
+                    h = self.put_blob(raw)
+                    file_count += 1
+                    total_bytes += len(raw)
+                    is_exec = bool(os.stat(entry.path).st_mode & 0o111)
+                    files_list.append({
+                        "name": entry.name,
+                        "digest": {"hash": h, "size_bytes": len(raw)},
+                        "is_executable": is_exec,
+                    })
+            dir_node = {"files": files_list, "directories": dirs_list, "symlinks": []}
+            dir_bytes = json.dumps(dir_node, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            dir_h = self.put_blob(dir_bytes)
+            return dir_h, dir_node
+
+        root_h, root_node = _walk_dir(root_abs)
+        tree_obj = {"root": root_node, "children": [children_by_hash[k] for k in sorted(children_by_hash)]}
+        tree_bytes = json.dumps(tree_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        tree_h = self.put_blob(tree_bytes)
+        return {
+            "tree_digest": tree_h,
+            "root_digest": root_h,
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+            "directory_count": 1 + len(children_by_hash),
+        }
+
+    def materialize_merkle_tree(self, root_dir_digest: str, dst_dir: str) -> List[str]:
+        """Materializes a CAS `Directory` digest into `dst_dir` cleanly without path traversal."""
+        dst_abs = os.path.realpath(dst_dir)
+        os.makedirs(dst_abs, exist_ok=True)
+        restored: List[str] = []
+
+        def _restore_dir(d_hash: str, cur_dst: str) -> None:
+            raw_d = self.get_blob(d_hash)
+            node = json.loads(raw_d.decode("utf-8"))
+            for f_ent in node.get("files", []):
+                fname = os.path.basename(str(f_ent["name"]))
+                if not fname or fname in (".", ".."):
+                    raise ValueError(f"Unsafe Merkle file entry: {f_ent['name']}")
+                out_p = os.path.join(cur_dst, fname)
+                blob = self.get_blob(str(f_ent["digest"]["hash"]))
+                with open(out_p, "wb") as f:
+                    f.write(blob)
+                if f_ent.get("is_executable"):
+                    try:
+                        os.chmod(out_p, 0o755)
+                    except OSError:
+                        pass
+                restored.append(out_p)
+            for sub_ent in node.get("directories", []):
+                dname = os.path.basename(str(sub_ent["name"]))
+                if not dname or dname in (".", ".."):
+                    raise ValueError(f"Unsafe Merkle dir entry: {sub_ent['name']}")
+                sub_dst = os.path.join(cur_dst, dname)
+                os.makedirs(sub_dst, exist_ok=True)
+                _restore_dir(str(sub_ent["digest"]["hash"]), sub_dst)
+
+        _restore_dir(root_dir_digest, dst_abs)
+        return restored
+
 
 class HermeticSandboxExecutor:
     """Executes build actions in an isolated directory with scrubbed deterministic environment."""
@@ -513,18 +595,29 @@ class RBECoordinator:
                 worker_id="cas_cache",
             )
 
-        url = f"{self._next_worker_url()}/execute"
-        body = json.dumps({
-            "action_id": spec.action_id,
-            "kind": spec.kind,
-            "payload": spec.payload,
-            "input_blobs": spec.input_blobs,
-            "deps": spec.deps,
-            "target_triple": spec.target_triple,
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=15.0) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        worker_url = self._next_worker_url()
+        if worker_url.startswith("grpc://"):
+            data = REAPIGrpcClient(worker_url).execute_raw({
+                "action_id": spec.action_id,
+                "kind": spec.kind,
+                "payload": spec.payload,
+                "input_blobs": spec.input_blobs,
+                "deps": spec.deps,
+                "target_triple": spec.target_triple,
+            })
+        else:
+            url = f"{worker_url}/execute"
+            body = json.dumps({
+                "action_id": spec.action_id,
+                "kind": spec.kind,
+                "payload": spec.payload,
+                "input_blobs": spec.input_blobs,
+                "deps": spec.deps,
+                "target_triple": spec.target_triple,
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
         return ActionResult(
             action_id=data["action_id"],
             action_digest=data["action_digest"],
@@ -606,7 +699,8 @@ class RBECoordinator:
 
         materialized_files: List[str] = []
         if materialize_finals_to is not None:
-            client = REAPIClient(self._next_worker_url())
+            w_url = self._next_worker_url()
+            client = REAPIGrpcClient(w_url) if w_url.startswith("grpc://") else REAPIClient(w_url)
             terminal_ids = [a.action_id for a in actions if a.action_id not in depended_on]
             digest_to_path: List[Tuple[Dict[str, Any], str]] = []
             for tid in terminal_ids:
@@ -745,6 +839,256 @@ class REAPIClient:
         return data
 
 
+class REAPIGrpcClient:
+    """Real Bazel REAPI v2 gRPC HTTP/2 + Protobuf (`google.protobuf.Struct`) RPC Client (Alpha-C93)."""
+
+    def __init__(self, target: str):
+        addr = target[7:] if target.startswith("grpc://") else target
+        self.target = addr.rstrip("/")
+
+    def _rpc(self, method_path: str, payload: Dict[str, Any], timeout: float = 15.0) -> Dict[str, Any]:
+        import grpc
+        from google.protobuf import json_format, struct_pb2
+
+        req_msg = json_format.ParseDict(payload, struct_pb2.Struct())
+        with grpc.insecure_channel(self.target) as channel:
+            stub = channel.unary_unary(
+                method_path,
+                request_serializer=lambda m: m.SerializeToString(),
+                response_deserializer=struct_pb2.Struct.FromString,
+            )
+            resp_msg = stub(req_msg, timeout=timeout)
+        return json_format.MessageToDict(resp_msg)
+
+    def get_capabilities(self) -> Dict[str, Any]:
+        return self._rpc("/build.bazel.remote.execution.v2.Capabilities/GetCapabilities", {})
+
+    def find_missing_blobs(self, digests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        data = self._rpc(
+            "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
+            {"blob_digests": digests},
+        )
+        return data.get("missing_blob_digests", [])
+
+    def batch_update_blobs(self, blobs: List[bytes]) -> List[Dict[str, Any]]:
+        import base64
+        import hashlib
+        reqs = []
+        for b in blobs:
+            h = hashlib.sha256(b).hexdigest()
+            reqs.append({"digest": {"hash": h, "size_bytes": len(b)}, "data": base64.b64encode(b).decode("ascii")})
+        data = self._rpc(
+            "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchUpdateBlobs",
+            {"requests": reqs},
+        )
+        return data.get("responses", [])
+
+    def batch_read_blobs(self, digests: List[Dict[str, Any]]) -> List[Optional[bytes]]:
+        import base64
+        data = self._rpc(
+            "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs",
+            {"digests": digests},
+        )
+        out: List[Optional[bytes]] = []
+        for r in data.get("responses", []):
+            if int(r.get("status", {}).get("code", 0)) == 0:
+                out.append(base64.b64decode(r["data"]))
+            else:
+                out.append(None)
+        return out
+
+    def get_action_result(self, action_digest: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self._rpc(
+                "/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
+                {"action_digest": {"hash": action_digest, "size_bytes": 0}},
+            )
+        except Exception:
+            return None
+
+    def execute_action(self, spec: ActionSpec) -> Dict[str, Any]:
+        return self._rpc(
+            "/build.bazel.remote.execution.v2.Execution/Execute",
+            {
+                "action_payload": {
+                    "action_id": spec.action_id,
+                    "kind": spec.kind,
+                    "payload": spec.payload,
+                    "input_blobs": spec.input_blobs,
+                    "deps": spec.deps,
+                    "target_triple": spec.target_triple,
+                }
+            },
+        )
+
+    def execute_raw(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        return self._rpc("/build.bazel.remote.execution.v2.Execution/ExecuteRaw", req)
+
+
+class REAPIGrpcServer:
+    """Real Bazel REAPI v2 gRPC HTTP/2 + Protobuf Server backed by CAS & HermeticSandboxExecutor."""
+
+    def __init__(self, worker_id: str, cas: ContentAddressableStore, handlers: Optional[Dict[str, Callable]] = None):
+        self.worker_id = worker_id
+        self.cas = cas
+        self.executor = HermeticSandboxExecutor(cas, handlers=handlers)
+        self.executed_count = 0
+        self._lock = threading.Lock()
+        self._server = None
+        self._pool: Optional[ThreadPoolExecutor] = None
+        self.port: int = 0
+
+    def start(self) -> str:
+        import base64
+        import grpc
+        from google.protobuf import json_format, struct_pb2
+
+        node = self
+
+        def _wrap(handler_fn: Callable[[Dict[str, Any]], Dict[str, Any]]):
+            def _rpc_impl(request_msg, context):
+                req_dict = json_format.MessageToDict(request_msg)
+                resp_dict = handler_fn(req_dict)
+                return json_format.ParseDict(resp_dict, struct_pb2.Struct())
+
+            return grpc.unary_unary_rpc_method_handler(
+                _rpc_impl,
+                request_deserializer=struct_pb2.Struct.FromString,
+                response_serializer=lambda m: m.SerializeToString(),
+            )
+
+        def _get_caps(_req):
+            caps = REAPIServerCapabilities.default_capabilities()
+            caps["omni_extensions"]["transport"] = "grpc+http2+protobuf"
+            return caps
+
+        def _find_missing(req):
+            missing = []
+            for d in req.get("blob_digests", []):
+                h = str(d["hash"])
+                if not node.cas.has_blob(h):
+                    missing.append({"hash": h, "size_bytes": int(d.get("size_bytes", 0))})
+            return {"missing_blob_digests": missing}
+
+        def _batch_update(req):
+            responses = []
+            for item in req.get("requests", []):
+                data = base64.b64decode(item["data"])
+                stored_h = node.cas.put_blob(data)
+                responses.append({
+                    "digest": {"hash": stored_h, "size_bytes": len(data)},
+                    "status": {"code": 0, "message": "OK"},
+                })
+            return {"responses": responses}
+
+        def _batch_read(req):
+            responses = []
+            for dig in req.get("digests", []):
+                h = str(dig["hash"])
+                if node.cas.has_blob(h):
+                    blob = node.cas.get_blob(h)
+                    responses.append({
+                        "digest": {"hash": h, "size_bytes": len(blob)},
+                        "data": base64.b64encode(blob).decode("ascii"),
+                        "status": {"code": 0, "message": "OK"},
+                    })
+                else:
+                    responses.append({"digest": dig, "data": "", "status": {"code": 5, "message": "NOT_FOUND"}})
+            return {"responses": responses}
+
+        def _get_ar(req):
+            ad = req.get("action_digest", {})
+            h = str(ad["hash"] if isinstance(ad, dict) else ad)
+            cached = node.cas.get_action_result(h)
+            if cached is None:
+                return {"found": False, "code": 5}
+            return _to_reapi_action_result(cached, node.cas)
+
+        def _exec_reapi(req):
+            act_req = req.get("action_payload", req)
+            spec = ActionSpec(
+                action_id=act_req["action_id"],
+                kind=act_req["kind"],
+                payload=act_req["payload"],
+                input_blobs=act_req.get("input_blobs", {}),
+                deps=act_req.get("deps", []),
+                target_triple=act_req.get("target_triple", "x86_64-unknown-linux-gnu"),
+            )
+            res = node.executor.execute(spec, worker_id=node.worker_id)
+            with node._lock:
+                node.executed_count += 1
+            reapi_ar = _to_reapi_action_result({"output_blobs": res.output_blobs, "metadata": res.metadata}, node.cas)
+            return {
+                "name": f"operations/{res.action_digest}",
+                "done": True,
+                "response": {
+                    "@type": "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse",
+                    "result": reapi_ar,
+                    "cached_result": res.cache_hit,
+                    "status": {"code": 0, "message": "OK"},
+                    "worker_id": res.worker_id,
+                    "action_digest": {"hash": res.action_digest, "size_bytes": 0},
+                },
+            }
+
+        def _exec_raw(req):
+            spec = ActionSpec(
+                action_id=req["action_id"],
+                kind=req["kind"],
+                payload=req["payload"],
+                input_blobs=req.get("input_blobs", {}),
+                deps=req.get("deps", []),
+                target_triple=req.get("target_triple", "x86_64-unknown-linux-gnu"),
+            )
+            res = node.executor.execute(spec, worker_id=node.worker_id)
+            with node._lock:
+                node.executed_count += 1
+            return {
+                "action_id": res.action_id,
+                "action_digest": res.action_digest,
+                "output_blobs": res.output_blobs,
+                "metadata": res.metadata,
+                "cache_hit": res.cache_hit,
+                "worker_id": res.worker_id,
+            }
+
+        self._pool = ThreadPoolExecutor(max_workers=4)
+        self._server = grpc.server(self._pool)
+        self._server.add_generic_rpc_handlers((
+            grpc.method_handlers_generic_handler(
+                "build.bazel.remote.execution.v2.Capabilities",
+                {"GetCapabilities": _wrap(_get_caps)},
+            ),
+            grpc.method_handlers_generic_handler(
+                "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                {
+                    "FindMissingBlobs": _wrap(_find_missing),
+                    "BatchUpdateBlobs": _wrap(_batch_update),
+                    "BatchReadBlobs": _wrap(_batch_read),
+                },
+            ),
+            grpc.method_handlers_generic_handler(
+                "build.bazel.remote.execution.v2.ActionCache",
+                {"GetActionResult": _wrap(_get_ar)},
+            ),
+            grpc.method_handlers_generic_handler(
+                "build.bazel.remote.execution.v2.Execution",
+                {"Execute": _wrap(_exec_reapi), "ExecuteRaw": _wrap(_exec_raw)},
+            ),
+        ))
+        self.port = self._server.add_insecure_port("127.0.0.1:0")
+        self._server.start()
+        return f"grpc://127.0.0.1:{self.port}"
+
+    def stop(self):
+        if self._server is not None:
+            self._server.stop(0).wait(timeout=5.0)
+            self._server = None
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
+
+
 class OSSandboxController:
     """
     Cross-platform OS kernel-level process & filesystem/memory sandbox:
@@ -868,11 +1212,76 @@ class OSSandboxController:
             finally:
                 k32.CloseHandle(job)
 
-        # POSIX / Linux (rlimit + optional Landlock) / macOS (rlimit)
+        # POSIX / Linux (rlimit + real Landlock LSM path_beneath ruleset) / macOS (rlimit)
         import resource
 
         caps = self.probe_capabilities()
         mem_bytes = max(64, max_memory_mb) * 1024 * 1024
+        sandbox_real = os.path.realpath(sandbox_dir)
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ro_candidates = [
+            "/usr", "/lib", "/lib64", "/bin", "/sbin",
+            "/etc/ld.so.cache", "/etc/alternatives", "/etc/ssl",
+            "/dev/null", "/dev/urandom",
+            sys.prefix, sys.base_prefix, sys.exec_prefix,
+            os.path.dirname(os.path.realpath(sys.executable)),
+            project_root,
+        ]
+        ro_paths: List[str] = []
+        seen_ro = set()
+        for cand in ro_candidates:
+            rp = os.path.realpath(cand)
+            if rp not in seen_ro and os.path.exists(rp):
+                seen_ro.add(rp)
+                ro_paths.append(rp)
+
+        def _apply_landlock() -> bool:
+            import ctypes
+
+            class LandlockRulesetAttr(ctypes.Structure):
+                _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+            class LandlockPathBeneathAttr(ctypes.Structure):
+                _pack_ = 1
+                _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            # SYS_landlock_create_ruleset=444, add_rule=445, restrict_self=446 (same on Linux x86_64/arm64)
+            # ABI v1 handled_access_fs bits 0..12 = 0x1FFF; read+exec+readdir = 0x0D
+            all_fs = 0x1FFF
+            ro_fs = 0x000D  # EXECUTE (1) | READ_FILE (4) | READ_DIR (8)
+            attr = LandlockRulesetAttr(handled_access_fs=all_fs)
+            ruleset_fd = libc.syscall(444, ctypes.byref(attr), ctypes.sizeof(attr), 0)
+            if ruleset_fd < 0:
+                return False
+
+            o_path_flags = getattr(os, "O_PATH", 0x200000) | getattr(os, "O_CLOEXEC", 0)
+            try:
+                def _allow(path_str: str, mask: int) -> None:
+                    fd = -1
+                    try:
+                        fd = os.open(path_str, o_path_flags)
+                        eff_mask = mask if os.path.isdir(path_str) else (mask & 0x0007)
+                        pb = LandlockPathBeneathAttr(allowed_access=eff_mask, parent_fd=fd)
+                        libc.syscall(445, ruleset_fd, 1, ctypes.byref(pb), 0)
+                    except OSError:
+                        pass
+                    finally:
+                        if fd >= 0:
+                            os.close(fd)
+
+                for ro_p in ro_paths:
+                    _allow(ro_p, 0x0006 if ro_p == "/dev/null" else ro_fs)
+                _allow(sandbox_real, all_fs)
+
+                # prctl(PR_SET_NO_NEW_PRIVS=38, 1, 0, 0, 0) required by Landlock
+                if libc.prctl(38, 1, 0, 0, 0) != 0:
+                    return False
+                if libc.syscall(446, ruleset_fd, 0) != 0:
+                    return False
+                return True
+            finally:
+                os.close(ruleset_fd)
 
         def _preexec():
             try:
@@ -884,10 +1293,7 @@ class OSSandboxController:
                 pass
             if caps.get("landlock"):
                 try:
-                    import ctypes
-                    libc = ctypes.CDLL(None, use_errno=True)
-                    # prctl(PR_SET_NO_NEW_PRIVS=38, 1, 0, 0, 0)
-                    libc.prctl(38, 1, 0, 0, 0)
+                    _apply_landlock()
                 except Exception:
                     pass
 
@@ -911,5 +1317,6 @@ class OSSandboxController:
             "stdout": out_b.decode("utf-8", errors="replace"),
             "stderr": err_b.decode("utf-8", errors="replace"),
             "sandbox_kernel_backend": caps["backend"],
-            "kernel_enforced": True,
+            "kernel_enforced": bool(caps.get("landlock")) if sys.platform.startswith("linux") else True,
+            "landlock_restricted": bool(caps.get("landlock")),
         }
