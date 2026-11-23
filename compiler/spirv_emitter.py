@@ -29,12 +29,25 @@ _OP_CAPABILITY = 17
 _OP_TYPE_VOID = 19
 _OP_TYPE_BOOL = 20
 _OP_TYPE_INT = 21
+_OP_TYPE_VECTOR = 23
+_OP_TYPE_RUNTIME_ARRAY = 29
+_OP_TYPE_STRUCT = 30
+_OP_TYPE_POINTER = 32
 _OP_TYPE_FUNCTION = 33
 _OP_CONSTANT = 43
 _OP_FUNCTION = 54
 _OP_FUNCTION_PARAMETER = 55
 _OP_FUNCTION_END = 56
 _OP_FUNCTION_CALL = 57
+_OP_VARIABLE = 59
+_OP_LOAD = 61
+_OP_STORE = 62
+_OP_ACCESS_CHAIN = 65
+_OP_ARRAY_LENGTH = 68
+_OP_DECORATE = 71
+_OP_MEMBER_DECORATE = 72
+_OP_UCONVERT = 113
+_OP_SCONVERT = 114
 _OP_IADD = 128
 _OP_ISUB = 130
 _OP_IMUL = 132
@@ -47,6 +60,7 @@ _OP_INOT_EQUAL = 171
 _OP_SGREATER_THAN = 173
 _OP_SGREATER_EQUAL = 175
 _OP_SLESS_THAN = 177
+_OP_ULESS_THAN = 176
 _OP_SLESS_EQUAL = 179
 _OP_SHR_LOGICAL = 194
 _OP_SHR_ARITH = 195
@@ -56,6 +70,7 @@ _OP_BIT_XOR = 198
 _OP_BIT_AND = 199
 _OP_NOT = 200
 _OP_PHI = 245
+_OP_SELECTION_MERGE = 247
 _OP_LABEL = 248
 _OP_BRANCH = 249
 _OP_BRANCH_COND = 250
@@ -248,6 +263,262 @@ class SPIRVEmitter:
             lo = uval & 0xFFFFFFFF
             hi = (uval >> 32) & 0xFFFFFFFF
             words.extend(_spv_inst(_OP_CONSTANT, ty_i64, cid, lo, hi))
+        words.extend(fn_words)
+        words.extend(entry_fn_words)
+        return struct.pack(f"<{len(words)}I", *words)
+
+    def emit_vulkan_compute_spirv(
+        self,
+        fn: SSAFunction,
+        workgroup_size: Tuple[int, int, int] = (64, 1, 1),
+    ) -> bytes:
+        """
+        Emits a Vulkan 1.2 Compute Shader SPIR-V 1.5 binary with:
+        - StorageBuffer DescriptorSet 0 Binding 0 (`in_buf`: RuntimeArray of i64)
+        - StorageBuffer DescriptorSet 0 Binding 1 (`out_buf`: RuntimeArray of i64)
+        - BuiltIn GlobalInvocationId (`v3uint`) + `OpArrayLength` bounds guard
+        - Calls the compiled Omni-SSA kernel per invocation: `out_buf[gid] = kernel(in_buf[gid], ...)`
+        """
+        next_id = 1
+
+        def alloc_id() -> int:
+            nonlocal next_id
+            i = next_id
+            next_id += 1
+            return i
+
+        ext_glsl = alloc_id()
+        ty_void = alloc_id()
+        ty_bool = alloc_id()
+        ty_u32 = alloc_id()
+        ty_i64 = alloc_id()
+        ty_v3u32 = alloc_id()
+        ty_ptr_in_v3u32 = alloc_id()
+        ty_ptr_in_u32 = alloc_id()
+        ty_rta_i64 = alloc_id()
+        ty_buf_struct = alloc_id()
+        ty_ptr_sb_struct = alloc_id()
+        ty_ptr_sb_i64 = alloc_id()
+        ty_entry_fn = alloc_id()
+        param_tys = [ty_i64 for _ in fn.params]
+        ty_kernel_fn = alloc_id()
+
+        gl_gid_var = alloc_id()
+        in_buf_var = alloc_id()
+        out_buf_var = alloc_id()
+        fn_main_id = alloc_id()
+        fn_kernel_id = alloc_id()
+
+        u32_0 = alloc_id()
+        const_cache_i64: Dict[int, int] = {}
+
+        def get_const_i64(val: int) -> int:
+            u = int(val) & 0xFFFFFFFFFFFFFFFF
+            if u not in const_cache_i64:
+                const_cache_i64[u] = alloc_id()
+            return const_cache_i64[u]
+
+        c_zero = get_const_i64(0)
+        c_one = get_const_i64(1)
+
+        param_ids = {SSAVar(p, 0): alloc_id() for p in fn.params}
+        var_ids: Dict[SSAVar, int] = {}
+
+        def get_var_id(v: SSAVar) -> int:
+            if v in param_ids:
+                return param_ids[v]
+            if v not in var_ids:
+                var_ids[v] = alloc_id()
+            return var_ids[v]
+
+        blk_label_ids = {b.name: alloc_id() for b in fn.blocks}
+        phi_res_ids: Dict[Tuple[str, SSAVar], int] = {}
+        for blk in fn.blocks:
+            for phi in blk.phi_nodes:
+                if phi.result:
+                    phi_res_ids[(blk.name, phi.result)] = get_var_id(phi.result)
+            for inst in blk.instructions:
+                if inst.result is not None and inst.opcode != "param":
+                    get_var_id(inst.result)
+
+        def op_id(opnd: Any) -> int:
+            if isinstance(opnd, bool):
+                return get_const_i64(int(opnd))
+            if isinstance(opnd, int):
+                return get_const_i64(opnd)
+            if isinstance(opnd, SSAVar):
+                return get_var_id(opnd)
+            return c_zero
+
+        # Lower kernel function
+        fn_words: List[int] = []
+        fn_words.extend(_spv_inst(_OP_FUNCTION, ty_i64, fn_kernel_id, 0, ty_kernel_fn))
+        for p in fn.params:
+            fn_words.extend(_spv_inst(_OP_FUNCTION_PARAMETER, ty_i64, param_ids[SSAVar(p, 0)]))
+
+        for blk in fn.blocks:
+            fn_words.extend(_spv_inst(_OP_LABEL, blk_label_ids[blk.name]))
+            for phi in blk.phi_nodes:
+                if phi.result is None:
+                    continue
+                pairs_words: List[int] = []
+                for pn, val in phi.phi_incoming:
+                    if pn in blk_label_ids:
+                        pairs_words.append(op_id(val))
+                        pairs_words.append(blk_label_ids[pn])
+                fn_words.extend(_spv_inst(_OP_PHI, ty_i64, phi_res_ids[(blk.name, phi.result)], *pairs_words))
+
+            for inst in blk.instructions:
+                op = inst.opcode
+                if op == "param":
+                    idx = inst.operands[0] if inst.operands else 0
+                    if isinstance(idx, str) and idx in fn.params:
+                        idx = fn.params.index(idx)
+                    if inst.result is not None and isinstance(idx, int) and idx < len(fn.params):
+                        param_ids[inst.result] = param_ids[SSAVar(fn.params[idx], 0)]
+                elif op == "const" and inst.result is not None:
+                    cid = get_const_i64(int(inst.operands[0]))
+                    fn_words.extend(_spv_inst(_OP_IADD, ty_i64, get_var_id(inst.result), cid, c_zero))
+                elif op == "mov" and inst.result is not None:
+                    fn_words.extend(_spv_inst(_OP_IADD, ty_i64, get_var_id(inst.result), op_id(inst.operands[0]), c_zero))
+                elif op == "neg" and inst.result is not None:
+                    fn_words.extend(_spv_inst(_OP_SNegate, ty_i64, get_var_id(inst.result), op_id(inst.operands[0])))
+                elif op == "not" and inst.result is not None:
+                    fn_words.extend(_spv_inst(_OP_NOT, ty_i64, get_var_id(inst.result), op_id(inst.operands[0])))
+                elif op in ("add", "sub", "mul", "sdiv", "srem", "shl", "shr", "sar", "lshr", "and", "or", "xor"):
+                    spv_op_m = {
+                        "add": _OP_IADD, "sub": _OP_ISUB, "mul": _OP_IMUL,
+                        "sdiv": _OP_SDIV, "srem": _OP_SREM,
+                        "shl": _OP_SHL, "shr": _OP_SHR_ARITH, "sar": _OP_SHR_ARITH, "lshr": _OP_SHR_LOGICAL,
+                        "and": _OP_BIT_AND, "or": _OP_BIT_OR, "xor": _OP_BIT_XOR,
+                    }
+                    if inst.result is not None:
+                        fn_words.extend(_spv_inst(spv_op_m[op], ty_i64, get_var_id(inst.result), op_id(inst.operands[0]), op_id(inst.operands[1])))
+                elif op in ("cmp_eq", "cmp_ne", "cmp_lt", "cmp_le", "cmp_gt", "cmp_ge") and inst.result is not None:
+                    cmp_op_m = {
+                        "cmp_eq": _OP_IEQUAL, "cmp_ne": _OP_INOT_EQUAL,
+                        "cmp_lt": _OP_SLESS_THAN, "cmp_le": _OP_SLESS_EQUAL,
+                        "cmp_gt": _OP_SGREATER_THAN, "cmp_ge": _OP_SGREATER_EQUAL,
+                    }
+                    bid = alloc_id()
+                    fn_words.extend(_spv_inst(cmp_op_m[op], ty_bool, bid, op_id(inst.operands[0]), op_id(inst.operands[1])))
+                    fn_words.extend(_spv_inst(_OP_SELECT, ty_i64, get_var_id(inst.result), bid, c_one, c_zero))
+                elif op == "select" and inst.result is not None:
+                    cond_b = alloc_id()
+                    fn_words.extend(_spv_inst(_OP_INOT_EQUAL, ty_bool, cond_b, op_id(inst.operands[0]), c_zero))
+                    fn_words.extend(_spv_inst(_OP_SELECT, ty_i64, get_var_id(inst.result), cond_b, op_id(inst.operands[1]), op_id(inst.operands[2])))
+                elif op == "br":
+                    fn_words.extend(_spv_inst(_OP_BRANCH, blk_label_ids[str(inst.operands[0])]))
+                elif op == "br_cond":
+                    cond_b = alloc_id()
+                    fn_words.extend(_spv_inst(_OP_INOT_EQUAL, ty_bool, cond_b, op_id(inst.operands[0]), c_zero))
+                    fn_words.extend(_spv_inst(_OP_BRANCH_COND, cond_b, blk_label_ids[str(inst.operands[1])], blk_label_ids[str(inst.operands[2])]))
+                elif op == "ret":
+                    rv = op_id(inst.operands[0]) if inst.operands else c_zero
+                    fn_words.extend(_spv_inst(_OP_RETURN_VALUE, rv))
+        fn_words.extend(_spv_inst(_OP_FUNCTION_END))
+
+        # GLCompute void main(): reads gid = gl_GlobalInvocationID.x;
+        # if (gid < arrayLength(in_buf)) { x = in_buf[gid]; out_buf[gid] = kernel(x, ...); }
+        lbl_entry = alloc_id()
+        lbl_body = alloc_id()
+        lbl_merge = alloc_id()
+        ptr_gid_x = alloc_id()
+        gid_u32 = alloc_id()
+        in_len_u32 = alloc_id()
+        in_bounds_b = alloc_id()
+        ptr_in_elem = alloc_id()
+        in_val_i64 = alloc_id()
+        gid_i64 = alloc_id()
+        call_res = alloc_id()
+        ptr_out_elem = alloc_id()
+
+        entry_fn_words: List[int] = []
+        entry_fn_words.extend(_spv_inst(_OP_FUNCTION, ty_void, fn_main_id, 0, ty_entry_fn))
+        entry_fn_words.extend(_spv_inst(_OP_LABEL, lbl_entry))
+        entry_fn_words.extend(_spv_inst(_OP_ACCESS_CHAIN, ty_ptr_in_u32, ptr_gid_x, gl_gid_var, u32_0))
+        entry_fn_words.extend(_spv_inst(_OP_LOAD, ty_u32, gid_u32, ptr_gid_x))
+        entry_fn_words.extend(_spv_inst(_OP_ARRAY_LENGTH, ty_u32, in_len_u32, in_buf_var, 0))
+        entry_fn_words.extend(_spv_inst(_OP_ULESS_THAN, ty_bool, in_bounds_b, gid_u32, in_len_u32))
+        entry_fn_words.extend(_spv_inst(_OP_SELECTION_MERGE, lbl_merge, 0))
+        entry_fn_words.extend(_spv_inst(_OP_BRANCH_COND, in_bounds_b, lbl_body, lbl_merge))
+        entry_fn_words.extend(_spv_inst(_OP_LABEL, lbl_body))
+        entry_fn_words.extend(_spv_inst(_OP_ACCESS_CHAIN, ty_ptr_sb_i64, ptr_in_elem, in_buf_var, u32_0, gid_u32))
+        entry_fn_words.extend(_spv_inst(_OP_LOAD, ty_i64, in_val_i64, ptr_in_elem))
+        if not fn.params:
+            entry_fn_words.extend(_spv_inst(_OP_FUNCTION_CALL, ty_i64, call_res, fn_kernel_id))
+        else:
+            call_args = [in_val_i64]
+            if len(fn.params) > 1:
+                entry_fn_words.extend(_spv_inst(_OP_UCONVERT, ty_i64, gid_i64, gid_u32))
+                call_args.append(gid_i64)
+                while len(call_args) < len(fn.params):
+                    call_args.append(c_zero)
+            entry_fn_words.extend(_spv_inst(_OP_FUNCTION_CALL, ty_i64, call_res, fn_kernel_id, *call_args))
+        entry_fn_words.extend(_spv_inst(_OP_ACCESS_CHAIN, ty_ptr_sb_i64, ptr_out_elem, out_buf_var, u32_0, gid_u32))
+        entry_fn_words.extend(_spv_inst(_OP_STORE, ptr_out_elem, call_res))
+        entry_fn_words.extend(_spv_inst(_OP_BRANCH, lbl_merge))
+        entry_fn_words.extend(_spv_inst(_OP_LABEL, lbl_merge))
+        entry_fn_words.extend(_spv_inst(_OP_RETURN))
+        entry_fn_words.extend(_spv_inst(_OP_FUNCTION_END))
+
+        words: List[int] = [
+            SPIRV_MAGIC,
+            SPIRV_VERSION_1_5,
+            SPIRV_GENERATOR_OMNI,
+            next_id,
+            0,
+        ]
+        words.extend(_spv_inst(_OP_CAPABILITY, 1))   # Shader
+        words.extend(_spv_inst(_OP_CAPABILITY, 11))  # Int64
+        words.extend(_spv_inst(_OP_EXT_INST_IMPORT, ext_glsl, *_spv_string("GLSL.std.450")))
+        words.extend(_spv_inst(_OP_MEMORY_MODEL, 0, 1))  # Logical, GLSL450
+        words.extend(_spv_inst(
+            _OP_ENTRY_POINT, 5, fn_main_id, *_spv_string("main"),
+            gl_gid_var, in_buf_var, out_buf_var,
+        ))
+        words.extend(_spv_inst(_OP_EXECUTION_MODE, fn_main_id, 17, *workgroup_size))
+        words.extend(_spv_inst(_OP_SOURCE, 0, 100))
+        words.extend(_spv_inst(_OP_NAME, fn_kernel_id, *_spv_string(fn.name)))
+        words.extend(_spv_inst(_OP_NAME, gl_gid_var, *_spv_string("gl_GlobalInvocationID")))
+        words.extend(_spv_inst(_OP_NAME, in_buf_var, *_spv_string("in_buf")))
+        words.extend(_spv_inst(_OP_NAME, out_buf_var, *_spv_string("out_buf")))
+
+        # Decorations: BuiltIn GlobalInvocationId=28, ArrayStride=6, Block=2, DescriptorSet=34, Binding=33, Offset=35
+        words.extend(_spv_inst(_OP_DECORATE, gl_gid_var, 11, 28))
+        words.extend(_spv_inst(_OP_DECORATE, ty_rta_i64, 6, 8))
+        words.extend(_spv_inst(_OP_MEMBER_DECORATE, ty_buf_struct, 0, 35, 0))
+        words.extend(_spv_inst(_OP_DECORATE, ty_buf_struct, 2))
+        words.extend(_spv_inst(_OP_DECORATE, in_buf_var, 34, 0))
+        words.extend(_spv_inst(_OP_DECORATE, in_buf_var, 33, 0))
+        words.extend(_spv_inst(_OP_DECORATE, out_buf_var, 34, 0))
+        words.extend(_spv_inst(_OP_DECORATE, out_buf_var, 33, 1))
+
+        # Types
+        words.extend(_spv_inst(_OP_TYPE_VOID, ty_void))
+        words.extend(_spv_inst(_OP_TYPE_BOOL, ty_bool))
+        words.extend(_spv_inst(_OP_TYPE_INT, ty_u32, 32, 0))
+        words.extend(_spv_inst(_OP_TYPE_INT, ty_i64, 64, 1))
+        words.extend(_spv_inst(_OP_TYPE_VECTOR, ty_v3u32, ty_u32, 3))
+        words.extend(_spv_inst(_OP_TYPE_POINTER, ty_ptr_in_v3u32, 1, ty_v3u32))     # Input=1
+        words.extend(_spv_inst(_OP_TYPE_POINTER, ty_ptr_in_u32, 1, ty_u32))
+        words.extend(_spv_inst(_OP_TYPE_RUNTIME_ARRAY, ty_rta_i64, ty_i64))
+        words.extend(_spv_inst(_OP_TYPE_STRUCT, ty_buf_struct, ty_rta_i64))
+        words.extend(_spv_inst(_OP_TYPE_POINTER, ty_ptr_sb_struct, 12, ty_buf_struct))  # StorageBuffer=12
+        words.extend(_spv_inst(_OP_TYPE_POINTER, ty_ptr_sb_i64, 12, ty_i64))
+        words.extend(_spv_inst(_OP_TYPE_FUNCTION, ty_entry_fn, ty_void))
+        words.extend(_spv_inst(_OP_TYPE_FUNCTION, ty_kernel_fn, ty_i64, *param_tys))
+
+        # Constants & Storage Variables
+        words.extend(_spv_inst(_OP_CONSTANT, ty_u32, u32_0, 0))
+        for uval, cid in sorted(const_cache_i64.items(), key=lambda kv: kv[1]):
+            lo = uval & 0xFFFFFFFF
+            hi = (uval >> 32) & 0xFFFFFFFF
+            words.extend(_spv_inst(_OP_CONSTANT, ty_i64, cid, lo, hi))
+        words.extend(_spv_inst(_OP_VARIABLE, ty_ptr_in_v3u32, gl_gid_var, 1))
+        words.extend(_spv_inst(_OP_VARIABLE, ty_ptr_sb_struct, in_buf_var, 12))
+        words.extend(_spv_inst(_OP_VARIABLE, ty_ptr_sb_struct, out_buf_var, 12))
+
         words.extend(fn_words)
         words.extend(entry_fn_words)
         return struct.pack(f"<{len(words)}I", *words)

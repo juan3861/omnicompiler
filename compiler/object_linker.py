@@ -826,6 +826,21 @@ class NativeObjectLinker:
                     struct.pack_into("<I", combined_text, patch_offset, patched_inst)
                     applied_relocs += 1
 
+                elif reloc.reloc_type == "RISCV_CALL_PLT":
+                    byte_diff = (target_offset + reloc.addend) - patch_offset
+                    if (byte_diff % 2) != 0 or not (-(1 << 20) <= byte_diff < (1 << 20)):
+                        raise RelocationOutOfBoundsError(f"RISCV_CALL_PLT displacement {byte_diff} out of range")
+                    imm = byte_diff & 0x1FFFFF
+                    b20 = (imm >> 20) & 1
+                    b10_1 = (imm >> 1) & 0x3FF
+                    b11 = (imm >> 11) & 1
+                    b19_12 = (imm >> 12) & 0xFF
+                    orig_inst = struct.unpack_from("<I", combined_text, patch_offset)[0]
+                    rd_bits = orig_inst & 0xF80
+                    patched_inst = (b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) | rd_bits | 0x6F
+                    struct.pack_into("<I", combined_text, patch_offset, patched_inst)
+                    applied_relocs += 1
+
         if unresolved_symbols:
             raise LinkerError(f"Unresolved external symbols during link: {unresolved_symbols}")
 

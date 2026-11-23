@@ -1,16 +1,18 @@
 """
-RISC-V 64 (RV64IM LP64) Native Machine Code Generator (Alpha-C88).
+RISC-V 64 (RV64GC: IMAFDC LP64/LP64D) Native Machine Code Generator (Alpha-C92).
 
-Translates Omni-SSA Functions (`param`, `const`, `mov`, `add`, `sub`, `mul`, `smulh`,
-`umulh`, `sdiv`, `srem`, `shl`, `shr`, `sar`, `lshr`, `and`, `or`, `xor`, `neg`, `not`,
-`cmp_*`, `select`, `phi`, `alloca`, `load`, `store`, `load_off`, `store_off`, `br`,
-`br_cond`, `ret`) directly into little-endian 32-bit RISC-V RV64IM machine words.
+Translates Omni-SSA Functions (`param`, `const`, `fconst`, `mov`, `add`, `sub`, `mul`,
+`smulh`, `umulh`, `sdiv`, `srem`, `shl`, `shr`, `sar`, `lshr`, `and`, `or`, `xor`, `neg`,
+`not`, `fadd`, `fsub`, `fmul`, `fdiv`, `fneg`, `sitofp`, `fptosi`, `fcmp_*`, `cmp_*`,
+`select`, `phi`, `alloca`, `load`, `store`, `load_off`, `store_off`, `atomic_add`,
+`atomic_cas`, `atomic_swap`, `fence`, `call`, `br`, `br_cond`, `ret`) directly into
+little-endian 32-bit RISC-V RV64GC machine words.
 """
 
 import struct
 from typing import Any, Dict, List, Optional, Tuple
 from compiler.ssa_ir import BasicBlock, SSAFunction, SSAInstruction, SSAVar
-from compiler.native_codegen import CompiledFunctionArtifact
+from compiler.native_codegen import CodegenRelocation, CompiledFunctionArtifact, _f64_bits
 
 
 _RV_REG = {
@@ -20,7 +22,31 @@ _RV_REG = {
     "s2": 18, "s3": 19, "s4": 20, "s5": 21, "s6": 22, "s7": 23,
     "t3": 28, "t4": 29, "t5": 30, "t6": 31,
 }
+_RV_FREG = {
+    "ft0": 0, "ft1": 1, "ft2": 2, "ft3": 3, "ft4": 4, "ft5": 5, "ft6": 6, "ft7": 7,
+    "fs0": 8, "fs1": 9,
+    "fa0": 10, "fa1": 11, "fa2": 12, "fa3": 13, "fa4": 14, "fa5": 15, "fa6": 16, "fa7": 17,
+}
 _PARAM_REGS = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"]
+
+
+def _rv_fp_r(f7: int, rs2: int, rs1: int, rm: int, rd: int, opcode: int = 0x53) -> bytes:
+    w = ((f7 & 0x7F) << 25) | ((rs2 & 0x1F) << 20) | ((rs1 & 0x1F) << 15) | ((rm & 7) << 12) | ((rd & 0x1F) << 7) | (opcode & 0x7F)
+    return struct.pack("<I", w)
+
+
+def _rv_amo_d(f5: int, rs2: str, rs1: str, rd: str, aq: int = 1, rl: int = 1) -> bytes:
+    w = (
+        ((f5 & 0x1F) << 27)
+        | ((aq & 1) << 26)
+        | ((rl & 1) << 25)
+        | (_RV_REG[rs2] << 20)
+        | (_RV_REG[rs1] << 15)
+        | (3 << 12)
+        | (_RV_REG[rd] << 7)
+        | 0x2F
+    )
+    return struct.pack("<I", w)
 
 
 def _rv_i(imm12: int, rs1: str, f3: int, rd: str, opcode: int) -> bytes:
@@ -129,6 +155,8 @@ class _RV64LabelBuffer:
             disp = self.labels[label] - pos
             if kind == "j":
                 self.code[pos:pos + 4] = _rv_j(disp, "zero")
+            elif kind == "jal_ra":
+                self.code[pos:pos + 4] = _rv_j(disp, "ra")
         return bytes(self.code)
 
 
@@ -144,7 +172,10 @@ class Riscv64CodeGenerator:
             ret_bytes = _rv_i(0, "zero", 0, "a0", 0x13) + struct.pack("<I", 0x00008067)
             return CompiledFunctionArtifact(
                 name=fn.name, arch="riscv64", abi=self.abi, code_bytes=ret_bytes,
-                relocations=[], stack_frame_size=0, saved_nonvolatile_regs=[], code_end_offset=len(ret_bytes),
+                relocations=[
+                CodegenRelocation(offset=off, symbol_name=sym, reloc_type="RISCV_CALL_PLT")
+                for off, sym in buf.relocations
+            ], stack_frame_size=0, saved_nonvolatile_regs=[], code_end_offset=len(ret_bytes),
             )
 
         # Assign stack slots relative to sp (kept within 12-bit +/-2047 immediate range when small,
@@ -215,6 +246,8 @@ class Riscv64CodeGenerator:
         def load_op(opnd: Any, dst_reg: str):
             if isinstance(opnd, bool):
                 buf.emit(_rv_i(int(opnd), "zero", 0, dst_reg, 0x13))
+            elif isinstance(opnd, float):
+                buf.emit(_rv_li(dst_reg, _f64_bits(opnd)))
             elif isinstance(opnd, int):
                 buf.emit(_rv_li(dst_reg, opnd))
             elif isinstance(opnd, SSAVar):
@@ -222,6 +255,7 @@ class Riscv64CodeGenerator:
             else:
                 buf.emit(_rv_i(0, "zero", 0, dst_reg, 0x13))
 
+        buf.mark(".L_func_entry")
         for i, pname in enumerate(fn.params):
             if i < len(_PARAM_REGS):
                 emit_store_slot(_PARAM_REGS[i], SSAVar(pname, 0))
@@ -310,9 +344,11 @@ class Riscv64CodeGenerator:
                         idx_p = fn.params.index(idx_p)
                     if isinstance(idx_p, int) and idx_p < len(_PARAM_REGS) and inst.result is not None:
                         emit_store_slot(_PARAM_REGS[idx_p], inst.result)
-                elif op == "const" and inst.result is not None:
+                elif op in ("const", "fconst") and inst.result is not None:
                     load_op(inst.operands[0], "t0")
                     emit_store_slot("t0", inst.result)
+                elif op in ("unroll_meta", "unroll_factor"):
+                    continue
                 elif op == "mov" and inst.result is not None:
                     load_op(inst.operands[0], "t0")
                     emit_store_slot("t0", inst.result)
@@ -358,6 +394,78 @@ class Riscv64CodeGenerator:
                         buf.emit(_rv_r(0x00, "t1", "t0", 2, "t0"))     # SLT t0, t0, t1 (t0 < t1)
                         buf.emit(_rv_i(1, "t0", 4, "t0", 0x13))        # XORI t0, t0, 1
                     emit_store_slot("t0", inst.result)
+                elif op in ("fadd", "fsub", "fmul", "fdiv") and inst.result is not None:
+                    load_op(inst.operands[0], "t0")
+                    load_op(inst.operands[1], "t1")
+                    buf.emit(_rv_fp_r(0x79, 0, _RV_REG["t0"], 0, _RV_FREG["ft0"]))  # FMV.D.X ft0, t0
+                    buf.emit(_rv_fp_r(0x79, 0, _RV_REG["t1"], 0, _RV_FREG["ft1"]))  # FMV.D.X ft1, t1
+                    fp_f7 = {"fadd": 0x01, "fsub": 0x05, "fmul": 0x09, "fdiv": 0x0D}[op]
+                    buf.emit(_rv_fp_r(fp_f7, _RV_FREG["ft1"], _RV_FREG["ft0"], 7, _RV_FREG["ft0"]))
+                    buf.emit(_rv_fp_r(0x71, 0, _RV_FREG["ft0"], 0, _RV_REG["t0"]))  # FMV.X.D t0, ft0
+                    emit_store_slot("t0", inst.result)
+                elif op == "fneg" and inst.result is not None:
+                    load_op(inst.operands[0], "t0")
+                    buf.emit(_rv_fp_r(0x79, 0, _RV_REG["t0"], 0, _RV_FREG["ft0"]))
+                    buf.emit(_rv_fp_r(0x11, _RV_FREG["ft0"], _RV_FREG["ft0"], 1, _RV_FREG["ft0"]))  # FSGNJN.D
+                    buf.emit(_rv_fp_r(0x71, 0, _RV_FREG["ft0"], 0, _RV_REG["t0"]))
+                    emit_store_slot("t0", inst.result)
+                elif op == "sitofp" and inst.result is not None:
+                    load_op(inst.operands[0], "t0")
+                    buf.emit(_rv_fp_r(0x69, 2, _RV_REG["t0"], 7, _RV_FREG["ft0"]))  # FCVT.D.L ft0, t0
+                    buf.emit(_rv_fp_r(0x71, 0, _RV_FREG["ft0"], 0, _RV_REG["t0"]))  # FMV.X.D t0, ft0
+                    emit_store_slot("t0", inst.result)
+                elif op == "fptosi" and inst.result is not None:
+                    load_op(inst.operands[0], "t0")
+                    buf.emit(_rv_fp_r(0x79, 0, _RV_REG["t0"], 0, _RV_FREG["ft0"]))  # FMV.D.X ft0, t0
+                    buf.emit(_rv_fp_r(0x61, 2, _RV_FREG["ft0"], 1, _RV_REG["t0"]))  # FCVT.L.D t0, ft0, rtz
+                    emit_store_slot("t0", inst.result)
+                elif op in ("fcmp_eq", "fcmp_ne", "fcmp_lt", "fcmp_le", "fcmp_gt", "fcmp_ge") and inst.result is not None:
+                    load_op(inst.operands[0], "t0")
+                    load_op(inst.operands[1], "t1")
+                    buf.emit(_rv_fp_r(0x79, 0, _RV_REG["t0"], 0, _RV_FREG["ft0"]))
+                    buf.emit(_rv_fp_r(0x79, 0, _RV_REG["t1"], 0, _RV_FREG["ft1"]))
+                    if op == "fcmp_eq":
+                        buf.emit(_rv_fp_r(0x51, _RV_FREG["ft1"], _RV_FREG["ft0"], 2, _RV_REG["t0"]))
+                    elif op == "fcmp_ne":
+                        buf.emit(_rv_fp_r(0x51, _RV_FREG["ft1"], _RV_FREG["ft0"], 2, _RV_REG["t0"]))
+                        buf.emit(_rv_i(1, "t0", 4, "t0", 0x13))  # XORI t0, t0, 1
+                    elif op == "fcmp_lt":
+                        buf.emit(_rv_fp_r(0x51, _RV_FREG["ft1"], _RV_FREG["ft0"], 1, _RV_REG["t0"]))
+                    elif op == "fcmp_le":
+                        buf.emit(_rv_fp_r(0x51, _RV_FREG["ft1"], _RV_FREG["ft0"], 0, _RV_REG["t0"]))
+                    elif op == "fcmp_gt":
+                        buf.emit(_rv_fp_r(0x51, _RV_FREG["ft0"], _RV_FREG["ft1"], 1, _RV_REG["t0"]))
+                    elif op == "fcmp_ge":
+                        buf.emit(_rv_fp_r(0x51, _RV_FREG["ft0"], _RV_FREG["ft1"], 0, _RV_REG["t0"]))
+                    emit_store_slot("t0", inst.result)
+                elif op in ("atomic_add", "atomic_swap", "atomic_xchg", "atomic_and", "atomic_or", "atomic_xor"):
+                    load_op(inst.operands[0], "t0")  # ptr
+                    load_op(inst.operands[1], "t1")  # val
+                    amo_f5 = {
+                        "atomic_add": 0x00, "atomic_swap": 0x01, "atomic_xchg": 0x01,
+                        "atomic_xor": 0x04, "atomic_or": 0x08, "atomic_and": 0x0C,
+                    }[op]
+                    buf.emit(_rv_amo_d(amo_f5, "t1", "t0", "t2", aq=1, rl=1))
+                    if inst.result is not None:
+                        emit_store_slot("t2", inst.result)
+                elif op == "atomic_cas":
+                    # LL/SC loop: LR.D t3, (t0); BNE t3, t1, done; SC.D t4, t2, (t0); BNEZ t4, retry
+                    load_op(inst.operands[0], "t0")  # ptr
+                    load_op(inst.operands[1], "t1")  # expected
+                    load_op(inst.operands[2], "t2")  # desired
+                    edge_ctr += 1
+                    lbl_retry = f".L_cas_retry_{edge_ctr}"
+                    lbl_done = f".L_cas_done_{edge_ctr}"
+                    buf.mark(lbl_retry)
+                    buf.emit(_rv_amo_d(0x02, "zero", "t0", "t3", aq=1, rl=0))  # LR.D.AQ t3, (t0)
+                    buf.emit(_rv_b(16, "t1", "t3", 1))                        # BNE t3, t1, +16 -> done
+                    buf.emit(_rv_amo_d(0x03, "t2", "t0", "t4", aq=0, rl=1))   # SC.D.RL t4, t2, (t0)
+                    buf.bnez("t4", lbl_retry)
+                    buf.mark(lbl_done)
+                    if inst.result is not None:
+                        emit_store_slot("t3", inst.result)
+                elif op == "fence":
+                    buf.emit(struct.pack("<I", 0x0FF0000F))  # FENCE iorw, iorw
                 elif op == "select" and inst.result is not None:
                     edge_ctr += 1
                     lbl_f = f".L_sel_f_{edge_ctr}"
@@ -420,9 +528,25 @@ class Riscv64CodeGenerator:
                         emit_phi_copies(blk.name, f_bb)
                     if next_bb_name != f_n:
                         buf.j(f".L_bb_{f_n}")
+                elif op == "call":
+                    callee = str(inst.operands[0])
+                    for idx_a, a_op in enumerate(inst.operands[1:]):
+                        if idx_a < len(_PARAM_REGS):
+                            load_op(a_op, _PARAM_REGS[idx_a])
+                    call_pos = len(buf.code)
+                    if callee == fn.name:
+                        buf.fixups.append(("jal_ra", call_pos, ".L_func_entry", None))
+                    else:
+                        buf.relocations.append((call_pos, callee))
+                    buf.emit(_rv_j(0, "ra"))
+                    if inst.result is not None:
+                        emit_store_slot("a0", inst.result)
                 elif op == "ret":
                     if inst.operands:
-                        load_op(inst.operands[0], "a0")
+                        rv = inst.operands[0]
+                        load_op(rv, "a0")
+                        if getattr(fn, "return_type", "i64") == "f64" or isinstance(rv, float) or (isinstance(rv, SSAVar) and rv.var_type == "f64"):
+                            buf.emit(_rv_fp_r(0x79, 0, _RV_REG["a0"], 0, _RV_FREG["fa0"]))
                     else:
                         buf.emit(_rv_i(0, "zero", 0, "a0", 0x13))
                     buf.j(".L_epilogue")
@@ -448,7 +572,10 @@ class Riscv64CodeGenerator:
             arch="riscv64",
             abi=self.abi,
             code_bytes=raw_code,
-            relocations=[],
+            relocations=[
+                CodegenRelocation(offset=off, symbol_name=sym, reloc_type="RISCV_CALL_PLT")
+                for off, sym in buf.relocations
+            ],
             stack_frame_size=frame_size,
             saved_nonvolatile_regs=["ra", "s0"],
             code_end_offset=len(raw_code),
