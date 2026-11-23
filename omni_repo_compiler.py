@@ -1892,11 +1892,29 @@ class OmniRepoCompiler:
                 ".debug_abbrev": dwarf_abbrev_bytes,
                 ".debug_line": dwarf_line_bytes,
             }
+            if effective_os in ("linux", "elf"):
+                from compiler.debug_info_emitter import DwarfCFIFrameEmitter
+                cfi_funcs = [
+                    {
+                        "initial_location": sp["low_pc"],
+                        "address_range": max(1, sp["high_pc"] - sp["low_pc"]),
+                        "prologue_size": compiled_artifacts[sp["name"]].prologue_size if sp["name"] in compiled_artifacts else 4,
+                        "stack_frame_size": compiled_artifacts[sp["name"]].stack_frame_size if sp["name"] in compiled_artifacts else 0,
+                        "saved_regs": compiled_artifacts[sp["name"]].saved_nonvolatile_regs if sp["name"] in compiled_artifacts else [],
+                    }
+                    for sp in subprogram_dies
+                ]
+                eh_frame_bytes = DwarfCFIFrameEmitter().emit_eh_frame(cfi_funcs, arch=effective_arch)
+                dwarf_sections_map[".eh_frame"] = eh_frame_bytes
+            else:
+                eh_frame_bytes = b""
             results["stages"]["debug_info"] = {
                 "dwarf_version": 5,
                 "debug_line_bytes": len(dwarf_line_bytes),
                 "debug_info_bytes": len(dwarf_info_bytes),
                 "debug_abbrev_bytes": len(dwarf_abbrev_bytes),
+                "eh_frame_bytes": len(eh_frame_bytes),
+                "eh_frame_fde_count": len(subprogram_dies) if eh_frame_bytes else 0,
                 "subprograms_count": len(subprogram_dies),
                 "line_mappings_count": len(all_line_entries),
             }

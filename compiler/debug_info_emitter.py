@@ -521,3 +521,143 @@ def decode_win64_pdata(pdata: bytes, xdata: bytes) -> List[Dict[str, Any]]:
             "frame_register": frame_reg & 0xF,
         })
     return entries
+
+
+# ==============================================================================
+# DWARF CFI Zero-Cost Exception Unwinding (`.eh_frame` CIE + FDE) (Alpha-C90)
+# ==============================================================================
+
+_X64_DWARF_REG = {
+    "rax": 0, "rdx": 1, "rcx": 2, "rbx": 3,
+    "rsi": 4, "rdi": 5, "rbp": 6, "rsp": 7,
+    "r8": 8, "r9": 9, "r10": 10, "r11": 11,
+    "r12": 12, "r13": 13, "r14": 14, "r15": 15,
+    "rip": 16,
+}
+
+_ARM64_DWARF_REG = {
+    **{f"x{i}": i for i in range(31)},
+    "sp": 31,
+}
+
+
+class DwarfCFIFrameEmitter:
+    """
+    Emits System V ELF `.eh_frame` DWARF Call Frame Information (CIE + FDE records)
+    describing stack-frame CFA recovery and callee-saved register spills for zero-cost
+    exception unwinding on x86-64 and ARM64.
+    """
+
+    def emit_eh_frame(
+        self,
+        functions: List[Dict[str, Any]],
+        arch: str = "x86_64",
+    ) -> bytes:
+        is_arm64 = arch.lower() in ("arm64", "aarch64")
+        sp_reg = 31 if is_arm64 else 7
+        ra_reg = 30 if is_arm64 else 16
+        fp_reg = 29 if is_arm64 else 6
+        reg_map = _ARM64_DWARF_REG if is_arm64 else _X64_DWARF_REG
+
+        # CIE (version 1, "zR" augmentation, DW_EH_PE_absptr=0x00, code_align=1, data_align=-8)
+        cie_body = bytearray()
+        cie_body.extend(struct.pack("<IB", 0, 1))  # CIE_id=0, version=1
+        cie_body.extend(b"zR\x00")
+        cie_body.extend(encode_uleb128(1))         # code_alignment_factor
+        cie_body.extend(encode_sleb128(-8))        # data_alignment_factor
+        cie_body.extend(encode_uleb128(ra_reg))    # return_address_register
+        cie_body.extend(encode_uleb128(1))         # augmentation data length
+        cie_body.append(0x00)                      # DW_EH_PE_absptr (64-bit pointer)
+        # Initial CFA: CFA = SP + (0 on arm64 else 8), RA at [CFA - 8] for x64
+        if is_arm64:
+            cie_body.append(0x0C)  # DW_CFA_def_cfa
+            cie_body.extend(encode_uleb128(sp_reg))
+            cie_body.extend(encode_uleb128(0))
+        else:
+            cie_body.append(0x0C)  # DW_CFA_def_cfa(rsp, 8)
+            cie_body.extend(encode_uleb128(sp_reg))
+            cie_body.extend(encode_uleb128(8))
+            cie_body.append(0x80 | ra_reg)  # DW_CFA_offset(rip, 1 * -8 = -8)
+            cie_body.extend(encode_uleb128(1))
+        while (4 + len(cie_body)) % 8 != 0:
+            cie_body.append(0x00)  # DW_CFA_nop
+        cie_bytes = struct.pack("<I", len(cie_body)) + bytes(cie_body)
+
+        out = bytearray(cie_bytes)
+        for fn_info in functions:
+            init_pc = int(fn_info.get("initial_location", fn_info.get("low_pc", 0x1000)))
+            code_sz = max(1, int(fn_info.get("address_range", fn_info.get("code_size", 16))))
+            frame_sz = max(0, int(fn_info.get("stack_frame_size", 0)))
+            prolog_sz = max(1, min(code_sz - 1, int(fn_info.get("prologue_size", 4))))
+            saved = list(fn_info.get("saved_regs") or [])
+
+            fde_offset = len(out)
+            # CIE_pointer in FDE points backward from the CIE_pointer field (fde_offset + 4) to CIE (0)
+            cie_ptr = fde_offset + 4
+            fde_body = bytearray()
+            fde_body.extend(struct.pack("<IQQB", cie_ptr, init_pc, code_sz, 0))
+
+            # Advance across prologue pushes and frame allocation
+            adv = min(63, prolog_sz)
+            fde_body.append(0x40 | adv)  # DW_CFA_advance_loc(adv)
+            total_cfa = (0 if is_arm64 else 8) + frame_sz
+            pushed_words = 0
+            for r in saved:
+                if r in reg_map:
+                    pushed_words += 1
+                    rnum = reg_map[r]
+                    if not is_arm64 and pushed_words == 1 and r == "rbp":
+                        cfa_off = 16
+                    else:
+                        cfa_off = (0 if is_arm64 else 8) + pushed_words * 8
+                    if rnum <= 63:
+                        fde_body.append(0x80 | rnum)
+                        fde_body.extend(encode_uleb128(1 + pushed_words))
+                    else:
+                        fde_body.append(0x05)  # DW_CFA_offset_extended
+                        fde_body.extend(encode_uleb128(rnum))
+                        fde_body.extend(encode_uleb128(1 + pushed_words))
+            final_cfa_off = max(total_cfa, (0 if is_arm64 else 8) + pushed_words * 8)
+            fde_body.append(0x0E)  # DW_CFA_def_cfa_offset
+            fde_body.extend(encode_uleb128(final_cfa_off))
+            if not is_arm64 and "rbp" in saved:
+                fde_body.append(0x0D)  # DW_CFA_def_cfa_register(rbp)
+                fde_body.extend(encode_uleb128(fp_reg))
+
+            while (4 + len(fde_body)) % 8 != 0:
+                fde_body.append(0x00)
+            out.extend(struct.pack("<I", len(fde_body)) + bytes(fde_body))
+
+        out.extend(b"\x00\x00\x00\x00")  # CIE/FDE ZERO terminator
+        return bytes(out)
+
+    @staticmethod
+    def decode_eh_frame(data: bytes) -> Dict[str, Any]:
+        """Decodes CIE and FDE headers from an ELF `.eh_frame` section."""
+        pos = 0
+        cies: List[Dict[str, Any]] = []
+        fdes: List[Dict[str, Any]] = []
+        while pos + 4 <= len(data):
+            length = struct.unpack_from("<I", data, pos)[0]
+            pos += 4
+            if length == 0:
+                break
+            rec = data[pos:pos + length]
+            pos += length
+            cie_id = struct.unpack_from("<I", rec, 0)[0]
+            if cie_id == 0:
+                cies.append({"version": rec[4], "length": length})
+            else:
+                init_loc, addr_range = struct.unpack_from("<QQ", rec, 4)
+                fdes.append({
+                    "cie_pointer": cie_id,
+                    "initial_location": init_loc,
+                    "address_range": addr_range,
+                    "length": length,
+                })
+        return {
+            "cie_count": len(cies),
+            "fde_count": len(fdes),
+            "cies": cies,
+            "fdes": fdes,
+        }
