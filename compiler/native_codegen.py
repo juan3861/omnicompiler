@@ -1249,6 +1249,8 @@ class X64CodeGenerator:
                             and ins_top.opcode.lower() == op
                             and isinstance(inst.result, SSAVar)
                             and isinstance(ins_hi.result, SSAVar)
+                            and inst.result != ins_hi.result
+                            and inst.result not in ins_hi.operands
                             and len(inst.operands) == 2
                             and len(ins_hi.operands) == 2
                             and len(ins_top.operands) == 2
@@ -1375,9 +1377,8 @@ class X64CodeGenerator:
                             resolve_operand_to_reg(inst.operands[0], "rax")
                             if k == 1:
                                 if op in ("div", "sdiv"):
-                                    buf.emit(b"\x48\x89\xc1")          # mov rcx, rax
-                                    buf.emit(b"\x48\xc1\xe9\x3f")      # shr rcx, 63
-                                    buf.emit(_x64_alu_rr(0x01, "rax", "rcx")) # add rax, rcx
+                                    buf.emit(b"\x48\x99")              # cqo (rdx = sign(rax))
+                                    buf.emit(b"\x48\x29\xd0")          # sub rax, rdx
                                     buf.emit(b"\x48\xd1\xf8")          # sar rax, 1
                                     write_result_from_reg(inst.result, "rax")
                                 else:
@@ -1554,6 +1555,8 @@ class X64CodeGenerator:
                             and ins_top.opcode.lower() == "fadd"
                             and isinstance(inst.result, SSAVar)
                             and isinstance(ins_hi.result, SSAVar)
+                            and inst.result != ins_hi.result
+                            and inst.result not in ins_hi.operands
                             and len(inst.operands) == 2
                             and len(ins_hi.operands) == 2
                             and len(ins_top.operands) == 2
@@ -2947,6 +2950,8 @@ class Arm64CodeGenerator:
                             and ins_top.opcode.lower() == "add"
                             and isinstance(inst.result, SSAVar)
                             and isinstance(ins_hi.result, SSAVar)
+                            and inst.result != ins_hi.result
+                            and inst.result not in ins_hi.operands
                             and len(inst.operands) == 2
                             and len(ins_hi.operands) == 2
                             and len(ins_top.operands) == 2
@@ -3077,6 +3082,8 @@ class Arm64CodeGenerator:
                             and ins_top.opcode.lower() == "fadd"
                             and isinstance(inst.result, SSAVar)
                             and isinstance(ins_hi.result, SSAVar)
+                            and inst.result != ins_hi.result
+                            and inst.result not in ins_hi.operands
                             and len(inst.operands) == 2
                             and len(ins_hi.operands) == 2
                             and len(ins_top.operands) == 2

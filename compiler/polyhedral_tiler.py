@@ -431,13 +431,16 @@ class LoopUnrollPass:
         if not iv_step_is_one:
             return False
 
-        # Allow 8x unroll for compact integer loops without division/memory pressure; 4x otherwise
-        has_heavy_op = any(
-            ins.opcode in ("sdiv", "div", "srem", "fdiv", "call", "load", "load_off")
+        # Allow 8x unroll for compact integer loops without division/memory pressure; 2x for div-heavy sequential loops; 4x otherwise
+        has_div = any(ins.opcode in ("sdiv", "div", "srem", "fdiv") for ins in orig_insts)
+        has_heavy_op = has_div or any(
+            ins.opcode in ("call", "load", "load_off")
             for ins in orig_insts
         )
         if not has_heavy_op and len(orig_insts) <= 16 and len(header.phi_nodes) <= 3:
             u = min(factor, 8)
+        elif has_div and len(orig_insts) >= 8:
+            u = 2
         else:
             u = min(factor, 4)
         if u < 2:
@@ -639,6 +642,14 @@ class LoopUnrollPass:
                     iter_remap[ins.result] = new_res
                     if ins.opcode == "const" and ins.result in const_map:
                         const_map[new_res] = const_map[ins.result]
+                    if r > 0 and ins.result == iv_next_var:
+                        c_step_r = self._fresh_var(ins.result, f"ivs{r}")
+                        const_map[c_step_r] = r + 1
+                        unrolled_insts.append(SSAInstruction(c_step_r, "const", [r + 1], source_line=ins.source_line))
+                        unrolled_insts.append(
+                            SSAInstruction(new_res, "add", [iv_var, c_step_r], source_line=ins.source_line)
+                        )
+                        continue
                     if r == 0 and ins.opcode == "mul" and len(new_ops) == 2:
                         if new_ops[0] == cur_iv_r and isinstance(new_ops[1], SSAVar) and new_ops[1] in const_map:
                             base_iv_mul_cache[const_map[new_ops[1]]] = new_res
