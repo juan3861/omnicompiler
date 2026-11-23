@@ -55,7 +55,7 @@ def canonical_ssa_digest(fn: SSAFunction) -> str:
 
 SUPPORTED_Z3_OPCODES = frozenset({
     "param", "const", "mov",
-    "add", "sub", "mul", "sdiv", "srem",
+    "add", "sub", "mul", "smulh", "umulh", "sdiv", "srem",
     "shl", "shr", "sar", "lshr", "and", "or", "xor",
     "neg", "not",
     "cmp_eq", "cmp_ne", "cmp_lt", "cmp_le", "cmp_gt", "cmp_ge",
@@ -569,7 +569,7 @@ class SSATranslationValidator:
                     elif eff_op in (
                         "add", "add_nsw", "add_nuw",
                         "sub", "sub_nsw", "sub_nuw",
-                        "mul", "mul_nsw", "mul_nuw",
+                        "mul", "mul_nsw", "mul_nuw", "smulh", "umulh",
                         "sdiv", "srem", "sdiv_exact",
                         "udiv", "urem", "udiv_exact",
                         "shl", "shl_nsw", "shl_nuw", "shr", "sar", "lshr",
@@ -613,6 +613,12 @@ class SSATranslationValidator:
                             elif eff_op == "mul_nuw":
                                 p128 = z3.ZeroExt(64, a) * z3.ZeroExt(64, b)
                                 out_p = z3.Or(base_p, z3.Extract(127, 64, p128) != zero_bv)
+                        elif eff_op == "smulh":
+                            p128 = z3.SignExt(64, a) * z3.SignExt(64, b)
+                            res = z3.Extract(127, 64, p128)
+                        elif eff_op == "umulh":
+                            p128 = z3.ZeroExt(64, a) * z3.ZeroExt(64, b)
+                            res = z3.Extract(127, 64, p128)
                         elif eff_op in ("sdiv", "sdiv_exact"):
                             div_ub = z3.Or(b == zero_bv, z3.And(a == min_s64, b == neg1_bv))
                             ub_clauses.append(z3.And(b_reach, z3.Or(div_ub, poison_b)))
@@ -1268,7 +1274,7 @@ class SSATranslationValidator:
                             env_levels[lvl][inst.result] = z3.If(v == 0, z3.BitVecVal(1, 64), z3.BitVecVal(0, 64))
 
                     elif op in (
-                        "add", "sub", "mul", "sdiv", "srem",
+                        "add", "sub", "mul", "smulh", "umulh", "sdiv", "srem",
                         "shl", "shr", "sar", "lshr", "and", "or", "xor",
                         "cmp_eq", "cmp_ne", "cmp_lt", "cmp_le", "cmp_gt", "cmp_ge",
                     ):
@@ -1287,6 +1293,10 @@ class SSATranslationValidator:
                             res_bv = v0 - v1
                         elif op == "mul":
                             res_bv = v0 * v1
+                        elif op == "smulh":
+                            res_bv = z3.Extract(127, 64, z3.SignExt(64, v0) * z3.SignExt(64, v1))
+                        elif op == "umulh":
+                            res_bv = z3.Extract(127, 64, z3.ZeroExt(64, v0) * z3.ZeroExt(64, v1))
                         elif op == "sdiv":
                             res_bv = v0 / v1
                         elif op == "srem":
@@ -1726,7 +1736,7 @@ class SSATranslationValidator:
                     )
 
                 elif op in (
-                    "add", "sub", "mul", "sdiv", "srem",
+                    "add", "sub", "mul", "smulh", "umulh", "sdiv", "srem",
                     "shl", "shr", "sar", "lshr", "and", "or", "xor",
                     "cmp_eq", "cmp_ne", "cmp_lt", "cmp_le", "cmp_gt", "cmp_ge",
                 ):
@@ -1744,6 +1754,10 @@ class SSATranslationValidator:
                         res_bv = v0 - v1
                     elif op == "mul":
                         res_bv = v0 * v1
+                    elif op == "smulh":
+                        res_bv = z3.Extract(127, 64, z3.SignExt(64, v0) * z3.SignExt(64, v1))
+                    elif op == "umulh":
+                        res_bv = z3.Extract(127, 64, z3.ZeroExt(64, v0) * z3.ZeroExt(64, v1))
                     elif op == "sdiv":
                         res_bv = v0 / v1
                     elif op == "srem":

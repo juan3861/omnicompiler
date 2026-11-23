@@ -1441,6 +1441,1182 @@ class WATToSSALifter:
         return None
 
 
+def _prune_trivial_and_dead_phis(fn: SSAFunction) -> SSAFunction:
+    """
+    Simplifies trivial PHIs (single unique non-self incoming value) and removes dead PHIs
+    never referenced in instructions, ret, or remaining PHIs so Z3 sees minimal loop state.
+    """
+    changed = True
+    while changed:
+        changed = False
+        repl: Dict[SSAVar, Any] = {}
+        for blk in fn.blocks:
+            kept: List[SSAInstruction] = []
+            for phi in blk.phi_nodes:
+                if phi.result is None:
+                    continue
+                uniq: List[Any] = []
+                for _, v in phi.phi_incoming:
+                    if isinstance(v, SSAVar) and v == phi.result:
+                        continue
+                    if not any((type(u) is type(v) and u == v) for u in uniq):
+                        uniq.append(v)
+                if len(uniq) == 1:
+                    repl[phi.result] = uniq[0]
+                    changed = True
+                else:
+                    kept.append(phi)
+            blk.phi_nodes = kept
+        if repl:
+            def sub(x: Any) -> Any:
+                while isinstance(x, SSAVar) and x in repl:
+                    nx = repl[x]
+                    if nx == x:
+                        break
+                    x = nx
+                return x
+
+            for blk in fn.blocks:
+                for phi in blk.phi_nodes:
+                    phi.phi_incoming = [(pn, sub(v)) for pn, v in phi.phi_incoming]
+                for inst in blk.instructions:
+                    inst.operands = [sub(o) for o in inst.operands]
+
+        # Dead PHI elimination
+        used: Set[SSAVar] = set()
+        for blk in fn.blocks:
+            for phi in blk.phi_nodes:
+                for _, v in phi.phi_incoming:
+                    if isinstance(v, SSAVar) and v != phi.result:
+                        used.add(v)
+            for inst in blk.instructions:
+                for o in inst.operands:
+                    if isinstance(o, SSAVar):
+                        used.add(o)
+        for blk in fn.blocks:
+            new_phis = [p for p in blk.phi_nodes if p.result in used]
+            if len(new_phis) != len(blk.phi_nodes):
+                blk.phi_nodes = new_phis
+                changed = True
+    return fn
+
+
+def _build_lifted_cfg_ssa(
+    fn_name: str,
+    params: Sequence[str],
+    param_regs: Sequence[str],
+    arch_regs: Sequence[str],
+    leaders: List[int],
+    blk_insts: Dict[int, List[Any]],
+    blk_succs: Dict[int, List[int]],
+    translate_block_fn,
+    param_types: Optional[Dict[str, str]] = None,
+) -> SSAFunction:
+    """
+    Shared 2-pass Cytron-Braun SSA builder over decoded basic blocks for native machine code lifters:
+    creates entry params, allocates block-header PHIs at join/back-edge headers, translates blocks
+    in RPO order, populates incoming PHI edges, and prunes dead/trivial PHIs.
+    """
+    leader_to_name = {off: ("entry" if off == 0 else f"bb_{off}") for off in leaders}
+    blocks_map: Dict[int, BasicBlock] = {off: BasicBlock(leader_to_name[off]) for off in leaders}
+    preds: Dict[int, List[int]] = {off: [] for off in leaders}
+    for src, dsts in blk_succs.items():
+        if src not in blocks_map:
+            continue
+        for dst in dsts:
+            if dst not in blocks_map:
+                continue
+            sb, db = blocks_map[src], blocks_map[dst]
+            if db not in sb.successors:
+                sb.successors.append(db)
+            if sb not in db.predecessors:
+                db.predecessors.append(sb)
+            if src not in preds[dst]:
+                preds[dst].append(src)
+
+    # DFS RPO traversal from offset 0 + back-edge target identification
+    visited: Set[int] = set()
+    visiting: Set[int] = set()
+    postorder: List[int] = []
+    back_targets: Set[int] = set()
+
+    def dfs(u: int):
+        visited.add(u)
+        visiting.add(u)
+        for v in blk_succs.get(u, []):
+            if v in visiting:
+                back_targets.add(v)
+            elif v in blocks_map and v not in visited:
+                dfs(v)
+        visiting.remove(u)
+        postorder.append(u)
+
+    if 0 in blocks_map:
+        dfs(0)
+    rpo = list(reversed(postorder))
+
+    var_ver: Dict[str, int] = {}
+
+    def fresh(prefix: str = "t") -> SSAVar:
+        v = var_ver.get(prefix, 0) + 1
+        var_ver[prefix] = v
+        return SSAVar(prefix, v)
+
+    # Identify all architectural registers and frame offsets modified across blocks
+    init_state: Dict[Any, Any] = {}
+    entry_blk = blocks_map[0]
+    for i, pname in enumerate(params):
+        pv = SSAVar(pname, 0)
+        entry_blk.add_instruction(SSAInstruction(pv, "param", [i]))
+        if i < len(param_regs):
+            init_state[param_regs[i]] = pv
+    for r in arch_regs:
+        if r not in init_state:
+            init_state[r] = 0
+    init_state[("sp_off",)] = 0
+    init_state[("fp_off",)] = 0
+
+    join_headers = {
+        off for off in rpo if off != 0 and (len(preds[off]) > 1 or off in back_targets)
+    }
+
+    # Pre-scan modified slots (regs + canonical frame stack offsets) for join-header PHIs
+    tracked_slots: List[Any] = list(arch_regs)
+    for off in rpo:
+        for ins in blk_insts.get(off, []):
+            for slot in ins.get("writes_slots", ()):
+                if slot not in tracked_slots:
+                    tracked_slots.append(slot)
+
+    header_phis: Dict[int, Dict[Any, SSAInstruction]] = {}
+    for joff in join_headers:
+        header_phis[joff] = {}
+        jb = blocks_map[joff]
+        for slot in tracked_slots:
+            if isinstance(slot, str):
+                s_name = f"phi_{slot}"
+            elif isinstance(slot, tuple) and len(slot) >= 2:
+                s_name = f"phi_s{str(slot[1]).replace('-', 'm')}"
+            else:
+                s_name = "phi_slot"
+            sv = fresh(s_name)
+            phi_ins = SSAInstruction(sv, "phi", [], phi_incoming=[])
+            jb.phi_nodes.append(phi_ins)
+            header_phis[joff][slot] = phi_ins
+
+    exit_states: Dict[int, Dict[Any, Any]] = {}
+    for off in rpo:
+        blk = blocks_map[off]
+        if off == 0:
+            st = dict(init_state)
+        elif off in join_headers:
+            # Start with entry PHIs; carry forward SP/FP constants if non-phi
+            base_pred = next((p for p in preds[off] if p in exit_states), None)
+            st = dict(exit_states[base_pred]) if base_pred is not None else dict(init_state)
+            for slot, phi_ins in header_phis[off].items():
+                st[slot] = phi_ins.result
+        else:
+            p0 = preds[off][0] if preds[off] else None
+            st = dict(exit_states[p0]) if (p0 is not None and p0 in exit_states) else dict(init_state)
+
+        exit_st = translate_block_fn(off, blk, st, fresh, leader_to_name)
+        exit_states[off] = exit_st
+
+    # Populate join-header PHIs cleanly
+    for joff in join_headers:
+        jb = blocks_map[joff]
+        for slot, phi_ins in header_phis[joff].items():
+            incoming: List[Tuple[str, Any]] = []
+            for p_off in preds[joff]:
+                pst = exit_states.get(p_off, init_state)
+                incoming.append((leader_to_name[p_off], pst.get(slot, 0)))
+            phi_ins.phi_incoming = incoming
+
+    fn = SSAFunction(name=fn_name, params=list(params), param_types=dict(param_types or {}))
+    fn.blocks = [blocks_map[o] for o in rpo]
+    fn.entry_block = blocks_map[0]
+    return _prune_trivial_and_dead_phis(fn)
+
+
+class X64MachineToSSALifter:
+    """
+    Pure-Python x86-64 machine-code disassembler and Machine-to-SSA Lifter.
+    Supports REX-encoded 64-bit GPRs, Win64/SysV ABIs, frame slots [rbp/rsp +/- disp],
+    ALU/imm, imul/idiv/cqo, shifts (shl/lshr/sar), cmp/test + jcc/setcc/cmovcc,
+    heap load/store, and full multi-block CFG + loop PHI recovery.
+    """
+
+    GPR64 = [
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    ]
+    SYSV_ARGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+    WIN64_ARGS = ["rcx", "rdx", "r8", "r9"]
+    CC_MAP = {
+        0x4: "cmp_eq", 0x5: "cmp_ne",
+        0xC: "cmp_lt", 0xD: "cmp_ge",
+        0xE: "cmp_le", 0xF: "cmp_gt",
+        0x2: "cmp_lt", 0x3: "cmp_ge",
+        0x6: "cmp_le", 0x7: "cmp_gt",
+    }
+
+    @classmethod
+    def _decode_modrm(cls, code: bytes, pos: int, rex_x: int, rex_b: int) -> Tuple[Tuple[Any, ...], int, int]:
+        modrm = code[pos]
+        pos += 1
+        mod = (modrm >> 6) & 3
+        reg = (modrm >> 3) & 7
+        rm = modrm & 7
+        if mod == 3:
+            return ("reg", cls.GPR64[rm | (rex_b << 3)]), pos, reg
+        base: Optional[str] = None
+        index: Optional[str] = None
+        scale = 1
+        disp = 0
+        if rm == 4:
+            sib = code[pos]
+            pos += 1
+            scale = 1 << ((sib >> 6) & 3)
+            idx_n = ((sib >> 3) & 7) | (rex_x << 3)
+            base_n = (sib & 7) | (rex_b << 3)
+            if idx_n != 4:
+                index = cls.GPR64[idx_n]
+            if mod == 0 and (sib & 7) == 5:
+                disp = struct.unpack_from("<i", code, pos)[0]
+                pos += 4
+            else:
+                base = cls.GPR64[base_n]
+        elif mod == 0 and rm == 5:
+            disp = struct.unpack_from("<i", code, pos)[0]
+            pos += 4
+            base = "rip"
+        else:
+            base = cls.GPR64[rm | (rex_b << 3)]
+
+        if mod == 1:
+            disp = struct.unpack_from("<b", code, pos)[0]
+            pos += 1
+        elif mod == 2:
+            disp = struct.unpack_from("<i", code, pos)[0]
+            pos += 4
+        return ("mem", base, index, scale, disp), pos, reg
+
+    def _disasm_one(self, code: bytes, pc: int) -> Dict[str, Any]:
+        start = pc
+        n = len(code)
+        b = code[pc]
+        if b == 0xC3:
+            return {"op": "ret", "len": 1, "writes_slots": ()}
+        if b == 0x90:
+            return {"op": "nop", "len": 1, "writes_slots": ()}
+        if b == 0xC9:
+            return {"op": "leave", "len": 1, "writes_slots": ()}
+        if b == 0xC5 and pc + 2 < n and code[pc + 1] == 0xF8 and code[pc + 2] == 0x77:
+            return {"op": "nop", "len": 3, "writes_slots": ()}
+        if b == 0xE9:
+            rel = struct.unpack_from("<i", code, pc + 1)[0]
+            return {"op": "jmp", "target": pc + 5 + rel, "len": 5, "writes_slots": ()}
+        if b == 0xEB:
+            rel = struct.unpack_from("<b", code, pc + 1)[0]
+            return {"op": "jmp", "target": pc + 2 + rel, "len": 2, "writes_slots": ()}
+        if 0x70 <= b <= 0x7F:
+            rel = struct.unpack_from("<b", code, pc + 1)[0]
+            return {"op": "jcc", "cc": b & 0xF, "target": pc + 2 + rel, "len": 2, "writes_slots": ()}
+        if b == 0xE8:
+            rel = struct.unpack_from("<i", code, pc + 1)[0]
+            return {"op": "call_rel", "target": pc + 5 + rel, "len": 5, "writes_slots": ()}
+
+        rex_w, rex_r, rex_x, rex_b = 0, 0, 0, 0
+        if 0x40 <= b <= 0x4F:
+            rex_w = (b >> 3) & 1
+            rex_r = (b >> 2) & 1
+            rex_x = (b >> 1) & 1
+            rex_b = b & 1
+            pc += 1
+            b = code[pc]
+
+        if b == 0x99:
+            return {"op": "cqo", "len": pc + 1 - start, "writes_slots": ("rdx",)}
+        if b == 0x98:
+            return {"op": "nop", "len": pc + 1 - start, "writes_slots": ()}
+        if 0x50 <= b <= 0x57:
+            rname = self.GPR64[(b - 0x50) | (rex_b << 3)]
+            return {"op": "push", "reg": rname, "len": pc + 1 - start, "writes_slots": ()}
+        if 0x58 <= b <= 0x5F:
+            rname = self.GPR64[(b - 0x58) | (rex_b << 3)]
+            return {"op": "pop", "reg": rname, "len": pc + 1 - start, "writes_slots": (rname,)}
+        if 0xB8 <= b <= 0xBF:
+            rname = self.GPR64[(b - 0xB8) | (rex_b << 3)]
+            pos = pc + 1
+            if rex_w:
+                val = struct.unpack_from("<q", code, pos)[0]
+                pos += 8
+            else:
+                val = struct.unpack_from("<I", code, pos)[0]
+                pos += 4
+            return {"op": "mov_imm", "dst": ("reg", rname), "imm": val, "len": pos - start, "writes_slots": (rname,)}
+
+        if b == 0x0F:
+            op2 = code[pc + 1]
+            pos = pc + 2
+            if 0x80 <= op2 <= 0x8F:
+                rel = struct.unpack_from("<i", code, pos)[0]
+                pos += 4
+                return {"op": "jcc", "cc": op2 & 0xF, "target": pos + rel, "len": pos - start, "writes_slots": ()}
+            if op2 == 0xAF:
+                rm_op, pos, reg_idx = self._decode_modrm(code, pos, rex_x, rex_b)
+                rname = self.GPR64[reg_idx | (rex_r << 3)]
+                return {"op": "imul2", "dst": rname, "src": rm_op, "len": pos - start, "writes_slots": (rname,)}
+            if 0x90 <= op2 <= 0x9F:
+                rm_op, pos, _ = self._decode_modrm(code, pos, rex_x, rex_b)
+                w_slots = (rm_op[1],) if rm_op[0] == "reg" else ()
+                return {"op": "setcc", "cc": op2 & 0xF, "dst": rm_op, "len": pos - start, "writes_slots": w_slots}
+            if op2 == 0xB6:
+                rm_op, pos, reg_idx = self._decode_modrm(code, pos, rex_x, rex_b)
+                rname = self.GPR64[reg_idx | (rex_r << 3)]
+                return {"op": "mov", "dst": ("reg", rname), "src": rm_op, "len": pos - start, "writes_slots": (rname,)}
+            if 0x40 <= op2 <= 0x4F:
+                rm_op, pos, reg_idx = self._decode_modrm(code, pos, rex_x, rex_b)
+                rname = self.GPR64[reg_idx | (rex_r << 3)]
+                return {"op": "cmovcc", "cc": op2 & 0xF, "dst": rname, "src": rm_op, "len": pos - start, "writes_slots": (rname,)}
+            raise ValueError(f"Unsupported x64 0x0F opcode 0x{op2:02x} at {start}")
+
+        pos = pc + 1
+        rm_op, pos, reg_idx = self._decode_modrm(code, pos, rex_x, rex_b)
+        rname = self.GPR64[reg_idx | (rex_r << 3)]
+
+        def slot_for(operand: Tuple[Any, ...]) -> Tuple[Any, ...]:
+            if operand[0] == "reg" and operand[1] not in ("rsp", "rbp"):
+                return (operand[1],)
+            if operand[0] == "mem" and operand[1] in ("rbp", "rsp") and operand[2] is None:
+                return (("stk", operand[1], operand[4]),)
+            return ()
+
+        if b == 0x89:
+            return {"op": "mov", "dst": rm_op, "src": ("reg", rname), "len": pos - start, "writes_slots": slot_for(rm_op)}
+        if b == 0x8B:
+            return {"op": "mov", "dst": ("reg", rname), "src": rm_op, "len": pos - start, "writes_slots": (rname,)}
+        if b == 0x8D:
+            return {"op": "lea", "dst": rname, "addr": rm_op, "len": pos - start, "writes_slots": (rname,)}
+        if b == 0x63:
+            return {"op": "mov", "dst": ("reg", rname), "src": rm_op, "len": pos - start, "writes_slots": (rname,)}
+        if b == 0xC7 and reg_idx == 0:
+            imm = struct.unpack_from("<i", code, pos)[0]
+            pos += 4
+            return {"op": "mov_imm", "dst": rm_op, "imm": imm, "len": pos - start, "writes_slots": slot_for(rm_op)}
+        if b in (0x01, 0x29, 0x21, 0x09, 0x31, 0x39):
+            alu_m = {0x01: "add", 0x29: "sub", 0x21: "and", 0x09: "or", 0x31: "xor", 0x39: "cmp"}
+            w_s = () if b == 0x39 else slot_for(rm_op)
+            return {"op": alu_m[b], "dst": rm_op, "src": ("reg", rname), "len": pos - start, "writes_slots": w_s}
+        if b in (0x03, 0x2B, 0x23, 0x0B, 0x33, 0x3B):
+            alu_m = {0x03: "add", 0x2B: "sub", 0x23: "and", 0x0B: "or", 0x33: "xor", 0x3B: "cmp"}
+            w_s = () if b == 0x3B else (rname,)
+            return {"op": alu_m[b], "dst": ("reg", rname), "src": rm_op, "len": pos - start, "writes_slots": w_s}
+        if b in (0x81, 0x83):
+            if b == 0x81:
+                imm = struct.unpack_from("<i", code, pos)[0]
+                pos += 4
+            else:
+                imm = struct.unpack_from("<b", code, pos)[0]
+                pos += 1
+            ext_m = {0: "add", 1: "or", 4: "and", 5: "sub", 6: "xor", 7: "cmp"}
+            if reg_idx not in ext_m:
+                raise ValueError(f"Unsupported 0x{b:02x} /{reg_idx} at {start}")
+            aop = ext_m[reg_idx]
+            w_s = () if aop == "cmp" else slot_for(rm_op)
+            return {"op": aop, "dst": rm_op, "src": ("imm", imm), "len": pos - start, "writes_slots": w_s}
+        if b == 0x85:
+            return {"op": "test", "lhs": rm_op, "rhs": ("reg", rname), "len": pos - start, "writes_slots": ()}
+        if b == 0x69 or b == 0x6B:
+            if b == 0x69:
+                imm = struct.unpack_from("<i", code, pos)[0]
+                pos += 4
+            else:
+                imm = struct.unpack_from("<b", code, pos)[0]
+                pos += 1
+            return {"op": "imul3", "dst": rname, "src": rm_op, "imm": imm, "len": pos - start, "writes_slots": (rname,)}
+        if b in (0xC1, 0xD3):
+            sh_m = {4: "shl", 5: "lshr", 7: "sar"}
+            if reg_idx not in sh_m:
+                raise ValueError(f"Unsupported shift /{reg_idx} at {start}")
+            if b == 0xC1:
+                imm = struct.unpack_from("<B", code, pos)[0]
+                pos += 1
+                cnt = ("imm", imm)
+            else:
+                cnt = ("reg", "rcx")
+            return {"op": sh_m[reg_idx], "dst": rm_op, "src": cnt, "len": pos - start, "writes_slots": slot_for(rm_op)}
+        if b == 0xF7:
+            if reg_idx == 2:
+                return {"op": "not", "dst": rm_op, "len": pos - start, "writes_slots": slot_for(rm_op)}
+            if reg_idx == 3:
+                return {"op": "neg", "dst": rm_op, "len": pos - start, "writes_slots": slot_for(rm_op)}
+            if reg_idx == 5:
+                return {"op": "imul1", "src": rm_op, "len": pos - start, "writes_slots": ("rax", "rdx")}
+            if reg_idx == 7:
+                return {"op": "idiv1", "src": rm_op, "len": pos - start, "writes_slots": ("rax", "rdx")}
+        if b == 0xFF and reg_idx in (0, 1):
+            return {"op": "add" if reg_idx == 0 else "sub", "dst": rm_op, "src": ("imm", 1), "len": pos - start, "writes_slots": slot_for(rm_op)}
+        raise ValueError(f"Unsupported x64 opcode 0x{b:02x} at offset {start}")
+
+    def lift(
+        self,
+        code_bytes: bytes,
+        fn_name: str,
+        params: Sequence[str],
+        abi: str = "sysv",
+        code_end_offset: Optional[int] = None,
+        param_types: Optional[Dict[str, str]] = None,
+    ) -> SSAFunction:
+        end = len(code_bytes) if code_end_offset is None else min(len(code_bytes), int(code_end_offset))
+        raw = code_bytes[:end]
+        decoded: Dict[int, Dict[str, Any]] = {}
+        pc = 0
+        while pc < len(raw):
+            ins = self._disasm_one(raw, pc)
+            decoded[pc] = ins
+            pc += ins["len"]
+
+        leaders_set: Set[int] = {0}
+        for off, ins in decoded.items():
+            op = ins["op"]
+            if op == "jmp":
+                if 0 <= ins["target"] < len(raw):
+                    leaders_set.add(ins["target"])
+                nxt = off + ins["len"]
+                if nxt < len(raw):
+                    leaders_set.add(nxt)
+            elif op == "jcc":
+                if 0 <= ins["target"] < len(raw):
+                    leaders_set.add(ins["target"])
+                nxt = off + ins["len"]
+                if nxt < len(raw):
+                    leaders_set.add(nxt)
+            elif op == "ret":
+                nxt = off + ins["len"]
+                if nxt < len(raw):
+                    leaders_set.add(nxt)
+        leaders = sorted(o for o in leaders_set if o in decoded)
+        leader_idx_map = {o: idx for idx, o in enumerate(leaders)}
+
+        blk_insts: Dict[int, List[Any]] = {o: [] for o in leaders}
+        blk_succs: Dict[int, List[int]] = {o: [] for o in leaders}
+        for idx, start_off in enumerate(leaders):
+            next_leader = leaders[idx + 1] if idx + 1 < len(leaders) else len(raw)
+            cur = start_off
+            last_ins = None
+            while cur < next_leader and cur in decoded:
+                ins = decoded[cur]
+                blk_insts[start_off].append(ins)
+                last_ins = ins
+                cur += ins["len"]
+                if ins["op"] in ("jmp", "jcc", "ret"):
+                    break
+            if last_ins is not None:
+                op = last_ins["op"]
+                if op == "jmp":
+                    if last_ins["target"] in leader_idx_map:
+                        blk_succs[start_off].append(last_ins["target"])
+                elif op == "jcc":
+                    if last_ins["target"] in leader_idx_map:
+                        blk_succs[start_off].append(last_ins["target"])
+                    if next_leader in leader_idx_map:
+                        blk_succs[start_off].append(next_leader)
+                elif op != "ret" and next_leader in leader_idx_map:
+                    blk_succs[start_off].append(next_leader)
+
+        # Resolve canonical frame offsets (sp_off, fp_off) per block so spilled stack slots participate in loop PHIs
+        blk_sp_entry: Dict[int, Tuple[int, int]] = {0: (0, 0)}
+        work_q = [0]
+        while work_q:
+            boff = work_q.pop(0)
+            sp_o, fp_o = blk_sp_entry[boff]
+            for ins in blk_insts[boff]:
+                iop = ins["op"]
+                if iop == "push":
+                    sp_o -= 8
+                    ins["writes_slots"] = (("slot", sp_o),)
+                elif iop == "pop":
+                    sp_o += 8
+                elif iop == "leave":
+                    sp_o = fp_o + 8
+                elif iop == "mov" and ins["dst"] == ("reg", "rbp") and ins["src"] == ("reg", "rsp"):
+                    fp_o = sp_o
+                elif iop == "mov" and ins["dst"] == ("reg", "rsp") and ins["src"] == ("reg", "rbp"):
+                    sp_o = fp_o
+                elif iop in ("add", "sub") and ins["dst"] == ("reg", "rsp") and ins["src"][0] == "imm":
+                    imm_v = ins["src"][1]
+                    sp_o = sp_o + imm_v if iop == "add" else sp_o - imm_v
+                else:
+                    new_ws = []
+                    for ws in ins.get("writes_slots", ()):
+                        if isinstance(ws, tuple) and ws[0] == "stk":
+                            base_r, disp = ws[1], ws[2]
+                            new_ws.append(("slot", (sp_o if base_r == "rsp" else fp_o) + disp))
+                        else:
+                            new_ws.append(ws)
+                    ins["writes_slots"] = tuple(new_ws)
+            for s_off in blk_succs.get(boff, []):
+                if s_off not in blk_sp_entry:
+                    blk_sp_entry[s_off] = (sp_o, fp_o)
+                    work_q.append(s_off)
+
+        arg_regs = self.WIN64_ARGS if abi == "win64" else self.SYSV_ARGS
+
+        def emit_const_if_needed(blk: BasicBlock, v: Any, fresh) -> Any:
+            if isinstance(v, int):
+                return v
+            return v
+
+        def read_mem_addr(blk: BasicBlock, mem_op: Tuple[Any, ...], st: Dict[Any, Any], fresh):
+            _, base, index, scale, disp = mem_op
+            if base in ("rsp", "rbp") and index is None:
+                sp_off = st[("sp_off",)] if base == "rsp" else st[("fp_off",)]
+                if isinstance(sp_off, int):
+                    return ("stack", sp_off + disp)
+            # Heap / parameter pointer address expression
+            expr: Any = st.get(base, 0) if base and base != "rip" else 0
+            if index is not None:
+                iv = st.get(index, 0)
+                if scale != 1:
+                    s_v = fresh("addr_mul")
+                    blk.add_instruction(SSAInstruction(s_v, "mul", [iv, scale]))
+                    iv = s_v
+                a_v = fresh("addr_idx")
+                blk.add_instruction(SSAInstruction(a_v, "add", [expr, iv]))
+                expr = a_v
+            return ("heap", expr, disp)
+
+        def read_op(blk: BasicBlock, opnd: Tuple[Any, ...], st: Dict[Any, Any], fresh) -> Any:
+            kind = opnd[0]
+            if kind == "reg":
+                return st.get(opnd[1], 0)
+            if kind == "imm":
+                return opnd[1]
+            if kind == "mem":
+                loc = read_mem_addr(blk, opnd, st, fresh)
+                if loc[0] == "stack":
+                    return st.get(("slot", loc[1]), 0)
+                _, base_e, disp = loc
+                lv = fresh("ld")
+                blk.add_instruction(SSAInstruction(lv, "load_off", [base_e, disp, "i64"]))
+                return lv
+            return 0
+
+        def write_op(blk: BasicBlock, opnd: Tuple[Any, ...], val: Any, st: Dict[Any, Any], fresh):
+            if opnd[0] == "reg":
+                st[opnd[1]] = val
+            elif opnd[0] == "mem":
+                loc = read_mem_addr(blk, opnd, st, fresh)
+                if loc[0] == "stack":
+                    st[("slot", loc[1])] = val
+                else:
+                    _, base_e, disp = loc
+                    blk.add_instruction(SSAInstruction(None, "store_off", [base_e, disp, val, "i64"]))
+
+        # Normalize stack slot names inside writes_slots to match ("slot", off) keys only dynamically via reg PHIs
+        def translate_blk(off: int, blk: BasicBlock, st: Dict[Any, Any], fresh, lnames: Dict[int, str]) -> Dict[Any, Any]:
+            st = dict(st)
+            flags_pair: Tuple[Any, Any] = (0, 0)
+            for ins in blk_insts[off]:
+                op = ins["op"]
+                if op in ("nop", "cqo"):
+                    continue
+                if op == "push":
+                    sp = st[("sp_off",)]
+                    if isinstance(sp, int):
+                        sp -= 8
+                        st[("sp_off",)] = sp
+                        st[("slot", sp)] = st.get(ins["reg"], 0)
+                elif op == "pop":
+                    sp = st[("sp_off",)]
+                    if isinstance(sp, int):
+                        st[ins["reg"]] = st.get(("slot", sp), 0)
+                        st[("sp_off",)] = sp + 8
+                elif op == "leave":
+                    fp = st[("fp_off",)]
+                    if isinstance(fp, int):
+                        st["rbp"] = st.get(("slot", fp), 0)
+                        st[("sp_off",)] = fp + 8
+                elif op == "mov_imm":
+                    write_op(blk, ins["dst"], ins["imm"], st, fresh)
+                elif op == "mov":
+                    if ins["dst"] == ("reg", "rbp") and ins["src"] == ("reg", "rsp"):
+                        st[("fp_off",)] = st[("sp_off",)]
+                    elif ins["dst"] == ("reg", "rsp") and ins["src"] == ("reg", "rbp"):
+                        st[("sp_off",)] = st[("fp_off",)]
+                    else:
+                        v = read_op(blk, ins["src"], st, fresh)
+                        write_op(blk, ins["dst"], v, st, fresh)
+                elif op == "lea":
+                    loc = read_mem_addr(blk, ins["addr"], st, fresh)
+                    if loc[0] == "heap":
+                        _, base_e, disp = loc
+                        if disp != 0:
+                            lv = fresh("lea")
+                            blk.add_instruction(SSAInstruction(lv, "add", [base_e, disp]))
+                            st[ins["dst"]] = lv
+                        else:
+                            st[ins["dst"]] = base_e
+                elif op == "cmp":
+                    lhs = read_op(blk, ins["dst"], st, fresh)
+                    rhs = read_op(blk, ins["src"], st, fresh)
+                    flags_pair = (lhs, rhs)
+                elif op == "test":
+                    lhs = read_op(blk, ins["lhs"], st, fresh)
+                    rhs = read_op(blk, ins["rhs"], st, fresh)
+                    if ins["lhs"] == ins["rhs"]:
+                        flags_pair = (lhs, 0)
+                    else:
+                        tv = fresh("tst")
+                        blk.add_instruction(SSAInstruction(tv, "and", [lhs, rhs]))
+                        flags_pair = (tv, 0)
+                elif op == "setcc":
+                    cc_op = self.CC_MAP.get(ins["cc"], "cmp_eq")
+                    cv = fresh("setcc")
+                    blk.add_instruction(SSAInstruction(cv, cc_op, [flags_pair[0], flags_pair[1]]))
+                    write_op(blk, ins["dst"], cv, st, fresh)
+                elif op == "cmovcc":
+                    cc_op = self.CC_MAP.get(ins["cc"], "cmp_eq")
+                    cv = fresh("cmovc")
+                    blk.add_instruction(SSAInstruction(cv, cc_op, [flags_pair[0], flags_pair[1]]))
+                    src_v = read_op(blk, ins["src"], st, fresh)
+                    dst_v = st.get(ins["dst"], 0)
+                    sv = fresh("cmov")
+                    blk.add_instruction(SSAInstruction(sv, "select", [cv, src_v, dst_v]))
+                    st[ins["dst"]] = sv
+                elif op in ("add", "sub", "and", "or", "xor", "shl", "lshr", "sar"):
+                    if op in ("add", "sub") and ins["dst"] == ("reg", "rsp") and ins["src"][0] == "imm":
+                        sp = st[("sp_off",)]
+                        if isinstance(sp, int):
+                            imm_v = ins["src"][1]
+                            st[("sp_off",)] = sp + (imm_v if op == "add" else -imm_v)
+                        continue
+                    lhs = read_op(blk, ins["dst"], st, fresh)
+                    rhs = read_op(blk, ins["src"], st, fresh)
+                    if isinstance(lhs, int) and isinstance(rhs, int) and op in ("add", "sub"):
+                        st[ins["dst"][1] if ins["dst"][0] == "reg" else "tmp"] = lhs + rhs if op == "add" else lhs - rhs
+                    else:
+                        rv = fresh(op)
+                        blk.add_instruction(SSAInstruction(rv, op, [lhs, rhs]))
+                        write_op(blk, ins["dst"], rv, st, fresh)
+                elif op in ("neg", "not"):
+                    v = read_op(blk, ins["dst"], st, fresh)
+                    rv = fresh(op)
+                    blk.add_instruction(SSAInstruction(rv, op, [v]))
+                    write_op(blk, ins["dst"], rv, st, fresh)
+                elif op == "imul2":
+                    lhs = st.get(ins["dst"], 0)
+                    rhs = read_op(blk, ins["src"], st, fresh)
+                    rv = fresh("mul")
+                    blk.add_instruction(SSAInstruction(rv, "mul", [lhs, rhs]))
+                    st[ins["dst"]] = rv
+                elif op == "imul3":
+                    lhs = read_op(blk, ins["src"], st, fresh)
+                    rv = fresh("mul")
+                    blk.add_instruction(SSAInstruction(rv, "mul", [lhs, ins["imm"]]))
+                    st[ins["dst"]] = rv
+                elif op == "imul1":
+                    lhs = st.get("rax", 0)
+                    rhs = read_op(blk, ins["src"], st, fresh)
+                    lo = fresh("mullo")
+                    hi = fresh("smulh")
+                    blk.add_instruction(SSAInstruction(lo, "mul", [lhs, rhs]))
+                    blk.add_instruction(SSAInstruction(hi, "smulh", [lhs, rhs]))
+                    st["rax"] = lo
+                    st["rdx"] = hi
+                elif op == "idiv1":
+                    lhs = st.get("rax", 0)
+                    rhs = read_op(blk, ins["src"], st, fresh)
+                    q = fresh("sdiv")
+                    r = fresh("srem")
+                    blk.add_instruction(SSAInstruction(q, "sdiv", [lhs, rhs]))
+                    blk.add_instruction(SSAInstruction(r, "srem", [lhs, rhs]))
+                    st["rax"] = q
+                    st["rdx"] = r
+                elif op == "jmp":
+                    tgt = lnames[ins["target"]]
+                    blk.add_instruction(SSAInstruction(None, "br", [tgt]))
+                    return st
+                elif op == "jcc":
+                    cc_op = self.CC_MAP.get(ins["cc"], "cmp_eq")
+                    cv = fresh("jcond")
+                    blk.add_instruction(SSAInstruction(cv, cc_op, [flags_pair[0], flags_pair[1]]))
+                    succs = blk_succs[off]
+                    t_name = lnames[ins["target"]]
+                    f_off = [s for s in succs if s != ins["target"]][0] if len(succs) > 1 else ins["target"]
+                    f_name = lnames[f_off]
+                    blk.add_instruction(SSAInstruction(None, "br_cond", [cv, t_name, f_name]))
+                    return st
+                elif op == "ret":
+                    blk.add_instruction(SSAInstruction(None, "ret", [st.get("rax", 0)]))
+                    return st
+
+            # Fallthrough edge
+            if not blk.instructions or not blk.instructions[-1].is_terminator:
+                succs = blk_succs.get(off, [])
+                if succs:
+                    blk.add_instruction(SSAInstruction(None, "br", [lnames[succs[0]]]))
+            return st
+
+        arch_regs = [r for r in self.GPR64 if r not in ("rsp", "rbp")]
+        return _build_lifted_cfg_ssa(
+            fn_name=fn_name,
+            params=params,
+            param_regs=arg_regs,
+            arch_regs=arch_regs,
+            leaders=leaders,
+            blk_insts=blk_insts,
+            blk_succs=blk_succs,
+            translate_block_fn=translate_blk,
+            param_types=param_types,
+        )
+
+
+class Arm64MachineToSSALifter:
+    """
+    Pure-Python AArch64 (ARM64) 32-bit fixed-width instruction decoder & Machine-to-SSA Lifter.
+    Supports AAPCS64 (x0..x7), SP/X29 frame tracking, STP/LDP/LDR/STR/LDUR/STUR,
+    MOVZ/MOVK/MOVN, ADD/SUB/CMP, LOGICAL, MUL/MSUB/SMULH/UMULH/SDIV, shifts (UBFM/SBFM/V),
+    CSET/CSEL, B/B.cond/CBZ/CBNZ, and multi-block CFG + loop PHI construction.
+    """
+
+    XREGS = [f"x{i}" for i in range(31)] + ["xzr"]
+    AAPCS64_ARGS = [f"x{i}" for i in range(8)]
+    COND_MAP = {
+        0x0: "cmp_eq", 0x1: "cmp_ne",
+        0xA: "cmp_ge", 0xB: "cmp_lt",
+        0xC: "cmp_gt", 0xD: "cmp_le",
+        0x2: "cmp_ge", 0x3: "cmp_lt",
+        0x8: "cmp_gt", 0x9: "cmp_le",
+    }
+
+    @staticmethod
+    def _sext(val: int, bits: int) -> int:
+        sign = 1 << (bits - 1)
+        return (val ^ sign) - sign
+
+    def _disasm_word(self, word: int, pc: int) -> Dict[str, Any]:
+        if word == 0xD65F03C0:
+            return {"op": "ret", "writes_slots": ()}
+        if word == 0xD503201F:
+            return {"op": "nop", "writes_slots": ()}
+        if (word >> 26) == 0x05:  # B imm26
+            off = self._sext(word & 0x3FFFFFF, 26) << 2
+            return {"op": "b", "target": pc + off, "writes_slots": ()}
+        if (word >> 26) == 0x25:  # BL imm26
+            off = self._sext(word & 0x3FFFFFF, 26) << 2
+            return {"op": "bl", "target": pc + off, "writes_slots": ()}
+        if (word & 0xFF000010) == 0x54000000:  # B.cond imm19
+            off = self._sext((word >> 5) & 0x7FFFF, 19) << 2
+            return {"op": "bcond", "cc": word & 0xF, "target": pc + off, "writes_slots": ()}
+        if (word & 0x7E000000) == 0x34000000:  # CBZ / CBNZ
+            is_nz = (word >> 24) & 1
+            off = self._sext((word >> 5) & 0x7FFFF, 19) << 2
+            rt = self.XREGS[word & 0x1F]
+            return {"op": "cbnz" if is_nz else "cbz", "reg": rt, "target": pc + off, "writes_slots": ()}
+        if (word & 0x1F800000) == 0x12800000:  # MOVN / MOVZ / MOVK
+            opc = (word >> 29) & 3
+            hw = (word >> 21) & 3
+            imm16 = (word >> 5) & 0xFFFF
+            rd = self.XREGS[word & 0x1F]
+            return {"op": {0: "movn", 2: "movz", 3: "movk"}.get(opc, "movz"), "rd": rd, "imm16": imm16, "hw": hw, "writes_slots": (rd,)}
+        if (word & 0x1F000000) == 0x11000000:  # ADD/SUB/ADDS/SUBS imm12
+            is_sub = (word >> 30) & 1
+            is_s = (word >> 29) & 1
+            sh = (word >> 22) & 1
+            imm12 = ((word >> 10) & 0xFFF) << (12 if sh else 0)
+            rn_idx = (word >> 5) & 0x1F
+            rd_idx = word & 0x1F
+            rn = "sp" if (rn_idx == 31 and not is_s) else self.XREGS[rn_idx]
+            rd = "sp" if (rd_idx == 31 and not is_s) else self.XREGS[rd_idx]
+            w_s = () if (is_s and rd_idx == 31) or rd == "sp" else (rd,)
+            return {"op": "sub_imm" if is_sub else "add_imm", "set_flags": bool(is_s), "rd": rd, "rn": rn, "imm": imm12, "writes_slots": w_s}
+        if (word & 0x1F200000) == 0x0B000000:  # ADD/SUB shifted reg
+            is_sub = (word >> 30) & 1
+            is_s = (word >> 29) & 1
+            rm = self.XREGS[(word >> 16) & 0x1F]
+            rn = self.XREGS[(word >> 5) & 0x1F]
+            rd_idx = word & 0x1F
+            rd = self.XREGS[rd_idx]
+            w_s = () if (is_s and rd_idx == 31) else (rd,)
+            return {"op": "sub" if is_sub else "add", "set_flags": bool(is_s), "rd": rd, "rn": rn, "rm": rm, "writes_slots": w_s}
+        if (word & 0x1F000000) == 0x0A000000:  # Logical shifted reg (AND/ORR/EOR/ANDS)
+            opc = (word >> 29) & 3
+            rm = self.XREGS[(word >> 16) & 0x1F]
+            rn_idx = (word >> 5) & 0x1F
+            rn = self.XREGS[rn_idx]
+            rd = self.XREGS[word & 0x1F]
+            if opc == 1 and rn_idx == 31:
+                return {"op": "mov_reg", "rd": rd, "rm": rm, "writes_slots": (rd,)}
+            aop = {0: "and", 1: "or", 2: "xor", 3: "ands"}[opc]
+            w_s = () if (opc == 3 and (word & 0x1F) == 31) else (rd,)
+            return {"op": aop, "rd": rd, "rn": rn, "rm": rm, "writes_slots": w_s}
+        if (word & 0x1F000000) == 0x1B000000:  # Data processing 3-source (MUL/MADD/MSUB/SMULH/UMULH)
+            op31 = (word >> 21) & 7
+            o0 = (word >> 15) & 1
+            rm = self.XREGS[(word >> 16) & 0x1F]
+            ra_idx = (word >> 10) & 0x1F
+            ra = self.XREGS[ra_idx]
+            rn = self.XREGS[(word >> 5) & 0x1F]
+            rd = self.XREGS[word & 0x1F]
+            if op31 == 2 and o0 == 0:
+                return {"op": "smulh", "rd": rd, "rn": rn, "rm": rm, "writes_slots": (rd,)}
+            if op31 == 6 and o0 == 0:
+                return {"op": "umulh", "rd": rd, "rn": rn, "rm": rm, "writes_slots": (rd,)}
+            if op31 == 0 and o0 == 0 and ra_idx == 31:
+                return {"op": "mul", "rd": rd, "rn": rn, "rm": rm, "writes_slots": (rd,)}
+            if op31 == 0 and o0 == 1:
+                return {"op": "msub", "rd": rd, "rn": rn, "rm": rm, "ra": ra, "writes_slots": (rd,)}
+            return {"op": "madd", "rd": rd, "rn": rn, "rm": rm, "ra": ra, "writes_slots": (rd,)}
+        if (word & 0x1FE00000) == 0x1AC00000:  # 2-source (SDIV/UDIV/LSLV/LSRV/ASRV)
+            op2 = (word >> 10) & 0x3F
+            rm = self.XREGS[(word >> 16) & 0x1F]
+            rn = self.XREGS[(word >> 5) & 0x1F]
+            rd = self.XREGS[word & 0x1F]
+            m = {2: "udiv", 3: "sdiv", 8: "shl", 9: "lshr", 10: "sar"}.get(op2)
+            if m:
+                return {"op": m, "rd": rd, "rn": rn, "rm": rm, "writes_slots": (rd,)}
+        if (word & 0x1F800000) == 0x13000000:  # Bitfield SBFM / UBFM
+            opc = (word >> 29) & 3
+            immr = (word >> 16) & 0x3F
+            imms = (word >> 10) & 0x3F
+            rn = self.XREGS[(word >> 5) & 0x1F]
+            rd = self.XREGS[word & 0x1F]
+            if opc == 0 and imms == 0x3F:
+                return {"op": "sar_imm", "rd": rd, "rn": rn, "imm": immr, "writes_slots": (rd,)}
+            if opc == 0 and immr == 0 and imms == 0x1F:
+                return {"op": "mov_reg", "rd": rd, "rm": rn, "writes_slots": (rd,)}
+            if opc == 2 and imms == 0x3F:
+                return {"op": "lshr_imm", "rd": rd, "rn": rn, "imm": immr, "writes_slots": (rd,)}
+            if opc == 2 and imms + 1 == immr:
+                return {"op": "shl_imm", "rd": rd, "rn": rn, "imm": 64 - immr, "writes_slots": (rd,)}
+        if (word & 0x1FE00000) == 0x1A800000:  # CSEL / CSINC / CSET
+            cc = (word >> 12) & 0xF
+            op2 = (word >> 10) & 3
+            rm_idx = (word >> 16) & 0x1F
+            rn_idx = (word >> 5) & 0x1F
+            rd = self.XREGS[word & 0x1F]
+            if op2 == 1 and rn_idx == 31 and rm_idx == 31:
+                return {"op": "cset", "rd": rd, "cc": cc ^ 1, "writes_slots": (rd,)}
+            return {"op": "csel", "rd": rd, "rn": self.XREGS[rn_idx], "rm": self.XREGS[rm_idx], "cc": cc, "writes_slots": (rd,)}
+        if (word & 0xFFC00000) in (0xF9400000, 0xF9000000):  # LDR / STR 64-bit uimm12
+            is_load = (word & 0xFFC00000) == 0xF9400000
+            imm12 = ((word >> 10) & 0xFFF) * 8
+            rn_idx = (word >> 5) & 0x1F
+            rn = "sp" if rn_idx == 31 else self.XREGS[rn_idx]
+            rt = self.XREGS[word & 0x1F]
+            return {"op": "ldr_u" if is_load else "str_u", "rt": rt, "rn": rn, "off": imm12, "writes_slots": (rt,) if is_load else ()}
+        if (word & 0xFFE00C00) in (0xF8400000, 0xF8000000):  # LDUR / STUR simm9
+            is_load = (word & 0xFFE00C00) == 0xF8400000
+            simm9 = self._sext((word >> 12) & 0x1FF, 9)
+            rn_idx = (word >> 5) & 0x1F
+            rn = "sp" if rn_idx == 31 else self.XREGS[rn_idx]
+            rt = self.XREGS[word & 0x1F]
+            return {"op": "ldr_u" if is_load else "str_u", "rt": rt, "rn": rn, "off": simm9, "writes_slots": (rt,) if is_load else ()}
+        if (word & 0x3B000000) == 0x29000000:  # STP / LDP pair frame save/restore
+            is_load = (word >> 22) & 1
+            mode = (word >> 23) & 3  # 1=post-idx, 2=signed-off, 3=pre-idx
+            simm7 = self._sext((word >> 15) & 0x7F, 7) * 8
+            rt2 = self.XREGS[(word >> 10) & 0x1F]
+            rn_idx = (word >> 5) & 0x1F
+            rn = "sp" if rn_idx == 31 else self.XREGS[rn_idx]
+            rt1 = self.XREGS[word & 0x1F]
+            w_s = (rt1, rt2) if is_load else ()
+            return {"op": "ldp" if is_load else "stp", "rt1": rt1, "rt2": rt2, "rn": rn, "off": simm7, "mode": mode, "writes_slots": w_s}
+        raise ValueError(f"Unsupported ARM64 instruction 0x{word:08x} at pc={pc}")
+
+    def lift(
+        self,
+        code_bytes: bytes,
+        fn_name: str,
+        params: Sequence[str],
+        abi: str = "aapcs64",
+        code_end_offset: Optional[int] = None,
+        param_types: Optional[Dict[str, str]] = None,
+    ) -> SSAFunction:
+        end = len(code_bytes) if code_end_offset is None else min(len(code_bytes), int(code_end_offset))
+        raw = code_bytes[: end - (end % 4)]
+        decoded: Dict[int, Dict[str, Any]] = {}
+        for pc in range(0, len(raw), 4):
+            word = struct.unpack_from("<I", raw, pc)[0]
+            decoded[pc] = self._disasm_word(word, pc)
+
+        leaders_set: Set[int] = {0}
+        for pc, ins in decoded.items():
+            op = ins["op"]
+            if op in ("b", "bcond", "cbz", "cbnz"):
+                if 0 <= ins["target"] < len(raw):
+                    leaders_set.add(ins["target"])
+                if pc + 4 < len(raw):
+                    leaders_set.add(pc + 4)
+            elif op == "ret" and pc + 4 < len(raw):
+                leaders_set.add(pc + 4)
+        leaders = sorted(o for o in leaders_set if o in decoded)
+        leader_set = set(leaders)
+
+        blk_insts: Dict[int, List[Any]] = {o: [] for o in leaders}
+        blk_succs: Dict[int, List[int]] = {o: [] for o in leaders}
+        for idx, start_off in enumerate(leaders):
+            next_leader = leaders[idx + 1] if idx + 1 < len(leaders) else len(raw)
+            cur = start_off
+            last_ins = None
+            while cur < next_leader and cur in decoded:
+                ins = decoded[cur]
+                blk_insts[start_off].append(ins)
+                last_ins = ins
+                cur += 4
+                if ins["op"] in ("b", "bcond", "cbz", "cbnz", "ret"):
+                    break
+            if last_ins is not None:
+                op = last_ins["op"]
+                if op == "b":
+                    if last_ins["target"] in leader_set:
+                        blk_succs[start_off].append(last_ins["target"])
+                elif op in ("bcond", "cbz", "cbnz"):
+                    if last_ins["target"] in leader_set:
+                        blk_succs[start_off].append(last_ins["target"])
+                    if next_leader in leader_set:
+                        blk_succs[start_off].append(next_leader)
+                elif op != "ret" and next_leader in leader_set:
+                    blk_succs[start_off].append(next_leader)
+
+        # Canonical frame offset tracking for ARM64 [sp/x29 + off] stack slots across blocks
+        blk_sp_entry_a: Dict[int, Tuple[int, int]] = {0: (0, 0)}
+        wq_a = [0]
+        while wq_a:
+            boff = wq_a.pop(0)
+            sp_o, fp_o = blk_sp_entry_a[boff]
+            for ins in blk_insts[boff]:
+                iop = ins["op"]
+                if iop in ("add_imm", "sub_imm") and ins["rn"] == "sp" and ins["rd"] == "sp":
+                    sp_o = sp_o - ins["imm"] if iop == "sub_imm" else sp_o + ins["imm"]
+                elif iop == "stp" and ins["rn"] == "sp":
+                    if ins["mode"] == 3:
+                        sp_o += ins["off"]
+                        eff = sp_o
+                    elif ins["mode"] == 1:
+                        eff = sp_o
+                        sp_o += ins["off"]
+                    else:
+                        eff = sp_o + ins["off"]
+                    ins["writes_slots"] = (("slot", eff), ("slot", eff + 8))
+                elif iop == "ldp" and ins["rn"] == "sp":
+                    if ins["mode"] == 1:
+                        sp_o += ins["off"]
+                    elif ins["mode"] == 3:
+                        sp_o += ins["off"]
+                elif iop == "str_u" and ins["rn"] in ("sp", "x29"):
+                    base_o = sp_o if ins["rn"] == "sp" else fp_o
+                    ins["writes_slots"] = (("slot", base_o + ins["off"]),)
+            for s_off in blk_succs.get(boff, []):
+                if s_off not in blk_sp_entry_a:
+                    blk_sp_entry_a[s_off] = (sp_o, fp_o)
+                    wq_a.append(s_off)
+
+        def get_r(st: Dict[Any, Any], reg: str) -> Any:
+            if reg == "xzr":
+                return 0
+            return st.get(reg, 0)
+
+        def translate_blk(off: int, blk: BasicBlock, st: Dict[Any, Any], fresh, lnames: Dict[int, str]) -> Dict[Any, Any]:
+            st = dict(st)
+            flags_pair: Tuple[Any, Any] = (0, 0)
+            const_shadow: Dict[str, int] = {}
+
+            for ins in blk_insts[off]:
+                op = ins["op"]
+                if op in ("nop", "bl"):
+                    continue
+                if op == "movz":
+                    v = (ins["imm16"] << (ins["hw"] * 16)) & 0xFFFFFFFFFFFFFFFF
+                    const_shadow[ins["rd"]] = v
+                    st[ins["rd"]] = self._sext(v, 64) if (v >> 63) else v
+                elif op == "movn":
+                    v = (~(ins["imm16"] << (ins["hw"] * 16))) & 0xFFFFFFFFFFFFFFFF
+                    const_shadow[ins["rd"]] = v
+                    st[ins["rd"]] = self._sext(v, 64) if (v >> 63) else v
+                elif op == "movk":
+                    shift = ins["hw"] * 16
+                    mask = ~(0xFFFF << shift) & 0xFFFFFFFFFFFFFFFF
+                    if ins["rd"] in const_shadow:
+                        v = (const_shadow[ins["rd"]] & mask) | (ins["imm16"] << shift)
+                        const_shadow[ins["rd"]] = v
+                        st[ins["rd"]] = self._sext(v, 64) if (v >> 63) else v
+                    else:
+                        cur = get_r(st, ins["rd"])
+                        cleared = fresh("movk_and")
+                        blk.add_instruction(SSAInstruction(cleared, "and", [cur, mask]))
+                        merged = fresh("movk_or")
+                        blk.add_instruction(SSAInstruction(merged, "or", [cleared, ins["imm16"] << shift]))
+                        st[ins["rd"]] = merged
+                elif op == "mov_reg":
+                    const_shadow.pop(ins["rd"], None)
+                    st[ins["rd"]] = get_r(st, ins["rm"])
+                elif op in ("add_imm", "sub_imm"):
+                    rn, rd, imm, is_sub = ins["rn"], ins["rd"], ins["imm"], (op == "sub_imm")
+                    if rn == "sp" and rd == "sp":
+                        sp_o = st[("sp_off",)]
+                        if isinstance(sp_o, int):
+                            st[("sp_off",)] = sp_o - imm if is_sub else sp_o + imm
+                        continue
+                    lhs = st[("sp_off",)] if rn == "sp" else get_r(st, rn)
+                    if ins["set_flags"] and rd == "xzr":
+                        flags_pair = (lhs, -imm if not is_sub else imm)
+                        continue
+                    const_shadow.pop(rd, None)
+                    if isinstance(lhs, int):
+                        st[rd] = lhs - imm if is_sub else lhs + imm
+                    else:
+                        rv = fresh("sub" if is_sub else "add")
+                        blk.add_instruction(SSAInstruction(rv, "sub" if is_sub else "add", [lhs, imm]))
+                        st[rd] = rv
+                elif op in ("add", "sub"):
+                    lhs = get_r(st, ins["rn"])
+                    rhs = get_r(st, ins["rm"])
+                    if ins["set_flags"] and ins["rd"] == "xzr":
+                        flags_pair = (lhs, rhs)
+                        continue
+                    const_shadow.pop(ins["rd"], None)
+                    aop = "sub" if op == "sub" else "add"
+                    rv = fresh(aop)
+                    blk.add_instruction(SSAInstruction(rv, aop, [lhs, rhs]))
+                    st[ins["rd"]] = rv
+                elif op in ("and", "or", "xor", "ands"):
+                    lhs = get_r(st, ins["rn"])
+                    rhs = get_r(st, ins["rm"])
+                    if op == "ands" and ins["rd"] == "xzr":
+                        if ins["rn"] == ins["rm"]:
+                            flags_pair = (lhs, 0)
+                        else:
+                            tv = fresh("tst")
+                            blk.add_instruction(SSAInstruction(tv, "and", [lhs, rhs]))
+                            flags_pair = (tv, 0)
+                        continue
+                    const_shadow.pop(ins["rd"], None)
+                    aop = "and" if op == "ands" else op
+                    rv = fresh(aop)
+                    blk.add_instruction(SSAInstruction(rv, aop, [lhs, rhs]))
+                    st[ins["rd"]] = rv
+                elif op in ("mul", "smulh", "umulh", "sdiv", "udiv", "shl", "lshr", "sar"):
+                    const_shadow.pop(ins["rd"], None)
+                    lhs = get_r(st, ins["rn"])
+                    rhs = get_r(st, ins["rm"])
+                    zop = "sdiv" if op == "udiv" else op
+                    rv = fresh(zop)
+                    blk.add_instruction(SSAInstruction(rv, zop, [lhs, rhs]))
+                    st[ins["rd"]] = rv
+                elif op in ("msub", "madd"):
+                    const_shadow.pop(ins["rd"], None)
+                    prod = fresh("mul")
+                    blk.add_instruction(SSAInstruction(prod, "mul", [get_r(st, ins["rn"]), get_r(st, ins["rm"])]))
+                    res = fresh("msub" if op == "msub" else "madd")
+                    blk.add_instruction(SSAInstruction(res, "sub" if op == "msub" else "add", [get_r(st, ins["ra"]), prod]))
+                    st[ins["rd"]] = res
+                elif op in ("sar_imm", "lshr_imm", "shl_imm"):
+                    const_shadow.pop(ins["rd"], None)
+                    sop = op.replace("_imm", "")
+                    rv = fresh(sop)
+                    blk.add_instruction(SSAInstruction(rv, sop, [get_r(st, ins["rn"]), ins["imm"]]))
+                    st[ins["rd"]] = rv
+                elif op == "cset":
+                    const_shadow.pop(ins["rd"], None)
+                    cc_op = self.COND_MAP.get(ins["cc"], "cmp_eq")
+                    cv = fresh("cset")
+                    blk.add_instruction(SSAInstruction(cv, cc_op, [flags_pair[0], flags_pair[1]]))
+                    st[ins["rd"]] = cv
+                elif op == "csel":
+                    const_shadow.pop(ins["rd"], None)
+                    cc_op = self.COND_MAP.get(ins["cc"], "cmp_eq")
+                    cv = fresh("cselc")
+                    blk.add_instruction(SSAInstruction(cv, cc_op, [flags_pair[0], flags_pair[1]]))
+                    sv = fresh("csel")
+                    blk.add_instruction(SSAInstruction(sv, "select", [cv, get_r(st, ins["rn"]), get_r(st, ins["rm"])]))
+                    st[ins["rd"]] = sv
+                elif op == "stp":
+                    if ins["rn"] == "sp" and isinstance(st[("sp_off",)], int):
+                        sp_o = st[("sp_off",)]
+                        if ins["mode"] == 3:
+                            sp_o += ins["off"]
+                            st[("sp_off",)] = sp_o
+                            eff = sp_o
+                        elif ins["mode"] == 1:
+                            eff = sp_o
+                            st[("sp_off",)] = sp_o + ins["off"]
+                        else:
+                            eff = sp_o + ins["off"]
+                        st[("slot", eff)] = get_r(st, ins["rt1"])
+                        st[("slot", eff + 8)] = get_r(st, ins["rt2"])
+                elif op == "ldp":
+                    if ins["rn"] == "sp" and isinstance(st[("sp_off",)], int):
+                        sp_o = st[("sp_off",)]
+                        eff = sp_o + ins["off"] if ins["mode"] != 1 else sp_o
+                        st[ins["rt1"]] = st.get(("slot", eff), 0)
+                        st[ins["rt2"]] = st.get(("slot", eff + 8), 0)
+                        if ins["mode"] == 1:
+                            st[("sp_off",)] = sp_o + ins["off"]
+                        elif ins["mode"] == 3:
+                            st[("sp_off",)] = eff
+                elif op == "str_u":
+                    rn = ins["rn"]
+                    val = get_r(st, ins["rt"])
+                    if rn in ("sp", "x29") and isinstance(st.get(("sp_off",) if rn == "sp" else ("fp_off",)), int):
+                        base_o = st[("sp_off",) if rn == "sp" else ("fp_off",)]
+                        st[("slot", base_o + ins["off"])] = val
+                    else:
+                        blk.add_instruction(SSAInstruction(None, "store_off", [get_r(st, rn), ins["off"], val, "i64"]))
+                elif op == "ldr_u":
+                    rn = ins["rn"]
+                    const_shadow.pop(ins["rt"], None)
+                    if rn in ("sp", "x29") and isinstance(st.get(("sp_off",) if rn == "sp" else ("fp_off",)), int):
+                        base_o = st[("sp_off",) if rn == "sp" else ("fp_off",)]
+                        st[ins["rt"]] = st.get(("slot", base_o + ins["off"]), 0)
+                    else:
+                        lv = fresh("ldr")
+                        blk.add_instruction(SSAInstruction(lv, "load_off", [get_r(st, rn), ins["off"], "i64"]))
+                        st[ins["rt"]] = lv
+                elif op == "b":
+                    blk.add_instruction(SSAInstruction(None, "br", [lnames[ins["target"]]]))
+                    return st
+                elif op in ("bcond", "cbz", "cbnz"):
+                    if op == "bcond":
+                        cc_op = self.COND_MAP.get(ins["cc"], "cmp_eq")
+                        cv = fresh("bc")
+                        blk.add_instruction(SSAInstruction(cv, cc_op, [flags_pair[0], flags_pair[1]]))
+                    else:
+                        cc_op = "cmp_ne" if op == "cbnz" else "cmp_eq"
+                        cv = fresh("cb")
+                        blk.add_instruction(SSAInstruction(cv, cc_op, [get_r(st, ins["reg"]), 0]))
+                    succs = blk_succs[off]
+                    t_name = lnames[ins["target"]]
+                    f_off = [s for s in succs if s != ins["target"]][0] if len(succs) > 1 else ins["target"]
+                    f_name = lnames[f_off]
+                    blk.add_instruction(SSAInstruction(None, "br_cond", [cv, t_name, f_name]))
+                    return st
+                elif op == "ret":
+                    blk.add_instruction(SSAInstruction(None, "ret", [get_r(st, "x0")]))
+                    return st
+
+            if not blk.instructions or not blk.instructions[-1].is_terminator:
+                succs = blk_succs.get(off, [])
+                if succs:
+                    blk.add_instruction(SSAInstruction(None, "br", [lnames[succs[0]]]))
+            return st
+
+        arch_regs = [f"x{i}" for i in range(31)]
+        return _build_lifted_cfg_ssa(
+            fn_name=fn_name,
+            params=params,
+            param_regs=self.AAPCS64_ARGS,
+            arch_regs=arch_regs,
+            leaders=leaders,
+            blk_insts=blk_insts,
+            blk_succs=blk_succs,
+            translate_block_fn=translate_blk,
+            param_types=param_types,
+        )
+
+
 class BackendTranslationValidator:
     """
     Verifies formal IR equivalence across backend lowerings (`LLVMBackend`, `WasmBackend`)
@@ -1690,4 +2866,66 @@ class BackendTranslationValidator:
             "outputs_by_backend": results_by_backend,
             "memory_by_backend": memory_by_backend,
             "mismatches": mismatches,
+        }
+
+    def verify_ssa_to_machine_code(
+        self,
+        ssa_fn: SSAFunction,
+        code_bytes: bytes,
+        arch: str = "x86_64",
+        abi: Optional[str] = None,
+        code_end_offset: Optional[int] = None,
+        timeout_ms: int = 4000,
+    ) -> Dict[str, Any]:
+        """
+        Lifts post-regalloc x86-64 or AArch64 (ARM64) native machine code bytes back into
+        Omni-SSA and proves formal semantic equivalence against the input SSAFunction via Z3.
+        """
+        arch_norm = arch.lower()
+        if arch_norm in ("x86_64", "amd64", "x64"):
+            resolved_abi = abi or ("win64" if platform.system().lower() == "windows" else "sysv")
+            lifter = X64MachineToSSALifter()
+        elif arch_norm in ("arm64", "aarch64"):
+            resolved_abi = abi or "aapcs64"
+            lifter = Arm64MachineToSSALifter()
+        else:
+            return {
+                "proven": False,
+                "status": f"UNSUPPORTED_MACHINE_ARCH_{arch}",
+                "counterexample": None,
+                "arch": arch,
+                "abi": abi,
+                "lifted_ssa": None,
+            }
+
+        try:
+            lifted_ssa = lifter.lift(
+                code_bytes=code_bytes,
+                fn_name=f"{ssa_fn.name}_{arch_norm}",
+                params=ssa_fn.params,
+                abi=resolved_abi,
+                code_end_offset=code_end_offset,
+                param_types=getattr(ssa_fn, "param_types", None),
+            )
+        except Exception as exc:
+            return {
+                "proven": False,
+                "status": f"UNLIFTED_MACHINE_CODE_{exc}",
+                "counterexample": None,
+                "arch": arch_norm,
+                "abi": resolved_abi,
+                "lifted_ssa": None,
+            }
+
+        verdict = self.validator.verify_equivalence(ssa_fn, lifted_ssa, timeout_ms=timeout_ms)
+        return {
+            "proven": bool(verdict.get("proven")),
+            "status": str(verdict.get("status")),
+            "counterexample": verdict.get("counterexample"),
+            "arch": arch_norm,
+            "abi": resolved_abi,
+            "lifted_ssa": lifted_ssa,
+            "lifted_blocks": len(lifted_ssa.blocks),
+            "lifted_instructions": sum(len(b.instructions) for b in lifted_ssa.blocks),
+            "verdict": verdict,
         }
