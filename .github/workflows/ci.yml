@@ -68,6 +68,7 @@ jobs:
     - name: 9. Run SOTA Comparative Benchmarks & Convergence Verification
       run: |
         python external_component_candidates/benchmarks/comparative_benchmark.py
+        python benchmarks/industrial_top1_suite.py
 
   verify-macos-arm64:
     name: Apple Silicon ARM64 Mach-O & Native Execution (${{ matrix.os }})
