@@ -18,7 +18,7 @@ import subprocess
 import unittest
 
 from omni_repo_compiler import OmniRepoCompiler
-from compiler.object_linker import NativeObjectLinker, ObjectModule, NATIVE_FREESTANDING_KERNELS_X64
+from compiler.object_linker import NativeObjectLinker, ObjectModule, NATIVE_FREESTANDING_KERNELS_X64, NATIVE_FREESTANDING_KERNELS_X64_SYSV
 from validation.binary_structure_auditor import BinaryStructureAuditor
 
 
@@ -165,8 +165,9 @@ def local_work(x: int) -> int:
         self.assertTrue(link_res["success"])
         self.assertIn("omni_list_len", link_res["global_symbols"])
 
-        # Check that omni_list_len code bytes match the freestanding kernel exactly
-        kernel_bytes = NATIVE_FREESTANDING_KERNELS_X64["omni_list_len"]
+        # Check that omni_list_len code bytes match the host-ABI freestanding kernel exactly
+        expected_kernels = NATIVE_FREESTANDING_KERNELS_X64 if sys.platform == "win32" else NATIVE_FREESTANDING_KERNELS_X64_SYSV
+        kernel_bytes = expected_kernels["omni_list_len"]
         len_offset = link_res["global_symbols"]["omni_list_len"]
         emitted_slice = link_res["combined_code"][len_offset:len_offset + len(kernel_bytes)]
         self.assertEqual(emitted_slice, kernel_bytes)

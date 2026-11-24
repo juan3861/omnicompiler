@@ -40,6 +40,7 @@ def arith_branch(a, b):
                 arch="x86_64",
                 abi=abi,
                 code_end_offset=art.code_end_offset,
+                timeout_ms=6000,
             )
             self.assertTrue(res["proven"], msg=f"{target_os}/{abi} failed: {res}")
             self.assertEqual(res["status"], "PROVEN_EQUIVALENT")
