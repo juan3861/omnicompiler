@@ -338,7 +338,9 @@ class AstToSsaLowering:
         struct_layouts: Optional[Dict[str, Dict[str, Tuple[int, str]]]] = None,
         global_luts: Optional[Dict[str, Tuple[str, Tuple[Any, ...]]]] = None,
         global_return_types: Optional[Dict[str, str]] = None,
+        enable_cross_frame_eh: bool = False,
     ):
+        self.enable_cross_frame_eh = enable_cross_frame_eh
         self.var_versions: Dict[str, int] = {}
         self._block_counter: int = 0
         # Braun SSA bookkeeping
@@ -1143,6 +1145,11 @@ class AstToSsaLowering:
             reachable.add(b.name)
             for s in b.successors:
                 visit(s)
+            for ins in b.instructions:
+                if ins.opcode == "eh_try_begin" and ins.operands:
+                    hb = self._block_by_name.get(str(ins.operands[0]))
+                    if hb is not None:
+                        visit(hb)
 
         visit(entry)
         fn.blocks = [b for b in fn.blocks if b.name in reachable]
@@ -1184,6 +1191,10 @@ class AstToSsaLowering:
                     self._write_variable(exc_name, self._cur_block, err_v)
                 self._cur_block.connect_to(handler_bb)
                 self._emit(None, "br", [handler_bb.name], line=line)
+            elif self.enable_cross_frame_eh:
+                self._emit(None, "call", ["__omni_eh_throw", err_v], line=line)
+                c0 = self._emit_const(0, line=line)
+                self._emit(None, "ret", [c0], line=line)
             else:
                 neg_v = self._next_var("raise_ret")
                 self._emit(neg_v, "neg", [err_v], line=line)
@@ -1193,16 +1204,38 @@ class AstToSsaLowering:
             handler_bb = self._new_block("except_blk", seal=False)
             merge_bb = self._new_block("try_merge", seal=False)
             exc_name = stmt.handlers[0].name if stmt.handlers else None
+            has_try_call = self.enable_cross_frame_eh and any(
+                isinstance(node, ast.Call)
+                for st_in_try in stmt.body
+                if not isinstance(st_in_try, ast.Raise)
+                for node in ast.walk(st_in_try)
+            )
+            try_entry_blk = self._cur_block
+            if has_try_call and stmt.handlers and try_entry_blk is not None:
+                try_entry_blk.connect_to(handler_bb)
+                self._emit(None, "eh_try_begin", [handler_bb.name], line=line)
             self._try_handler_stack.append((handler_bb, exc_name))
             self._lower_stmt_list(stmt.body)
             self._try_handler_stack.pop()
             if self._cur_block is not None and not self._cur_block.is_terminated:
+                if has_try_call and stmt.handlers:
+                    self._emit(None, "eh_try_end", [handler_bb.name], line=line)
                 self._cur_block.connect_to(merge_bb)
                 self._emit(None, "br", [merge_bb.name], line=line)
+            elif has_try_call and stmt.handlers and self._cur_block is not None and self._cur_block.instructions:
+                # Insert eh_try_end right before trailing ret/br terminator inside try body
+                self._cur_block.instructions.insert(
+                    len(self._cur_block.instructions) - 1,
+                    SSAInstruction(None, "eh_try_end", [handler_bb.name], source_line=line),
+                )
 
             self._seal_block(handler_bb)
-            if handler_bb.predecessors and stmt.handlers:
+            if (handler_bb.predecessors or has_try_call) and stmt.handlers:
                 self._cur_block = handler_bb
+                if has_try_call and exc_name:
+                    catch_v = self._next_var(exc_name)
+                    self._emit(catch_v, "eh_catch_val", [handler_bb.name], line=line)
+                    self._write_variable(exc_name, handler_bb, catch_v)
                 self._lower_stmt_list(stmt.handlers[0].body)
                 if self._cur_block is not None and not self._cur_block.is_terminated:
                     self._cur_block.connect_to(merge_bb)

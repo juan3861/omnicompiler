@@ -187,6 +187,7 @@ class CompiledFunctionArtifact:
     coalesced_moves: int = 0
     live_across_call_count: int = 0
     code_end_offset: int = 0
+    eh_lsda_entries: List[Dict[str, Any]] = field(default_factory=list)
 
 
 _LUT_PACK_SPEC: Dict[str, Tuple[str, int, int]] = {
@@ -681,7 +682,7 @@ class X64CodeGenerator:
 
     def compile_function(self, fn: SSAFunction) -> CompiledFunctionArtifact:
         has_calls = any(
-            inst.opcode == "call"
+            inst.opcode in ("call", "eh_try_begin", "eh_try_end", "eh_catch_val")
             for b in fn.blocks
             for inst in b.instructions
         )
@@ -1130,6 +1131,9 @@ class X64CodeGenerator:
 
         block_map: Dict[str, BasicBlock] = {b.name: b for b in fn.blocks}
         edge_trampolines: List[Tuple[str, str, BasicBlock]] = []
+        eh_starts: Dict[str, int] = {}
+        eh_ends: Dict[str, int] = {}
+        eh_catch_slots: Dict[str, int] = {}
 
         def branch_target_label(pred_name: str, succ_name: str) -> str:
             succ_bb = block_map.get(succ_name)
@@ -1229,6 +1233,17 @@ class X64CodeGenerator:
                 op = inst.opcode.lower()
 
                 if op == "param":
+                    continue
+                elif op == "eh_try_begin":
+                    eh_starts[str(inst.operands[0])] = len(buf.code)
+                    continue
+                elif op == "eh_try_end":
+                    eh_ends[str(inst.operands[0])] = len(buf.code)
+                    continue
+                elif op == "eh_catch_val":
+                    write_result_from_reg(inst.result, "rax")
+                    if isinstance(inst.result, SSAVar) and inst.result in slot_map:
+                        eh_catch_slots[block.name] = slot_map[inst.result]
                     continue
 
                 elif op in ("const", "fconst", "mov"):
@@ -2274,6 +2289,18 @@ class X64CodeGenerator:
         final_bytes = buf.finalize()
         for b, orig_ins in orig_block_insts:
             b.instructions = orig_ins
+        eh_lsda_recs: List[Dict[str, Any]] = []
+        for h_name, s_off in eh_starts.items():
+            lp_off = buf.labels.get(f".L_bb_{h_name}")
+            if lp_off is not None:
+                eh_lsda_recs.append({
+                    "handler": h_name,
+                    "try_start_off": s_off,
+                    "try_end_off": eh_ends.get(h_name, code_end_off),
+                    "landing_pad_off": lp_off,
+                    "frame_size": frame_size,
+                    "exc_slot_rbp_disp": eh_catch_slots.get(h_name, 0),
+                })
         return CompiledFunctionArtifact(
             name=fn.name,
             arch="x86_64",
@@ -2288,6 +2315,7 @@ class X64CodeGenerator:
             coalesced_moves=alloc.get("coalesced_moves", 0),
             live_across_call_count=len(alloc.get("live_across_call", [])),
             code_end_offset=code_end_off,
+            eh_lsda_entries=eh_lsda_recs,
         )
 
     def emit_avx2_vector_add_i64(self) -> bytes:
@@ -2937,6 +2965,11 @@ class Arm64CodeGenerator:
                     line_table.append((len(code), inst.source_line))
                 op = inst.opcode.lower()
                 if op == "param":
+                    continue
+                elif op in ("eh_try_begin", "eh_try_end"):
+                    continue
+                elif op == "eh_catch_val":
+                    store_res(inst.result, 0)
                     continue
                 elif op in ("const", "fconst", "mov"):
                     load_op(inst.operands[0], 9)

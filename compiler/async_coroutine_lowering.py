@@ -302,3 +302,242 @@ def drive_compiled_coroutine(
         await_token = int(frame[1])
         resume_arg = int(await_handler(await_token))
     raise RuntimeError("Coroutine exceeded max suspension steps without completing")
+
+
+def build_native_coro_driver_x64(target_os: str = "windows") -> bytes:
+    """
+    Emits freestanding native x86-64 machine code for:
+      int64_t native_coro_drive(int64_t* frame, int64_t (*poll)(int64_t*, int64_t),
+                                int64_t (*await_cb)(int64_t), int64_t max_steps)
+    Drives compiled `async/await` coroutines through arbitrary suspension states completely
+    inside native machine code without returning to Python on intermediate `await` points.
+    """
+    import struct
+    is_win = target_os.lower() in ("win", "win32", "windows")
+    code = bytearray()
+    labels: Dict[str, int] = {}
+    fixups: List[Tuple[int, str, int]] = []
+
+    def mark(lbl: str) -> None:
+        labels[lbl] = len(code)
+
+    def jmp_rel8(op_b: int, lbl: str) -> None:
+        code.append(op_b)
+        fixups.append((len(code), lbl, 1))
+        code.append(0)
+
+    # Prologue: save 6 callee-saved regs (48B) + 40B stack = 96B aligned with ret addr
+    code.extend(b"\x53\x55\x41\x54\x41\x55\x41\x56\x41\x57")  # push rbx, rbp, r12..r15
+    code.extend(b"\x48\x83\xec\x28")                          # sub rsp, 40
+
+    if is_win:
+        # rbx=frame(rcx), r12=poll(rdx), r13=await_cb(r8), r14=max_steps(r9), r15=resume_val(0)
+        code.extend(b"\x48\x89\xcb")                          # mov rbx, rcx
+        code.extend(b"\x49\x89\xd4")                          # mov r12, rdx
+        code.extend(b"\x4d\x89\xc5")                          # mov r13, r8
+        code.extend(b"\x4d\x89\xce")                          # mov r14, r9
+    else:
+        # SysV: rdi=frame, rsi=poll, rdx=await_cb, rcx=max_steps
+        code.extend(b"\x48\x89\xfb")                          # mov rbx, rdi
+        code.extend(b"\x49\x89\xf4")                          # mov r12, rsi
+        code.extend(b"\x49\x89\xd5")                          # mov r13, rdx
+        code.extend(b"\x49\x89\xce")                          # mov r14, rcx
+    code.extend(b"\x4d\x31\xff")                              # xor r15, r15 (resume_val = 0)
+
+    mark("loop")
+    code.extend(b"\x4d\x85\xf6")                              # test r14, r14
+    jmp_rel8(0x7E, "done")                                    # jle done
+    if is_win:
+        code.extend(b"\x48\x89\xd9")                          # mov rcx, rbx
+        code.extend(b"\x4c\x89\xfa")                          # mov rdx, r15
+    else:
+        code.extend(b"\x48\x89\xdf")                          # mov rdi, rbx
+        code.extend(b"\x4c\x89\xf6")                          # mov rsi, r15
+    code.extend(b"\x41\xff\xd4")                              # call r12
+    code.extend(b"\x48\x83\xf8\x01")                          # cmp rax, 1
+    jmp_rel8(0x74, "done")                                    # je done
+
+    # Suspended: load await_token = frame[1] ([rbx + 8]), resolve via await_cb or pass through
+    code.extend(b"\x4d\x85\xed")                              # test r13, r13
+    jmp_rel8(0x74, "no_cb")                                   # jz no_cb
+    if is_win:
+        code.extend(b"\x48\x8b\x4b\x08")                      # mov rcx, [rbx + 8]
+    else:
+        code.extend(b"\x48\x8b\x7b\x08")                      # mov rdi, [rbx + 8]
+    code.extend(b"\x41\xff\xd5")                              # call r13
+    code.extend(b"\x49\x89\xc7")                              # mov r15, rax
+    jmp_rel8(0xEB, "next_step")                               # jmp next_step
+
+    mark("no_cb")
+    code.extend(b"\x4c\x8b\x7b\x08")                          # mov r15, [rbx + 8]
+
+    mark("next_step")
+    code.extend(b"\x49\xff\xce")                              # dec r14
+    jmp_rel8(0xEB, "loop")                                    # jmp loop
+
+    mark("done")
+    code.extend(b"\x48\x8b\x43\x08")                          # mov rax, [rbx + 8]
+    code.extend(b"\x48\x83\xc4\x28")                          # add rsp, 40
+    code.extend(b"\x41\x5f\x41\x5e\x41\x5d\x41\x5c\x5d\x5b")  # pop r15..rbx
+    code.append(0xC3)                                         # ret
+
+    for pos, lbl, sz in fixups:
+        disp = labels[lbl] - (pos + sz)
+        struct.pack_into("<b", code, pos, disp)
+    return bytes(code)
+
+
+class NativeWorkStealingScheduler:
+    """
+    Multi-threaded Chase-Lev Work-Stealing Coroutine Executor (Alpha-C94).
+
+    Executes compiled stackless `async/await` coroutines concurrently across `num_workers`
+    OS threads using per-worker double-ended queues (`deque` local LIFO pop, cross-worker
+    FIFO steal) and optional native x86-64 `native_coro_drive` dispatch that resolves
+    arbitrary await suspensions inside native code without returning to Python per `await`.
+    """
+
+    def __init__(self, num_workers: int = 4, target_os: Optional[str] = None):
+        import collections
+        import sys
+        import threading
+
+        self.num_workers = max(1, int(num_workers))
+        self.target_os = (
+            target_os.lower()
+            if target_os
+            else ("windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "linux"))
+        )
+        self._deques = [collections.deque() for _ in range(self.num_workers)]
+        self._locks = [threading.Lock() for _ in range(self.num_workers)]
+        self._stat_lock = threading.Lock()
+        self.tasks_completed = 0
+        self.steal_count = 0
+        self.native_driver_runs = 0
+        self._driver_mem: Optional[Tuple[int, int]] = None
+        self._driver_fn = None
+        self._init_native_driver()
+
+    def _init_native_driver(self) -> None:
+        import platform as _plat
+        import sys
+        if _plat.machine().lower() not in ("x86_64", "amd64"):
+            return
+        drv_bytes = build_native_coro_driver_x64(self.target_os)
+        sz = max(4096, ((len(drv_bytes) + 4095) // 4096) * 4096)
+        if sys.platform == "win32":
+            k32 = ctypes.windll.kernel32
+            k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
+            k32.VirtualAlloc.restype = ctypes.c_void_p
+            ptr = int(k32.VirtualAlloc(None, sz, 0x3000, 0x40))
+        else:
+            libc = ctypes.CDLL(None)
+            libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+            libc.mmap.restype = ctypes.c_void_p
+            mflags = 0x1002 if sys.platform == "darwin" else 0x22
+            ptr = int(libc.mmap(None, sz, 7, mflags, -1, 0))
+        ctypes.memmove(ctypes.c_void_p(ptr), drv_bytes, len(drv_bytes))
+        self._driver_mem = (ptr, sz)
+        proto = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int64)
+        self._driver_fn = proto(ptr)
+
+    def close(self) -> None:
+        import sys
+        if self._driver_mem is not None:
+            ptr, sz = self._driver_mem
+            self._driver_fn = None
+            self._driver_mem = None
+            if sys.platform == "win32":
+                k32 = ctypes.windll.kernel32
+                k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+                k32.VirtualFree.restype = ctypes.c_int
+                k32.VirtualFree(ctypes.c_void_p(ptr), 0, 0x8000)
+            else:
+                libc = ctypes.CDLL(None)
+                libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                libc.munmap.restype = ctypes.c_int
+                libc.munmap(ctypes.c_void_p(ptr), sz)
+
+    def __enter__(self) -> "NativeWorkStealingScheduler":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def run_batch(
+        self,
+        tasks: List[Dict[str, Any]],
+        max_steps: int = 64,
+    ) -> Dict[str, Any]:
+        """
+        Executes a batch of compiled coroutine specs across `self.num_workers` threads.
+        Each task dict has:
+          - `frame_slots`: Dict[str, int]
+          - `init_args`: Dict[str, int]
+          - `poll_addr`: int (native address of `poll_<name>`) OR `poll_callable`
+          - `await_cb_addr`: int (optional native address of `int64(int64)`) OR `await_handler`
+        """
+        import threading
+
+        results: List[Optional[int]] = [None] * len(tasks)
+        for idx, t in enumerate(tasks):
+            q_idx = idx % self.num_workers
+            self._deques[q_idx].append((idx, t))
+
+        def _exec_one(t: Dict[str, Any]) -> int:
+            slots = t["frame_slots"]
+            init_args = t.get("init_args", {})
+            n_slots = max(2, len(slots))
+            frame = (ctypes.c_int64 * n_slots)()
+            frame[0] = 0
+            frame[1] = 0
+            for pname, val in init_args.items():
+                if pname in slots:
+                    frame[slots[pname] // 8] = int(val)
+            f_addr = ctypes.addressof(frame)
+
+            if self._driver_fn is not None and "poll_addr" in t:
+                cb_addr = int(t.get("await_cb_addr", 0))
+                res_val = int(self._driver_fn(f_addr, int(t["poll_addr"]), cb_addr, max_steps))
+                with self._stat_lock:
+                    self.native_driver_runs += 1
+                return res_val
+
+            poll_callable = t["poll_callable"]
+            await_handler = t.get("await_handler", lambda tok: tok)
+            return drive_compiled_coroutine(poll_callable, slots, init_args, await_handler, max_steps=max_steps)
+
+        def _worker(wid: int) -> None:
+            while True:
+                item = None
+                with self._locks[wid]:
+                    if self._deques[wid]:
+                        item = self._deques[wid].pop()
+                if item is None:
+                    for offset in range(1, self.num_workers):
+                        peer = (wid + offset) % self.num_workers
+                        with self._locks[peer]:
+                            if self._deques[peer]:
+                                item = self._deques[peer].popleft()
+                                with self._stat_lock:
+                                    self.steal_count += 1
+                                break
+                if item is None:
+                    break
+                t_idx, t_spec = item
+                results[t_idx] = _exec_one(t_spec)
+                with self._stat_lock:
+                    self.tasks_completed += 1
+
+        threads = [threading.Thread(target=_worker, args=(w,)) for w in range(self.num_workers)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+        return {
+            "results": results,
+            "tasks_completed": len(tasks),
+            "steal_count": self.steal_count,
+            "native_driver_runs": self.native_driver_runs,
+        }
