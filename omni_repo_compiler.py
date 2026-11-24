@@ -383,6 +383,7 @@ class OmniRepoCompiler:
             effective_os = "macos" if target_os.lower() == "darwin" else target_os.lower()
         else:
             effective_os = "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "linux")
+        self.linker.target_os = effective_os
         if target_arch:
             t_low = target_arch.lower()
             if t_low in ("arm64", "aarch64"):

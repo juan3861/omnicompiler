@@ -557,16 +557,27 @@ def load_macho_object(obj_bytes: bytes, repo_name: str = "macho_object") -> Obje
 # ==============================================================================
 
 # Freestanding native x86-64 machine code kernels for runtime collection operations
-# Enables freestanding standalone binaries (.exe / ELF) to execute without host Python runtime.
+# Enables freestanding standalone binaries (.exe / ELF / Mach-O) to execute without host Python runtime.
 NATIVE_FREESTANDING_KERNELS_X64: Dict[str, bytes] = {
     "omni_list_len": bytes.fromhex("4885c97405488b4108c331c0c3"),
     "omni_list_get": bytes.fromhex("4885c97406488b44d110c331c0c3"),
-    "omni_list_set": bytes.fromhex("4885c974154c8944d110483b51087209488d4201488941084889c8c331c0c3"),
+    "omni_list_set": bytes.fromhex("4885c974174c8944d110483b51087208488d4201488941084889c8c331c0c3"),
     "omni_item_len": bytes.fromhex("4885c97405488b4108c331c0c3"),
     "omni_item_get": bytes.fromhex("4885c97406488b44d110c331c0c3"),
-    "omni_item_set": bytes.fromhex("4885c974154c8944d110483b51087209488d4201488941084889c8c331c0c3"),
+    "omni_item_set": bytes.fromhex("4885c974174c8944d110483b51087208488d4201488941084889c8c331c0c3"),
     "omni_str_len": bytes.fromhex("4885c974100fb601a880750483e07fc3488b4108c331c0c3"),
-    "omni_list_sum": bytes.fromhex("4885c97418488b51084885d2741031c04531c04a0344c11049ffc04939d07cf2c331c0c3"),
+    "omni_list_sum": bytes.fromhex("4885c9741c488b51084885d2741331c04531c04a0344c11049ffc04939d07cf3c331c0c3"),
+}
+
+NATIVE_FREESTANDING_KERNELS_X64_SYSV: Dict[str, bytes] = {
+    "omni_list_len": bytes.fromhex("4885ff7405488b4708c331c0c3"),
+    "omni_list_get": bytes.fromhex("4885ff7406488b44f710c331c0c3"),
+    "omni_list_set": bytes.fromhex("4885ff7417488954f710483b77087208488d4601488947084889f8c331c0c3"),
+    "omni_item_len": bytes.fromhex("4885ff7405488b4708c331c0c3"),
+    "omni_item_get": bytes.fromhex("4885ff7406488b44f710c331c0c3"),
+    "omni_item_set": bytes.fromhex("4885ff7417488954f710483b77087208488d4601488947084889f8c331c0c3"),
+    "omni_str_len": bytes.fromhex("4885ff74100fb607a880750483e07fc3488b4708c331c0c3"),
+    "omni_list_sum": bytes.fromhex("4885ff741c488b57084885d2741331c04531c04a0344c71049ffc04939d07cf3c331c0c3"),
 }
 
 OS_C_ABI_IMPORT_TABLE: Dict[str, Tuple[str, str]] = {
@@ -607,9 +618,10 @@ class NativeObjectLinker:
     and multi-symbol shared libraries (`.dll` / `.so` / `.dylib`).
     """
 
-    def __init__(self):
+    def __init__(self, target_os: Optional[str] = None):
         self.modules: List[ObjectModule] = []
         self.emitter = StandaloneBinaryEmitter()
+        self.target_os: Optional[str] = target_os
 
     def add_module(self, module: ObjectModule):
         self.modules.append(module)
@@ -629,13 +641,15 @@ class NativeObjectLinker:
         self.add_module(mod)
         return mod
 
-    def link(self, entry_symbol: Optional[str] = None) -> Dict[str, Any]:
+    def link(self, entry_symbol: Optional[str] = None, target_os: Optional[str] = None) -> Dict[str, Any]:
         """
         Executes static linking pass across all modules:
         1. Layout sections contiguously in memory.
         2. Build global symbol address map & exported symbol map.
         3. Patch all x86-64 (`REL32`, `ADDR64`) and ARM64 (`ARM64_CALL26`) relocation slots.
         """
+        eff_target_os = (target_os or self.target_os or ("windows" if sys.platform == "win32" else "linux")).lower()
+        is_win_abi = eff_target_os in ("win", "win32", "windows")
         # Auto-synthesize runtime collection symbol thunks if any module requires them
         try:
             from runtime.native_heap import NATIVE_COLLECTION_SYMBOLS
@@ -671,7 +685,7 @@ class NativeObjectLinker:
                 for m in self.modules
                 for r in m.relocations
             )
-            host_os = "windows" if sys.platform == "win32" else "linux"
+            host_os = "windows" if is_win_abi else "linux"
             atomic_map = get_atomic_kernels(target_os=host_os, arch="arm64" if is_arm64_link else "x86_64")
             atomic_mod = ObjectModule("__omni_atomic_kernels__")
             for sym in sorted(needed_atomic_syms):
@@ -683,10 +697,11 @@ class NativeObjectLinker:
             if not hasattr(self, "_active_callbacks"):
                 self._active_callbacks = []
             runtime_mod = ObjectModule("__omni_runtime_thunks__")
+            kernels_map = NATIVE_FREESTANDING_KERNELS_X64 if is_win_abi else NATIVE_FREESTANDING_KERNELS_X64_SYSV
             for sym in sorted(needed_runtime_syms):
-                if sym in NATIVE_FREESTANDING_KERNELS_X64:
-                    # Emit pure freestanding silicon machine code (zero transient host pointers)
-                    kernel_code = NATIVE_FREESTANDING_KERNELS_X64[sym]
+                if sym in kernels_map:
+                    # Emit pure freestanding silicon machine code matching target ABI
+                    kernel_code = kernels_map[sym]
                     runtime_mod.add_symbol(sym, kernel_code, is_exported=True)
                 else:
                     fn_meta = NATIVE_COLLECTION_SYMBOLS[sym]

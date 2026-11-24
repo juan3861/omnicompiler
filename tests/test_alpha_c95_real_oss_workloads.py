@@ -78,7 +78,7 @@ def dyn_heap_kernel(n: int) -> int:
 
                 # 2. Linux ELF64 .so (x86_64 & arm64) + DT_NEEDED / .dynsym audit
                 for t_arch, so_name, exp_arch in (
-                    ("x86_64", "libdyn_x64.so", "x86-64"),
+                    ("x86_64", "libdyn_x86_64.so", "x86-64"),
                     ("arm64", "libdyn_arm64.so", "ARM64"),
                 ):
                     so_path = os.path.join(td, so_name)

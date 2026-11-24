@@ -352,7 +352,7 @@ def build_native_coro_driver_x64(target_os: str = "windows") -> bytes:
         code.extend(b"\x4c\x89\xfa")                          # mov rdx, r15
     else:
         code.extend(b"\x48\x89\xdf")                          # mov rdi, rbx
-        code.extend(b"\x4c\x89\xf6")                          # mov rsi, r15
+        code.extend(b"\x4c\x89\xfe")                          # mov rsi, r15
     code.extend(b"\x41\xff\xd4")                              # call r12
     code.extend(b"\x48\x83\xf8\x01")                          # cmp rax, 1
     jmp_rel8(0x74, "done")                                    # je done
