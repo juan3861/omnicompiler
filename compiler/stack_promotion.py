@@ -86,4 +86,14 @@ class StackPromotionPass:
                             stats["promoted_strings"] += 1
                             stats["bytes_promoted_to_stack"] += bytes_needed
 
+                    # 3. Promote non-escaping local struct / buffer `omni_alloc`
+                    elif func_name == "omni_alloc" and len(inst.operands) >= 2:
+                        sz_val = resolve_int(inst.operands[1])
+                        if sz_val is not None and sz_val > 0:
+                            bytes_needed = max(8, ((sz_val + 7) // 8) * 8)
+                            inst.opcode = "alloca"
+                            inst.operands = [bytes_needed]
+                            promoted_vars.add(var)
+                            stats["bytes_promoted_to_stack"] += bytes_needed
+
         return fn, stats

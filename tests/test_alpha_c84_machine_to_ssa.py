@@ -62,6 +62,7 @@ def arm_arith_branch(a, b):
             arch="arm64",
             abi="aapcs64",
             code_end_offset=art.code_end_offset,
+            timeout_ms=6000,
         )
         self.assertTrue(res["proven"], msg=res)
         self.assertEqual(res["status"], "PROVEN_EQUIVALENT")

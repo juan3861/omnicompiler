@@ -13,10 +13,11 @@ is silently dropped or miscompiled.
 from __future__ import annotations
 
 import ast
+import copy
 from dataclasses import dataclass, field
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 SUPPORTED_POLYGLOT_EXTENSIONS: Dict[str, str] = {
@@ -94,6 +95,7 @@ class PolyglotParseResult:
     module: ast.Module
     functions: List[ast.FunctionDef] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    imported_modules: List[str] = field(default_factory=list)
 
 
 _MULTI_CHAR_OPS = (
@@ -329,6 +331,14 @@ class _PolyglotParser:
         )
         self.pos = 0
         self.declared_structs: Dict[str, ast.ClassDef] = {}
+        self.imported_modules: List[str] = []
+        self.imported_namespaces: Set[str] = set()
+        if language in ("c", "cpp"):
+            for inc_m in re.findall(r'^\s*#\s*include\s*["<]([^">]+)[">]', source, re.MULTILINE):
+                self.imported_modules.append(inc_m)
+                stem = os.path.splitext(os.path.basename(inc_m))[0]
+                if stem:
+                    self.imported_namespaces.add(stem)
 
     def _peek(self, offset: int = 0) -> _Tok:
         idx = self.pos + offset
@@ -953,18 +963,41 @@ class _PolyglotParser:
         if t.kind == "ID" and t.val in ("package", "import", "use", "mod"):
             start_line = t.line
             self._advance()
+            imp_toks: List[_Tok] = []
             # Go import ( ... )
             if t.val == "import" and self._at("PUNCT", "("):
-                self._skip_balanced("(", ")")
-                return
-            while not self._at("EOF"):
-                nxt = self._peek()
-                if nxt.kind == "PUNCT" and nxt.val == ";":
-                    self._advance()
-                    return
-                if self.language == "go" and nxt.line > start_line:
-                    return
                 self._advance()
+                depth = 1
+                while not self._at("EOF") and depth > 0:
+                    pk = self._advance()
+                    if pk.kind == "PUNCT" and pk.val == "(":
+                        depth += 1
+                    elif pk.kind == "PUNCT" and pk.val == ")":
+                        depth -= 1
+                    else:
+                        imp_toks.append(pk)
+            else:
+                while not self._at("EOF"):
+                    nxt = self._peek()
+                    if nxt.kind == "PUNCT" and nxt.val == ";":
+                        self._advance()
+                        break
+                    if self.language == "go" and nxt.line > start_line:
+                        break
+                    imp_toks.append(self._advance())
+            for itk in imp_toks:
+                if itk.kind == "STR" and itk.val:
+                    self.imported_modules.append(itk.val)
+                    stem = os.path.splitext(os.path.basename(itk.val))[0]
+                    if stem:
+                        self.imported_namespaces.add(stem)
+                elif itk.kind == "ID" and itk.val not in ("from", "as", "crate", "self", "super", "pub", "default"):
+                    if t.val in ("use", "mod", "import"):
+                        self.imported_namespaces.add(itk.val)
+            if not any(itk.kind == "STR" for itk in imp_toks) and imp_toks:
+                id_parts = [itk.val for itk in imp_toks if itk.kind == "ID"]
+                if id_parts and t.val in ("use", "mod"):
+                    self.imported_modules.append("::".join(id_parts))
             return
         if t.kind == "PUNCT" and t.val == ";":
             self._advance()
@@ -1499,11 +1532,11 @@ class _PolyglotParser:
             return [ast.Return(value=expr, lineno=line)], semi
 
         if t.kind == "ID" and t.val in ("let", "const", "var", "val"):
-            stmts = [self._parse_var_decl()]
+            stmts = self._parse_var_decl()
             if self.language in ("javascript", "typescript"):
                 while self._at("PUNCT", ","):
                     self._advance()
-                    stmts.append(self._parse_var_item(kw_line=line))
+                    stmts.extend(self._parse_var_item(kw_line=line))
             semi = self._consume_optional_semi()
             return stmts, semi
 
@@ -1511,10 +1544,38 @@ class _PolyglotParser:
             save_cvar = self.pos
             tspec = self._parse_c_type_spec()
             if tspec is not None and self._at("ID"):
-                cabi_ft, is_ptr, _ = tspec
+                cabi_ft, is_ptr, c_struct_name = tspec
                 vname = self._advance()
+                # Optional C array suffix `arr[4]` / `arr[]`
+                is_c_arr = False
+                if self._at("PUNCT", "["):
+                    is_c_arr = True
+                    self._skip_balanced("[", "]")
                 if self._at("OP", "="):
                     self._advance()
+                    if is_c_arr and self._at("PUNCT", "{"):
+                        self._advance()
+                        arr_elts: List[ast.expr] = []
+                        while not self._at("PUNCT", "}") and not self._at("EOF"):
+                            arr_elts.append(self._parse_expr())
+                            if self._at("PUNCT", ","):
+                                self._advance()
+                            else:
+                                break
+                        self._expect("PUNCT", "}")
+                        semi = self._consume_optional_semi()
+                        return [
+                            ast.Assign(
+                                targets=[ast.Name(id=vname.val, ctx=ast.Store(), lineno=vname.line)],
+                                value=ast.List(elts=arr_elts, ctx=ast.Load(), lineno=vname.line),
+                                lineno=line,
+                            )
+                        ], semi
+                    if c_struct_name and not is_ptr and self._at("PUNCT", "{"):
+                        st_stmts = self._try_parse_struct_literal_rhs(vname.val, c_struct_name, line)
+                        if st_stmts is not None:
+                            semi = self._consume_optional_semi()
+                            return st_stmts, semi
                     val = self._parse_expr()
                 elif self._at("PUNCT", ";"):
                     val = ast.Constant(value=(0.0 if cabi_ft in ("f32", "f64") and not is_ptr else 0), lineno=line)
@@ -1522,6 +1583,16 @@ class _PolyglotParser:
                     val = None
                 if val is not None:
                     semi = self._consume_optional_semi()
+                    if c_struct_name and c_struct_name in self.declared_structs:
+                        return [
+                            ast.AnnAssign(
+                                target=ast.Name(id=vname.val, ctx=ast.Store(), lineno=vname.line),
+                                annotation=ast.Name(id=c_struct_name, ctx=ast.Load(), lineno=vname.line),
+                                value=val,
+                                simple=1,
+                                lineno=line,
+                            )
+                        ], semi
                     return [
                         ast.Assign(
                             targets=[ast.Name(id=vname.val, ctx=ast.Store(), lineno=vname.line)],
@@ -1566,10 +1637,197 @@ class _PolyglotParser:
             return [ast.Continue(lineno=line)], semi
 
         # Assignment / short var decl / augassign / i++ / expr stmt
-        simple, ended_semi = self._parse_simple_stmt(consume_semi=True)
-        return [simple], ended_semi
+        simple_list, ended_semi = self._parse_simple_stmt_list(consume_semi=True)
+        return simple_list, ended_semi
 
-    def _parse_var_item(self, kw_line: int) -> ast.stmt:
+    def _compute_struct_byte_size(self, sname: str) -> int:
+        cls_def = self.declared_structs.get(sname)
+        if cls_def is None:
+            return 16
+        from compiler.ssa_ir import AstToSsaLowering
+        tmp = AstToSsaLowering()
+        for cname, cnode in self.declared_structs.items():
+            tmp.register_struct_from_classdef(cnode)
+        tmp.register_struct_from_classdef(cls_def)
+        meta = tmp.struct_meta.get(sname)
+        if meta is not None:
+            return max(8, int(meta[0]))
+        return max(8, len(cls_def.body) * 8)
+
+    def _try_parse_struct_literal_rhs(
+        self, var_name: str, sname_hint: Optional[str], line: int
+    ) -> Optional[List[ast.stmt]]:
+        save = self.pos
+        target_struct: Optional[str] = None
+        if self._at("ID") and self._peek().val in self.declared_structs and self._peek(1).kind == "PUNCT" and self._peek(1).val == "{":
+            target_struct = self._advance().val
+        elif sname_hint and sname_hint in self.declared_structs and self._at("PUNCT", "{"):
+            target_struct = sname_hint
+        else:
+            return None
+
+        self._expect("PUNCT", "{")
+        cls_def = self.declared_structs[target_struct]
+        ordered_fields = [
+            st.target.id for st in cls_def.body
+            if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)
+        ]
+        inits: List[Tuple[str, ast.expr]] = []
+        pos_idx = 0
+        try:
+            while not self._at("PUNCT", "}") and not self._at("EOF"):
+                if self._at("ID") and self._peek(1).kind == "OP" and self._peek(1).val == ":":
+                    fld_tok = self._advance()
+                    self._advance()
+                    val_e = self._parse_expr()
+                    inits.append((fld_tok.val, val_e))
+                else:
+                    if pos_idx >= len(ordered_fields):
+                        self.pos = save
+                        return None
+                    val_e = self._parse_expr()
+                    inits.append((ordered_fields[pos_idx], val_e))
+                    pos_idx += 1
+                if self._at("PUNCT", ","):
+                    self._advance()
+                else:
+                    break
+            self._expect("PUNCT", "}")
+        except PolyglotLoweringError:
+            self.pos = save
+            return None
+
+        sz_bytes = self._compute_struct_byte_size(target_struct)
+        stmts: List[ast.stmt] = [
+            ast.AnnAssign(
+                target=ast.Name(id=var_name, ctx=ast.Store(), lineno=line),
+                annotation=ast.Name(id=target_struct, ctx=ast.Load(), lineno=line),
+                value=ast.Call(
+                    func=ast.Name(id="omni_alloc", ctx=ast.Load(), lineno=line),
+                    args=[ast.Constant(value=sz_bytes, lineno=line)],
+                    keywords=[],
+                    lineno=line,
+                ),
+                simple=1,
+                lineno=line,
+            )
+        ]
+        for fld_name, val_e in inits:
+            stmts.append(
+                ast.Assign(
+                    targets=[
+                        ast.Attribute(
+                            value=ast.Name(id=var_name, ctx=ast.Load(), lineno=line),
+                            attr=fld_name,
+                            ctx=ast.Store(),
+                            lineno=line,
+                        )
+                    ],
+                    value=val_e,
+                    lineno=line,
+                )
+            )
+        return stmts
+
+    def _try_parse_inline_closure_def(self, assign_name: str, line: int) -> Optional[ast.FunctionDef]:
+        save = self.pos
+        # Rust `[move] |p1[: T], ...| [-> T] { ... }` or `|| { ... }`
+        if self._at("ID", "move") and (self._at_offset_kind_val(1, "OP", "|") or self._at_offset_kind_val(1, "OP", "||")):
+            self._advance()
+        if self._at("OP", "|") or self._at("OP", "||"):
+            params: List[str] = []
+            pt_map: Dict[str, str] = {}
+            if self._at("OP", "||"):
+                self._advance()
+            else:
+                self._advance()
+                while not self._at("OP", "|") and not self._at("EOF"):
+                    if self._at("ID", "mut"):
+                        self._advance()
+                    if not self._at("ID"):
+                        self.pos = save
+                        return None
+                    pn = self._advance().val
+                    params.append(pn)
+                    if self._at("OP", ":"):
+                        self._advance()
+                        ann = self._skip_type_annotation(stop_tokens={",", "|"})
+                        if ann:
+                            pt_map[pn] = ann
+                    if self._at("PUNCT", ","):
+                        self._advance()
+                    else:
+                        break
+                if not self._at("OP", "|"):
+                    self.pos = save
+                    return None
+                self._advance()
+            ret_type: Optional[str] = None
+            if self._at("OP", "->"):
+                self._advance()
+                ret_type = self._skip_type_annotation(stop_tokens={"{"})
+            if self._at("PUNCT", "{"):
+                body = self._parse_block(allow_tail_return=True)
+            else:
+                expr = self._parse_expr()
+                body = [ast.Return(value=expr, lineno=line)]
+            return self._make_function_def(assign_name, params, body, line, param_types=pt_map, return_type=ret_type)
+
+        # Go `func(a int64, b int64) int64 { ... }`
+        if self.language == "go" and self._at("ID", "func") and self._peek(1).kind == "PUNCT" and self._peek(1).val == "(":
+            self._advance()
+            self._expect("PUNCT", "(")
+            params_g: List[str] = []
+            pt_g: Dict[str, str] = {}
+            pending_g: List[str] = []
+            while not self._at("PUNCT", ")") and not self._at("EOF"):
+                if not self._at("ID"):
+                    self.pos = save
+                    return None
+                pending_g.append(self._advance().val)
+                if self._at("PUNCT", ","):
+                    self._advance()
+                    continue
+                if not self._at("PUNCT", ")"):
+                    ann_g = self._skip_go_type(stop_tokens={",", ")"})
+                    if ann_g:
+                        for pg in pending_g:
+                            pt_g[pg] = ann_g
+                params_g.extend(pending_g)
+                pending_g.clear()
+                if self._at("PUNCT", ","):
+                    self._advance()
+            if pending_g:
+                params_g.extend(pending_g)
+            self._expect("PUNCT", ")")
+            ret_g: Optional[str] = None
+            ret_toks_g: List[str] = []
+            while not self._at("PUNCT", "{") and not self._at("EOF"):
+                ret_toks_g.append(self._advance().val)
+            if ret_toks_g in (["float64"], ["f64"], ["double"]):
+                ret_g = "float"
+            body_g = self._parse_block()
+            return self._make_function_def(assign_name, params_g, body_g, line, param_types=pt_g, return_type=ret_g)
+
+        # JS/TS arrow `(a, b) => { ... }` or `(a: number) => expr` or `x => expr`
+        if self._at("PUNCT", "(") or (self._at("ID") and self._peek(1).kind == "OP" and self._peek(1).val == "=>"):
+            try:
+                fn = self._parse_arrow_rhs(assign_name, line)
+                if fn is not None:
+                    return fn
+            except PolyglotLoweringError:
+                pass
+            self.pos = save
+            return None
+        return None
+
+    def _at_offset_kind_val(self, offset: int, kind: str, val: Optional[str] = None) -> bool:
+        t = self._peek(offset)
+        if t.kind != kind:
+            return False
+        return val is None or t.val == val
+
+    def _parse_var_item(self, kw_line: int) -> List[ast.stmt]:
         if self._at("ID", "mut"):
             self._advance()
         name_tok = self._expect("ID")
@@ -1582,6 +1840,12 @@ class _PolyglotParser:
             var_ann = self._skip_go_type(stop_tokens={"=", ";", "}", ","})
         if self._at("OP", "="):
             self._advance()
+            st_stmts = self._try_parse_struct_literal_rhs(name_tok.val, var_ann, kw_line)
+            if st_stmts is not None:
+                return st_stmts
+            clos_fn = self._try_parse_inline_closure_def(name_tok.val, kw_line)
+            if clos_fn is not None:
+                return [clos_fn]
             val = self._parse_expr()
             if (
                 var_ann == "float"
@@ -1591,16 +1855,53 @@ class _PolyglotParser:
             ):
                 val = ast.Constant(value=float(val.value), lineno=val.lineno)
         else:
+            if var_ann and var_ann in self.declared_structs:
+                sz_bytes = self._compute_struct_byte_size(var_ann)
+                return [
+                    ast.AnnAssign(
+                        target=ast.Name(id=name_tok.val, ctx=ast.Store(), lineno=name_tok.line),
+                        annotation=ast.Name(id=var_ann, ctx=ast.Load(), lineno=name_tok.line),
+                        value=ast.Call(
+                            func=ast.Name(id="omni_alloc", ctx=ast.Load(), lineno=kw_line),
+                            args=[ast.Constant(value=sz_bytes, lineno=kw_line)],
+                            keywords=[],
+                            lineno=kw_line,
+                        ),
+                        simple=1,
+                        lineno=kw_line,
+                    )
+                ]
             val = ast.Constant(value=(0.0 if var_ann == "float" else 0), lineno=kw_line)
-        return ast.Assign(
-            targets=[ast.Name(id=name_tok.val, ctx=ast.Store(), lineno=name_tok.line)],
-            value=val,
-            lineno=kw_line,
-        )
+        if var_ann and var_ann in self.declared_structs:
+            return [
+                ast.AnnAssign(
+                    target=ast.Name(id=name_tok.val, ctx=ast.Store(), lineno=name_tok.line),
+                    annotation=ast.Name(id=var_ann, ctx=ast.Load(), lineno=name_tok.line),
+                    value=val,
+                    simple=1,
+                    lineno=kw_line,
+                )
+            ]
+        return [
+            ast.Assign(
+                targets=[ast.Name(id=name_tok.val, ctx=ast.Store(), lineno=name_tok.line)],
+                value=val,
+                lineno=kw_line,
+            )
+        ]
 
-    def _parse_var_decl(self) -> ast.stmt:
+    def _parse_var_decl(self) -> List[ast.stmt]:
         kw = self._advance()
         return self._parse_var_item(kw_line=kw.line)
+
+    def _parse_simple_stmt_list(self, consume_semi: bool = True) -> Tuple[List[ast.stmt], bool]:
+        self._pending_extra_stmts = []
+        first, semi = self._parse_simple_stmt(consume_semi=consume_semi)
+        res = [first]
+        if self._pending_extra_stmts:
+            res.extend(self._pending_extra_stmts)
+            self._pending_extra_stmts = []
+        return res, semi
 
     def _parse_simple_stmt(self, consume_semi: bool = True) -> Tuple[ast.stmt, bool]:
         t = self._peek()
@@ -1691,7 +1992,22 @@ class _PolyglotParser:
 
             if nxt.kind == "OP" and nxt.val in (":=", "="):
                 ident = self._advance()
-                self._advance()
+                op_assign = self._advance().val
+                if op_assign == ":=":
+                    st_stmts = self._try_parse_struct_literal_rhs(ident.val, None, line)
+                    if st_stmts is not None:
+                        semi = self._consume_optional_semi() if consume_semi else False
+                        self._pending_extra_stmts = st_stmts[1:]
+                        return st_stmts[0], semi
+                    clos_fn = self._try_parse_inline_closure_def(ident.val, line)
+                    if clos_fn is not None:
+                        semi = self._consume_optional_semi() if consume_semi else False
+                        return clos_fn, semi
+                else:
+                    clos_fn = self._try_parse_inline_closure_def(ident.val, line)
+                    if clos_fn is not None:
+                        semi = self._consume_optional_semi() if consume_semi else False
+                        return clos_fn, semi
                 val = self._parse_expr()
                 semi = self._consume_optional_semi() if consume_semi else False
                 return (
@@ -2064,7 +2380,7 @@ class _PolyglotParser:
         init_stmts: List[ast.stmt] = []
         if not self._at("PUNCT", ";"):
             if self._at("ID") and self._peek().val in ("let", "var", "const"):
-                init_stmts.append(self._parse_var_decl())
+                init_stmts.extend(self._parse_var_decl())
             elif self.language in ("c", "cpp", "java", "csharp"):
                 save_f = self.pos
                 tspec = self._parse_c_type_spec()
@@ -2347,18 +2663,64 @@ class _PolyglotParser:
                     and len(args) == 2
                 ):
                     expr = ast.BinOp(left=args[0], op=ast.Mult(), right=args[1], lineno=expr.lineno)
+                elif isinstance(expr, ast.Attribute) and expr.attr == "len" and len(args) == 0:
+                    expr = ast.Call(
+                        func=ast.Name(id="len", ctx=ast.Load(), lineno=expr.lineno),
+                        args=[expr.value],
+                        keywords=[],
+                        lineno=expr.lineno,
+                    )
+                elif (
+                    isinstance(expr, ast.Attribute)
+                    and isinstance(expr.value, ast.Name)
+                    and expr.value.id in self.imported_namespaces
+                ):
+                    expr = ast.Call(
+                        func=ast.Name(id=expr.attr, ctx=ast.Load(), lineno=expr.lineno),
+                        args=args,
+                        keywords=[],
+                        lineno=expr.lineno,
+                    )
                 else:
                     raise PolyglotLoweringError(
                         f"Line {self._peek().line}: unsupported dynamic call target in AOT subset"
                     )
                 continue
 
+            if self._at("OP", ":") and self._peek(1).kind == "OP" and self._peek(1).val == ":":
+                colon_tok = self._advance()
+                self._advance()
+                # Skip Rust turbofish `::<T>` if present
+                if self._at("OP", "<"):
+                    self._skip_type_args()
+                else:
+                    ns_member = self._expect("ID")
+                    expr = ast.Name(id=ns_member.val, ctx=ast.Load(), lineno=colon_tok.line)
+                continue
+
             if self._at("OP", "."):
                 dot = self._advance()
                 attr_tok = self._expect("ID")
-                expr = ast.Attribute(
-                    value=expr, attr=attr_tok.val, ctx=ast.Load(), lineno=dot.line
-                )
+                if (
+                    attr_tok.val == "length"
+                    and self.language in ("javascript", "typescript")
+                    and not self._at("PUNCT", "(")
+                    and not any(
+                        isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.target.id == "length"
+                        for cls in self.declared_structs.values()
+                        for st in cls.body
+                    )
+                ):
+                    expr = ast.Call(
+                        func=ast.Name(id="len", ctx=ast.Load(), lineno=dot.line),
+                        args=[expr],
+                        keywords=[],
+                        lineno=dot.line,
+                    )
+                else:
+                    expr = ast.Attribute(
+                        value=expr, attr=attr_tok.val, ctx=ast.Load(), lineno=dot.line
+                    )
                 continue
 
             if self._at("PUNCT", "["):
@@ -2396,7 +2758,113 @@ class _PolyglotParser:
                 .replace("\\\\", "\\")
             )
             return ast.Constant(value=decoded, lineno=t.line)
+        if t.kind == "PUNCT" and t.val == "[":
+            # Check Go slice/array composite literal: `[]int64{10, 20}` or `[3]int64{10, 20, 30}`
+            if self.language == "go":
+                save_go_arr = self.pos
+                self._advance()
+                while not self._at("PUNCT", "]") and not self._at("EOF"):
+                    self._advance()
+                if self._at("PUNCT", "]"):
+                    self._advance()
+                    self._skip_go_type(stop_tokens={"{"})
+                    if self._at("PUNCT", "{"):
+                        self._advance()
+                        go_elts: List[ast.expr] = []
+                        while not self._at("PUNCT", "}") and not self._at("EOF"):
+                            go_elts.append(self._parse_expr())
+                            if self._at("PUNCT", ","):
+                                self._advance()
+                            else:
+                                break
+                        self._expect("PUNCT", "}")
+                        return ast.List(elts=go_elts, ctx=ast.Load(), lineno=t.line)
+                self.pos = save_go_arr
+
+            self._advance()
+            if self._at("PUNCT", "]"):
+                self._advance()
+                return ast.List(elts=[], ctx=ast.Load(), lineno=t.line)
+            first_elt = self._parse_expr()
+            if self._at("PUNCT", ";"):
+                self._advance()
+                cnt_expr = self._parse_expr()
+                self._expect("PUNCT", "]")
+                if (
+                    isinstance(cnt_expr, ast.Constant)
+                    and isinstance(cnt_expr.value, int)
+                    and not isinstance(cnt_expr.value, bool)
+                    and 0 <= cnt_expr.value <= 256
+                ):
+                    return ast.List(
+                        elts=[copy.deepcopy(first_elt) for _ in range(cnt_expr.value)],
+                        ctx=ast.Load(),
+                        lineno=t.line,
+                    )
+                raise PolyglotLoweringError(
+                    f"Line {t.line}: array repeat literal requires small constant size (<= 256)"
+                )
+            arr_elts: List[ast.expr] = [first_elt]
+            while self._at("PUNCT", ","):
+                self._advance()
+                if self._at("PUNCT", "]"):
+                    break
+                arr_elts.append(self._parse_expr())
+            self._expect("PUNCT", "]")
+            return ast.List(elts=arr_elts, ctx=ast.Load(), lineno=t.line)
+
+        if t.kind == "OP" and t.val in ("|", "||") and self.language == "rust":
+            save_lam = self.pos
+            lam_params: List[ast.arg] = []
+            if self._at("OP", "||"):
+                self._advance()
+            else:
+                self._advance()
+                while not self._at("OP", "|") and not self._at("EOF"):
+                    if self._at("ID", "mut"):
+                        self._advance()
+                    if not self._at("ID"):
+                        break
+                    pn = self._advance().val
+                    lam_params.append(ast.arg(arg=pn))
+                    if self._at("OP", ":"):
+                        self._advance()
+                        self._skip_type_annotation(stop_tokens={",", "|"})
+                    if self._at("PUNCT", ","):
+                        self._advance()
+                    else:
+                        break
+                self._expect("OP", "|")
+            if self._at("OP", "->"):
+                self._advance()
+                self._skip_type_annotation(stop_tokens={"{"})
+            if self._at("PUNCT", "{"):
+                blk_stmts = self._parse_block(allow_tail_return=True)
+                if len(blk_stmts) == 1 and isinstance(blk_stmts[0], ast.Return) and blk_stmts[0].value is not None:
+                    return ast.Lambda(
+                        args=ast.arguments(posonlyargs=[], args=lam_params, vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+                        body=blk_stmts[0].value,
+                        lineno=t.line,
+                    )
+                self.pos = save_lam
+            else:
+                lam_body = self._parse_expr()
+                return ast.Lambda(
+                    args=ast.arguments(posonlyargs=[], args=lam_params, vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+                    body=lam_body,
+                    lineno=t.line,
+                )
+
         if t.kind == "ID":
+            if self.language in ("javascript", "typescript") and self._peek(1).kind == "OP" and self._peek(1).val == "=>":
+                p_name = self._advance().val
+                self._advance()
+                lam_b = self._parse_expr()
+                return ast.Lambda(
+                    args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=p_name)], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+                    body=lam_b,
+                    lineno=t.line,
+                )
             self._advance()
             if t.val == "true":
                 return ast.Constant(value=1, lineno=t.line)
@@ -2404,6 +2872,32 @@ class _PolyglotParser:
                 return ast.Constant(value=0, lineno=t.line)
             return ast.Name(id=t.val, ctx=ast.Load(), lineno=t.line)
         if t.kind == "PUNCT" and t.val == "(":
+            if self.language in ("javascript", "typescript"):
+                save_par = self.pos
+                try:
+                    ps, _pt = self._parse_js_ts_param_list()
+                    if self._at("OP", ":"):
+                        self._advance()
+                        self._skip_type_annotation(stop_tokens={"=>"})
+                    if self._at("OP", "=>") and not self._at_offset_kind_val(1, "PUNCT", "{"):
+                        self._advance()
+                        lam_expr = self._parse_expr()
+                        return ast.Lambda(
+                            args=ast.arguments(
+                                posonlyargs=[],
+                                args=[ast.arg(arg=pn) for pn in ps],
+                                vararg=None,
+                                kwonlyargs=[],
+                                kw_defaults=[],
+                                kwarg=None,
+                                defaults=[],
+                            ),
+                            body=lam_expr,
+                            lineno=t.line,
+                        )
+                except PolyglotLoweringError:
+                    pass
+                self.pos = save_par
             self._advance()
             inner = self._parse_expr()
             self._expect("PUNCT", ")")
@@ -2439,6 +2933,7 @@ def lower_polyglot_source_to_ast(
         module=mod,
         functions=funcs,
         errors=errors,
+        imported_modules=list(parser.imported_modules),
     )
 
 

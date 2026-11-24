@@ -1992,13 +1992,13 @@ class OmniRepoCompiler:
             elif effective_os == "macos":
                 resolved_fmt = "arm64_macho_dylib" if effective_arch == "arm64" else "macho_dylib"
             else:
-                resolved_fmt = "elf_so"
+                resolved_fmt = "arm64_elf_so" if effective_arch == "arm64" else "elf_so"
             artifact_path = self.linker.emit_linked_shared_library(
                 output_path=output_path,
                 export_name=entry_export,
                 target_format=resolved_fmt,
                 pdata_xdata=pdata_xdata_pair,
-                dwarf_sections=dwarf_sections_map if resolved_fmt == "elf_so" else None,
+                dwarf_sections=dwarf_sections_map if resolved_fmt in ("elf_so", "arm64_elf_so") else None,
             )
         else:
             if effective_os == "macos":

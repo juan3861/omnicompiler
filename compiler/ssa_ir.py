@@ -1277,9 +1277,22 @@ class AstToSsaLowering:
                 self._assign_target(target, val, line=line)
 
         elif isinstance(stmt, ast.AnnAssign):
+            if isinstance(stmt.target, ast.Name) and isinstance(stmt.annotation, ast.Name):
+                ann_id = stmt.annotation.id
+                if ann_id in self.struct_layouts:
+                    self._var_struct_types[stmt.target.id] = ann_id
+                elif ann_id.startswith("ptr_") and ann_id[4:] in self.struct_layouts:
+                    self._var_struct_types[stmt.target.id] = ann_id[4:]
             if stmt.value is not None:
                 val = self._lower_expr(stmt.value)
                 self._assign_target(stmt.target, val, line=line)
+            elif isinstance(stmt.target, ast.Name) and stmt.target.id in self._var_struct_types and self._cur_block is not None:
+                sname = self._var_struct_types[stmt.target.id]
+                sz_bytes = max(8, self.struct_meta.get(sname, (8, 8))[0])
+                sz_v = self._emit_const(sz_bytes, line=line)
+                ptr_v = self._next_var(stmt.target.id, var_type="ptr")
+                self._emit(ptr_v, "call", ["omni_alloc", sz_v], line=line)
+                self._write_variable(stmt.target.id, self._cur_block, ptr_v)
 
         elif isinstance(stmt, ast.AugAssign):
             if isinstance(stmt.target, ast.Name):

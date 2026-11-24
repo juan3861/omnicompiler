@@ -880,6 +880,8 @@ class NativeObjectLinker:
             extra_exports=exports,
             pdata_xdata=pdata_xdata,
             dwarf_sections=dwarf_sections,
+            os_import_stubs=link_res.get("external_os_imports") or None,
+            os_import_table=OS_C_ABI_IMPORT_TABLE,
         )
 
     def emit_linked_executable(
