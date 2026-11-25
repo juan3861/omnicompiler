@@ -42,6 +42,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             emit_provenance=(not args.no_provenance),
             verify_reproducibility=args.repro_check,
             sanitize=args.sanitize,
+            distributed_workers=args.workers,
         )
     finally:
         compiler.close()
@@ -175,6 +176,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_b.add_argument("--backend", default="native", choices=["native", "llvm", "gcc", "wasm", "homeostasis"])
     p_b.add_argument("--toolchain-mode", default="auto", choices=["auto", "aot_only", "federated_lto"])
     p_b.add_argument("--sanitize", default=None, help="Enable sanitizers e.g. 'asan,ubsan'")
+    p_b.add_argument("--workers", type=int, default=0, help="Enable distributed RBE worker pool (>=2)")
     p_b.add_argument("--entry", default="omni_main")
     p_b.add_argument("--export-all", action="store_true")
     p_b.add_argument("--no-provenance", action="store_true")

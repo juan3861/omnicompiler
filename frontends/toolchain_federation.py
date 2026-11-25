@@ -167,14 +167,18 @@ class FederatedBuildAdapter:
             pass
         with tempfile.TemporaryDirectory() as td:
             out_bc = os.path.join(td, "unit.bc")
-            flags = [f for f in extra_flags if f.startswith(("-I", "-D", "-std=", "-O"))]
+            flags = self._normalize_flags(extra_flags, src_path)
             if "-O" not in " ".join(flags):
                 flags.append("-O3")
             if lang == "cpp" and "throw " not in src_txt and "-fexceptions" not in flags:
                 flags.extend(["-fno-exceptions", "-fno-rtti"])
             cmd: List[str]
             if use_wsl:
-                cmd = ["wsl", cc, *flags, "-emit-llvm", "-c", _to_wsl_path(src_path), "-o", _to_wsl_path(out_bc)]
+                wsl_flags = [
+                    (f"-I{_to_wsl_path(f[2:])}" if f.startswith("-I") and len(f) > 2 else f)
+                    for f in flags
+                ]
+                cmd = ["wsl", cc, *wsl_flags, "-emit-llvm", "-c", _to_wsl_path(src_path), "-o", _to_wsl_path(out_bc)]
             else:
                 cmd = [cc, *flags, "-emit-llvm", "-c", src_path, "-o", out_bc]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
@@ -240,7 +244,7 @@ class FederatedBuildAdapter:
             pass
         with tempfile.TemporaryDirectory() as td:
             out_obj = os.path.join(td, "unit.o")
-            flags = [f for f in extra_flags if f.startswith(("-I", "-D", "-std=", "-O"))]
+            flags = self._normalize_flags(extra_flags, src_path)
             if "-O" not in " ".join(flags):
                 flags.append("-O2")
             if lang == "cpp" and "throw " not in src_txt and "-fexceptions" not in flags:
@@ -248,7 +252,11 @@ class FederatedBuildAdapter:
             pic_flags = ["-fPIC", "-fno-asynchronous-unwind-tables"] if obj_fmt in ("elf", "macho") else ["-fno-asynchronous-unwind-tables"]
             cmd: List[str]
             if use_wsl:
-                cmd = ["wsl", cc, *flags, *pic_flags, "-c", _to_wsl_path(src_path), "-o", _to_wsl_path(out_obj)]
+                wsl_flags = [
+                    (f"-I{_to_wsl_path(f[2:])}" if f.startswith("-I") and len(f) > 2 else f)
+                    for f in flags
+                ]
+                cmd = ["wsl", cc, *wsl_flags, *pic_flags, "-c", _to_wsl_path(src_path), "-o", _to_wsl_path(out_obj)]
             else:
                 cmd = [cc, *flags, *pic_flags, "-c", src_path, "-o", out_obj]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
@@ -296,8 +304,24 @@ class FederatedBuildAdapter:
             )
 
     @staticmethod
-    def _parse_compile_commands(repo_path: str) -> List[Tuple[str, List[str]]]:
-        cc_json = os.path.join(repo_path, "compile_commands.json")
+    def _normalize_flags(extra_flags: Sequence[str], src_path: str, repo_dir: str = "") -> List[str]:
+        prefixes = ("-I", "-D", "-std=", "-O", "-fexceptions", "-frtti", "-fno-", "-isystem")
+        flags = [str(f) for f in extra_flags if isinstance(f, str) and f.startswith(prefixes)]
+        src_dir = os.path.dirname(os.path.abspath(src_path))
+        inc_candidates = [src_dir]
+        if repo_dir:
+            inc_candidates.append(os.path.abspath(repo_dir))
+            inc_sub = os.path.join(repo_dir, "include")
+            if os.path.isdir(inc_sub):
+                inc_candidates.append(os.path.abspath(inc_sub))
+        for inc_d in inc_candidates:
+            flag_i = f"-I{inc_d}"
+            if flag_i not in flags:
+                flags.append(flag_i)
+        return flags
+
+    @staticmethod
+    def _parse_compile_commands_file(cc_json: str, repo_path: str) -> List[Tuple[str, List[str]]]:
         if not os.path.isfile(cc_json):
             return []
         try:
@@ -315,9 +339,184 @@ class FederatedBuildAdapter:
             args = entry.get("arguments")
             if not args and isinstance(entry.get("command"), str):
                 args = shlex.split(entry["command"])
-            flags = [str(a) for a in (args or []) if isinstance(a, str) and a.startswith(("-I", "-D", "-std=", "-O"))]
+            flags = [
+                str(a)
+                for a in (args or [])
+                if isinstance(a, str) and a.startswith(("-I", "-D", "-std=", "-O", "-fexceptions", "-frtti"))
+            ]
             units.append((fpath, flags))
         return units
+
+    @classmethod
+    def _parse_compile_commands(cls, repo_path: str) -> List[Tuple[str, List[str]]]:
+        return cls._parse_compile_commands_file(os.path.join(repo_path, "compile_commands.json"), repo_path)
+
+    def _collect_cmake_units(self, repo_path: str) -> Tuple[bool, List[Tuple[str, List[str]]]]:
+        """
+        Configures real CMakeLists.txt projects (`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`)
+        when a compatible native C/C++ compiler exists, and extracts CMake targets/includes/defines
+        for cross-WSL2 C/C++ builds on Windows.
+        """
+        import re
+        cmake_file = os.path.join(repo_path, "CMakeLists.txt")
+        if not os.path.isfile(cmake_file):
+            return False, []
+
+        # 1. Try real CMake configure when matching compiler is natively callable
+        cmake_bin = self.native_tools.get("cmake")
+        can_native_cmake = bool(cmake_bin) and (
+            (sys.platform != "win32" and (self.native_tools.get("gcc") or self.native_tools.get("clang")))
+            or (sys.platform == "win32" and self.target_os == "windows" and (self.native_tools.get("clang") or self.native_tools.get("gcc")))
+        )
+        if can_native_cmake and cmake_bin:
+            with tempfile.TemporaryDirectory() as bdir:
+                cmd = [cmake_bin, "-S", repo_path, "-B", bdir, "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
+                if self.native_tools.get("ninja"):
+                    cmd.extend(["-G", "Ninja"])
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+                cc_out = os.path.join(bdir, "compile_commands.json")
+                if proc.returncode == 0 and os.path.isfile(cc_out):
+                    parsed = self._parse_compile_commands_file(cc_out, repo_path)
+                    if parsed:
+                        return True, parsed
+
+        # 2. Structured CMakeLists.txt directive extraction (for cross-Linux WSL2 builds or missing local CMake compiler)
+        try:
+            with open(cmake_file, "r", encoding="utf-8", errors="ignore") as f:
+                cm_txt = f.read()
+        except OSError:
+            return False, []
+
+        clean_txt = re.sub(r"#.*", "", cm_txt)
+        inc_flags: List[str] = [f"-I{os.path.abspath(repo_path)}"]
+        def_flags: List[str] = []
+        extra_flags: List[str] = []
+
+        std_m = re.search(r"CMAKE_CXX_STANDARD\s+(\d+)", clean_txt)
+        if std_m:
+            extra_flags.append(f"-std=c++{std_m.group(1)}")
+
+        for m_inc in re.finditer(r"(?:target_include_directories|include_directories)\s*\(([^)]+)\)", clean_txt, re.IGNORECASE):
+            for tok in m_inc.group(1).split():
+                t = tok.strip("\"'")
+                if t.upper() in ("PUBLIC", "PRIVATE", "INTERFACE") or tok == m_inc.group(1).split()[0]:
+                    continue
+                t = t.replace("${CMAKE_CURRENT_SOURCE_DIR}", repo_path).replace("${PROJECT_SOURCE_DIR}", repo_path)
+                cand = t if os.path.isabs(t) else os.path.abspath(os.path.join(repo_path, t))
+                if os.path.isdir(cand):
+                    fi = f"-I{cand}"
+                    if fi not in inc_flags:
+                        inc_flags.append(fi)
+
+        for m_def in re.finditer(r"(?:target_compile_definitions|add_definitions)\s*\(([^)]+)\)", clean_txt, re.IGNORECASE):
+            for tok in m_def.group(1).split():
+                t = tok.strip("\"'")
+                if t.upper() in ("PUBLIC", "PRIVATE", "INTERFACE"):
+                    continue
+                if t.startswith("-D"):
+                    def_flags.append(t)
+                elif "=" in t or t.isupper():
+                    def_flags.append(f"-D{t}")
+
+        src_units: List[Tuple[str, List[str]]] = []
+        seen_src: set = set()
+        shared_flags = inc_flags + def_flags + extra_flags
+        for m_src in re.finditer(r"([A-Za-z0-9_./\\-]+\.(?:cpp|cxx|cc|c))(?![A-Za-z0-9_])", clean_txt):
+            rel_s = m_src.group(1)
+            full_s = os.path.abspath(os.path.join(repo_path, rel_s))
+            if os.path.isfile(full_s) and full_s not in seen_src:
+                seen_src.add(full_s)
+                src_units.append((full_s, list(shared_flags)))
+
+        return bool(src_units), src_units
+
+    def _compile_go_module(self, repo_path: str, repo_name: str) -> Optional[FederatedUnitArtifact]:
+        """
+        Invokes official `go build` on `go.mod` / `*.go` repositories:
+        - Uses `go build -buildmode=c-archive` when matching host C toolchain exists (producing linkable `.a`).
+        - Otherwise compiles pure Go directly with `GOOS=wasip1 GOARCH=wasm go build` (produces standard `.wasm`).
+        """
+        go_bin = self.native_tools.get("go")
+        use_wsl_go = False
+        if not go_bin and self.target_os == "linux" and self.wsl_tools.get("go"):
+            go_bin = self.wsl_tools["go"]
+            use_wsl_go = True
+        if not go_bin:
+            return None
+
+        has_gomod = os.path.isfile(os.path.join(repo_path, "go.mod"))
+        go_files = [
+            os.path.join(repo_path, fn)
+            for fn in os.listdir(repo_path)
+            if fn.endswith(".go") and not fn.endswith("_test.go")
+        ]
+        if not (has_gomod or go_files):
+            return None
+
+        has_export_comment = False
+        for gf in go_files:
+            try:
+                with open(gf, "r", encoding="utf-8", errors="ignore") as f:
+                    if "//export " in f.read():
+                        has_export_comment = True
+                        break
+            except OSError:
+                pass
+
+        t0 = time.perf_counter()
+        can_cgo_archive = has_export_comment and (
+            (self.target_os == "linux" and (sys.platform != "win32" or use_wsl_go) and (self.native_tools.get("gcc") or self.wsl_tools.get("gcc")))
+            or (self.target_os == "windows" and bool(self.native_tools.get("gcc")))
+        )
+        with tempfile.TemporaryDirectory() as td:
+            if can_cgo_archive:
+                out_a = os.path.join(td, f"lib{repo_name}_go.a")
+                env = dict(os.environ)
+                env["CGO_ENABLED"] = "1"
+                cmd = (
+                    ["wsl", go_bin, "build", "-buildmode=c-archive", "-o", _to_wsl_path(out_a), "."]
+                    if use_wsl_go
+                    else [go_bin, "build", "-buildmode=c-archive", "-o", out_a, "."]
+                )
+                proc = subprocess.run(cmd, cwd=repo_path, env=env, capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+                if proc.returncode == 0 and os.path.isfile(out_a):
+                    with open(out_a, "rb") as af:
+                        ar_bytes = af.read()
+                    syms, ar_fmt = self._inspect_archive_exports(ar_bytes, self.target_os, repo_name)
+                    return FederatedUnitArtifact(
+                        source_path=repo_path,
+                        repo_name=repo_name,
+                        language="go",
+                        artifact_kind="static_archive",
+                        payload=ar_bytes,
+                        defined_symbols=syms,
+                        toolchain_used="go:c-archive",
+                        compile_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                        object_format=ar_fmt,
+                    )
+
+            # Portable native Go WASI build (`GOOS=wasip1 GOARCH=wasm`) requiring zero Cgo C compiler
+            out_wasm = os.path.join(td, f"{repo_name}_go.wasm")
+            env_w = dict(os.environ)
+            env_w["GOOS"] = "wasip1"
+            env_w["GOARCH"] = "wasm"
+            cmd_w = [go_bin, "build", "-o", out_wasm, "."]
+            proc_w = subprocess.run(cmd_w, cwd=repo_path, env=env_w, capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+            if proc_w.returncode == 0 and os.path.isfile(out_wasm):
+                with open(out_wasm, "rb") as wf:
+                    w_bytes = wf.read()
+                return FederatedUnitArtifact(
+                    source_path=repo_path,
+                    repo_name=repo_name,
+                    language="go",
+                    artifact_kind="wasm_module",
+                    payload=w_bytes,
+                    defined_symbols=[],
+                    toolchain_used="go:wasip1",
+                    compile_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                    object_format="wasm",
+                )
+        return None
 
     def collect_federated_artifacts(
         self,
@@ -349,11 +548,33 @@ class FederatedBuildAdapter:
                 if norm_p in seen_paths:
                     continue
                 seen_paths.add(norm_p)
-                art = self._compile_c_cpp_to_bitcode(norm_p, repo_name, extra_flags=flags)
+                eff_flags = self._normalize_flags(flags, norm_p, repo_dir=repo_dir)
+                art = self._compile_c_cpp_to_bitcode(norm_p, repo_name, extra_flags=eff_flags)
                 if art is None:
-                    art = self._compile_c_cpp_to_object(norm_p, repo_name, extra_flags=flags)
+                    art = self._compile_c_cpp_to_object(norm_p, repo_name, extra_flags=eff_flags)
                 if art is not None:
                     artifacts.append(art)
+
+            # 1b. CMakeLists.txt build system integration
+            if os.path.isfile(os.path.join(repo_dir, "CMakeLists.txt")):
+                _cm_ok, cm_units = self._collect_cmake_units(repo_dir)
+                for fpath, flags in cm_units:
+                    norm_p = os.path.abspath(fpath)
+                    if norm_p in seen_paths:
+                        continue
+                    seen_paths.add(norm_p)
+                    eff_flags = self._normalize_flags(flags, norm_p, repo_dir=repo_dir)
+                    art = self._compile_c_cpp_to_bitcode(norm_p, repo_name, extra_flags=eff_flags)
+                    if art is None:
+                        art = self._compile_c_cpp_to_object(norm_p, repo_name, extra_flags=eff_flags)
+                    if art is not None:
+                        artifacts.append(art)
+
+            # 1c. Real Go module compilation (`go build -buildmode=c-archive` / `GOOS=wasip1`)
+            if toolchain_mode == "federated_lto":
+                go_art = self._compile_go_module(repo_dir, repo_name)
+                if go_art is not None:
+                    artifacts.append(go_art)
 
             # 2. Walk repo for prebuilt bitcode/IR/objects or complex C/C++/Rust units
             for root, _, files in os.walk(repo_dir):
@@ -432,9 +653,10 @@ class FederatedBuildAdapter:
                                 needs_fed = False
                         if needs_fed:
                             seen_paths.add(fpath)
-                            art = self._compile_c_cpp_to_bitcode(fpath, repo_name)
+                            repo_flags = self._normalize_flags([], fpath, repo_dir=repo_dir)
+                            art = self._compile_c_cpp_to_bitcode(fpath, repo_name, extra_flags=repo_flags)
                             if art is None:
-                                art = self._compile_c_cpp_to_object(fpath, repo_name)
+                                art = self._compile_c_cpp_to_object(fpath, repo_name, extra_flags=repo_flags)
                             if art is not None and (toolchain_mode == "federated_lto" or not set(art.defined_symbols).issubset(already_lowered)):
                                 artifacts.append(art)
                     elif ext == ".rs" and toolchain_mode == "federated_lto":

@@ -356,13 +356,17 @@ class OmniRepoCompiler:
         emit_provenance: bool = True,
         verify_reproducibility: bool = False,
         sanitize: Optional[str] = None,
+        distributed_workers: int = 0,
+        profile_weights: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """
         Executes the full 9-stage multi-repository compilation pipeline with real AST->SSA->Native/LLVM/GCC/WASM
         code generation, cross-repository call linking, Unicorn silicon verification, and provenance signing.
         """
         # Fresh linker instance per compilation prevents cross-call module accumulation
-        self.linker = NativeObjectLinker()
+        self.linker = NativeObjectLinker(allow_open_dynamic_imports=True)
+        if profile_weights:
+            self.linker.hot_weights = {str(k): int(v) for k, v in profile_weights.items()}
 
         resolved_toolchain_mode = toolchain_mode.lower().strip()
         if resolved_toolchain_mode not in ("auto", "aot_only", "federated_lto"):
@@ -514,6 +518,7 @@ class OmniRepoCompiler:
         federated_bc_units = [a for a in federated_artifacts if a.artifact_kind in ("bitcode", "ir")]
         federated_obj_units = [a for a in federated_artifacts if a.artifact_kind == "object"]
         federated_archive_units = [a for a in federated_artifacts if a.artifact_kind == "static_archive"]
+        federated_wasm_units = [a for a in federated_artifacts if a.artifact_kind == "wasm_module"]
         federated_defined_syms: Set[str] = {
             sym for art in federated_artifacts for sym in art.defined_symbols
         }
@@ -524,6 +529,8 @@ class OmniRepoCompiler:
             "bitcode_units": len(federated_bc_units),
             "object_units": len(federated_obj_units),
             "static_archive_units": len(federated_archive_units),
+            "wasm_build_units": len(federated_wasm_units),
+            "toolchains_invoked": sorted({a.toolchain_used for a in federated_artifacts}),
             "exported_symbols": sorted(federated_defined_syms),
             "cross_lto_fused": False,
         }
@@ -1401,6 +1408,8 @@ class OmniRepoCompiler:
                 for fn_n, owner in unit_owner_repo.items()
                 if owner == m.repo_name
             ]
+            if profile_weights:
+                repo_ssas.sort(key=lambda s: -int(profile_weights.get(s.name, 0)))
             if san_pass is not None:
                 for _s_fn in repo_ssas:
                     _s_rep = san_pass.instrument_function(_s_fn)
@@ -1716,7 +1725,11 @@ class OmniRepoCompiler:
                 else:
                     fed_bc_obj = load_elf_object(bc_obj_bytes, repo_name="__omni_fed_bc")
                 for sym_name, sym_def in fed_bc_obj.symbols.items():
-                    if getattr(sym_def, "section", ".text") == ".text" and sym_name not in defined_symbols_across_mods:
+                    if (
+                        getattr(sym_def, "section", ".text") == ".text"
+                        and not sym_name.startswith(("__elf_sec_", "__coff_sec_", "__macho_sec_"))
+                        and sym_name not in defined_symbols_across_mods
+                    ):
                         sym_def.is_exported = True
                         defined_symbols_across_mods.add(sym_name)
                 self.linker.add_module(fed_bc_obj)
@@ -1730,7 +1743,11 @@ class OmniRepoCompiler:
             else:
                 ext_mod = load_elf_object(f_obj.payload, repo_name=f"{f_obj.repo_name}_{f_idx}_fed_obj")
             for sym_name, sym_def in ext_mod.symbols.items():
-                if getattr(sym_def, "section", ".text") == ".text" and sym_name not in defined_symbols_across_mods:
+                if (
+                    getattr(sym_def, "section", ".text") == ".text"
+                    and not sym_name.startswith(("__elf_sec_", "__coff_sec_", "__macho_sec_"))
+                    and sym_name not in defined_symbols_across_mods
+                ):
                     sym_def.is_exported = True
                     defined_symbols_across_mods.add(sym_name)
             self.linker.add_module(ext_mod)
@@ -1886,6 +1903,7 @@ class OmniRepoCompiler:
         asm_all_valid = True
         if effective_arch == "x86_64":
             _x86_align_nops = (
+                b"\x66\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00",
                 b"\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00",
                 b"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00",
                 b"\x0f\x1f\x84\x00\x00\x00\x00\x00",
@@ -1899,10 +1917,19 @@ class OmniRepoCompiler:
                 b"\xcc",
             )
             for mod in self.linker.modules:
-                text_syms = [sd for sd in mod.symbols.values() if getattr(sd, "section", ".text") == ".text"]
+                is_external_obj = getattr(mod, "repo_name", "").endswith(("_fed_bc", "_fed_obj"))
+                text_syms = [
+                    sd
+                    for sd in mod.symbols.values()
+                    if getattr(sd, "section", ".text") == ".text"
+                    and not sd.name.startswith(("__elf_sec_", "__coff_sec_", "__macho_sec_"))
+                ]
                 sorted_syms = sorted(text_syms, key=lambda sd: sd.offset)
                 for idx_s, sym_def in enumerate(sorted_syms):
-                    next_off = sorted_syms[idx_s + 1].offset if idx_s + 1 < len(sorted_syms) else sym_def.offset + sym_def.size
+                    next_off = next(
+                        (s_n.offset for s_n in sorted_syms[idx_s + 1:] if s_n.offset > sym_def.offset),
+                        sym_def.offset + sym_def.size,
+                    )
                     end_off = min(sym_def.offset + sym_def.size, next_off)
                     fn_slice = bytes(mod.text_bytes[sym_def.offset:end_off])
                     if resolved_backend in ("llvm", "gcc", "homeostasis") or getattr(mod, "repo_name", "").endswith(("_llvm", "_gcc", "_fed_bc", "_fed_obj")):
@@ -1914,6 +1941,10 @@ class OmniRepoCompiler:
                                     fn_slice = fn_slice[:-len(nop_pat)]
                                     changed = True
                                     break
+                    if is_external_obj and fn_slice and fn_slice[-1] != 0xC3:
+                        # GCC/Clang stack-protector functions emit cold `call __stack_chk_fail` / `ud2` after main RET
+                        if len(fn_slice) >= 5 and (fn_slice[-5] == 0xE8 or fn_slice.endswith(b"\x0f\x0b")) and b"\xc3" in fn_slice:
+                            fn_slice = fn_slice[:fn_slice.rfind(b"\xc3") + 1]
                     asm_rep = self.asm_auditor.audit_function_code(fn_slice, sym_def.name)
                     if not asm_rep.is_valid:
                         asm_all_valid = False
@@ -1935,8 +1966,64 @@ class OmniRepoCompiler:
             "relocations_applied": link_res["relocations_applied"],
             "abs64_relocs_count": len(link_res.get("abs64_reloc_rvas", [])),
             "exported_symbols": sorted(link_res["exported_symbols"].keys()),
+            "layout_order": link_res.get("layout_order", []),
+            "hot_first_applied": bool(link_res.get("hot_first_applied", False)),
             "external_os_imports": sorted((link_res.get("external_os_imports") or {}).keys()),
         }
+
+        if distributed_workers >= 2:
+            import tempfile
+            from orchestrator.rbe_cas import ActionSpec, ContentAddressableStore, RBEClusterPool
+
+            with tempfile.TemporaryDirectory() as rbe_td:
+                rbe_cas = ContentAddressableStore(os.path.join(rbe_td, "cas"))
+                unit_actions: List[ActionSpec] = []
+                unit_dep_ids: List[str] = []
+                for idx_m, m_repo in enumerate(manifests):
+                    manifest_blob = rbe_cas.put_blob(
+                        f"{m_repo.repo_name}:{getattr(m_repo, 'digest', '')}:{len(m_repo.exports)}".encode("utf-8")
+                    )
+                    aid = f"rbe_unit_{idx_m}_{m_repo.repo_name}"
+                    unit_dep_ids.append(aid)
+                    unit_actions.append(
+                        ActionSpec(
+                            action_id=aid,
+                            kind="compile_ir_unit",
+                            payload={
+                                "func_name": m_repo.repo_name,
+                                "const_val": len(m_repo.exports) or 1,
+                                "arch": effective_arch if effective_arch in ("x86_64", "arm64") else "x86_64",
+                            },
+                            input_blobs={"manifest": manifest_blob},
+                            target_triple=f"{effective_arch}-{effective_os}",
+                        )
+                    )
+                code_blob = rbe_cas.put_blob(bytes(combined_code))
+                unit_actions.append(
+                    ActionSpec(
+                        action_id="rbe_link_image",
+                        kind="emit_standalone_binary",
+                        payload={
+                            "target_format": "pe64" if effective_os == "windows" else "elf64",
+                            "exit_code": 0,
+                            "output_name": f"{entry_export}_rbe.bin",
+                        },
+                        input_blobs={"linked.text": code_blob},
+                        deps=unit_dep_ids,
+                        target_triple=f"{effective_arch}-{effective_os}",
+                    )
+                )
+                with RBEClusterPool(rbe_cas, num_workers=distributed_workers, prefer_grpc=True) as rbe_pool:
+                    rbe_run = rbe_pool.execute_dag(unit_actions)
+                results["stages"]["rbe_cluster"] = {
+                    "enabled": True,
+                    "workers": distributed_workers,
+                    "worker_pids": rbe_run["worker_pids"],
+                    "endpoints": rbe_run["endpoints"],
+                    "total_actions": rbe_run["total_actions"],
+                    "cache_hits": rbe_run["cache_hits"],
+                    "executed_misses": rbe_run["executed_misses"],
+                }
 
         results["stages"]["ingestion"]["salsa_artifact_hits"] = self._salsa_obj_hits
         results["stages"]["ingestion"]["salsa_artifact_misses"] = self._salsa_obj_misses
@@ -2249,6 +2336,8 @@ class OmniRepoCompiler:
                         emit_provenance=False,
                         verify_reproducibility=False,
                         sanitize=sanitize,
+                        distributed_workers=0,
+                        profile_weights=profile_weights,
                     )
                     rep_art = rep_res["stages"]["emission"]["artifact_path"]
                     with open(rep_art, "rb") as rf:

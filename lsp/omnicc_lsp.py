@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import re
 import sys
-from typing import Any, BinaryIO, Dict, List, Optional
+import urllib.parse
+import urllib.request
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
 from compiler.sanitizer_pass import SanitizerInstrumentationPass
 from compiler.ssa_ir import lower_ast_to_ssa
@@ -51,11 +55,141 @@ def read_lsp_message(stream: BinaryIO) -> Optional[Dict[str, Any]]:
 
 
 class OmniLSPServer:
-    """In-process & stdio JSON-RPC 2.0 LSP state machine for `.py` / Omni sources."""
+    """In-process & stdio JSON-RPC 2.0 LSP state machine with cross-file workspace CPG index."""
 
     def __init__(self) -> None:
         self.documents: Dict[str, str] = {}
+        self.workspace_roots: List[str] = []
+        self.symbol_defs: Dict[str, List[Dict[str, Any]]] = {}  # sym -> [{"uri", "range", "kind", "lang"}]
+        self.doc_symbols: Dict[str, List[Dict[str, Any]]] = {}
         self.shutdown_requested: bool = False
+
+    @staticmethod
+    def _uri_to_path(uri: str) -> str:
+        if not uri.startswith("file://"):
+            return os.path.abspath(uri)
+        parsed = urllib.parse.urlparse(uri)
+        path = urllib.request.url2pathname(parsed.path)
+        if parsed.netloc:
+            path = f"//{parsed.netloc}{path}"
+        return os.path.abspath(path)
+
+    @staticmethod
+    def _path_to_uri(path: str) -> str:
+        return "file:///" + os.path.abspath(path).replace("\\", "/").lstrip("/")
+
+    def _index_document(self, uri: str, text: str) -> None:
+        self.documents[uri] = text
+        # Clear prior definitions for this URI
+        for sym_list in self.symbol_defs.values():
+            sym_list[:] = [d for d in sym_list if d.get("uri") != uri]
+
+        doc_syms: List[Dict[str, Any]] = []
+        ext = os.path.splitext(uri)[1].lower()
+        if ext == ".py" or not ext:
+            try:
+                tree = ast.parse(text, filename=uri)
+                for node in tree.body:
+                    if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                        sl = max(0, node.lineno - 1)
+                        el = max(sl, (getattr(node, "end_lineno", node.lineno) or node.lineno) - 1)
+                        sc = max(0, getattr(node, "col_offset", 0))
+                        rng = {"start": {"line": sl, "character": sc}, "end": {"line": sl, "character": sc + len(node.name)}}
+                        full_rng = {"start": {"line": sl, "character": 0}, "end": {"line": el, "character": 0}}
+                        kind = 5 if isinstance(node, ast.ClassDef) else 12
+                        self.symbol_defs.setdefault(node.name, []).append({"uri": uri, "range": rng, "kind": kind, "lang": "python"})
+                        doc_syms.append({"name": node.name, "kind": kind, "range": full_rng, "selectionRange": rng})
+            except SyntaxError:
+                pass
+        else:
+            # Polyglot C / C++ / Go / Rust definition extraction
+            lines = text.splitlines()
+            fn_pats = (
+                re.compile(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+                re.compile(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+                re.compile(r"^\s*(?:pub\s+)?(?:unsafe\s+)?(?:extern\s+\"C\"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+                re.compile(r"^\s*(?:extern\s+(?:\"C\"\s+)?)?(?:static\s+|inline\s+)*(?:[A-Za-z_][A-Za-z0-9_*\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?:\{|$)"),
+            )
+            for idx_l, line_str in enumerate(lines):
+                for pat in fn_pats:
+                    m = pat.match(line_str)
+                    if m:
+                        sname = m.group(1)
+                        if sname in ("if", "for", "while", "switch", "return"):
+                            continue
+                        col = max(0, line_str.find(sname))
+                        rng = {"start": {"line": idx_l, "character": col}, "end": {"line": idx_l, "character": col + len(sname)}}
+                        self.symbol_defs.setdefault(sname, []).append({"uri": uri, "range": rng, "kind": 12, "lang": ext.lstrip(".")})
+                        doc_syms.append({"name": sname, "kind": 12, "range": rng, "selectionRange": rng})
+                        break
+        self.doc_symbols[uri] = doc_syms
+
+    def index_workspace_root(self, root_path: str) -> int:
+        if not root_path or not os.path.isdir(root_path):
+            return 0
+        count = 0
+        exts = {".py", ".c", ".h", ".cc", ".cpp", ".hpp", ".rs", ".go"}
+        for rdir, _, files in os.walk(root_path):
+            if any(p in rdir for p in (".git", "__pycache__", ".venv", "node_modules", "target", "build")):
+                continue
+            for fn in sorted(files):
+                if os.path.splitext(fn)[1].lower() in exts:
+                    fp = os.path.join(rdir, fn)
+                    uri = self._path_to_uri(fp)
+                    try:
+                        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                            self._index_document(uri, f.read())
+                        count += 1
+                    except OSError:
+                        pass
+        return count
+
+    @staticmethod
+    def _ident_at(text: str, line: int, character: int) -> Optional[str]:
+        lines = text.splitlines()
+        if line < 0 or line >= len(lines):
+            return None
+        row = lines[line]
+        if not row:
+            return None
+        pos = min(max(0, character), len(row) - 1)
+        if not (row[pos].isalnum() or row[pos] == "_"):
+            if pos > 0 and (row[pos - 1].isalnum() or row[pos - 1] == "_"):
+                pos -= 1
+            else:
+                return None
+        l_i = pos
+        while l_i > 0 and (row[l_i - 1].isalnum() or row[l_i - 1] == "_"):
+            l_i -= 1
+        r_i = pos + 1
+        while r_i < len(row) and (row[r_i].isalnum() or row[r_i] == "_"):
+            r_i += 1
+        tok = row[l_i:r_i]
+        return tok if (tok and (tok[0].isalpha() or tok[0] == "_")) else None
+
+    def find_definitions(self, uri: str, line: int, character: int) -> List[Dict[str, Any]]:
+        ident = self._ident_at(self.documents.get(uri, ""), line, character)
+        if not ident:
+            return []
+        return [{"uri": d["uri"], "range": d["range"]} for d in self.symbol_defs.get(ident, [])]
+
+    def find_references(self, uri: str, line: int, character: int) -> List[Dict[str, Any]]:
+        ident = self._ident_at(self.documents.get(uri, ""), line, character)
+        if not ident:
+            return []
+        pat = re.compile(rf"\b{re.escape(ident)}\b")
+        locs: List[Dict[str, Any]] = []
+        for doc_uri, txt in sorted(self.documents.items()):
+            for idx_l, row in enumerate(txt.splitlines()):
+                for m in pat.finditer(row):
+                    locs.append({
+                        "uri": doc_uri,
+                        "range": {
+                            "start": {"line": idx_l, "character": m.start()},
+                            "end": {"line": idx_l, "character": m.end()},
+                        },
+                    })
+        return locs
 
     def analyze_diagnostics(self, uri: str, text: str) -> List[Dict[str, Any]]:
         diags: List[Dict[str, Any]] = []
@@ -129,6 +263,18 @@ class OmniLSPServer:
         outgoing: List[Dict[str, Any]] = []
 
         if method == "initialize":
+            root_uri = params.get("rootUri")
+            if isinstance(root_uri, str) and root_uri:
+                rp = self._uri_to_path(root_uri)
+                if rp not in self.workspace_roots:
+                    self.workspace_roots.append(rp)
+                    self.index_workspace_root(rp)
+            for wf in params.get("workspaceFolders") or []:
+                if isinstance(wf, dict) and wf.get("uri"):
+                    rp = self._uri_to_path(str(wf["uri"]))
+                    if rp not in self.workspace_roots:
+                        self.workspace_roots.append(rp)
+                        self.index_workspace_root(rp)
             outgoing.append({
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -136,15 +282,18 @@ class OmniLSPServer:
                     "capabilities": {
                         "textDocumentSync": 1,
                         "hoverProvider": True,
+                        "definitionProvider": True,
+                        "referencesProvider": True,
+                        "documentSymbolProvider": True,
                     },
-                    "serverInfo": {"name": "omnicc-lsp", "version": "1.0.0"},
+                    "serverInfo": {"name": "omnicc-lsp", "version": "1.1.0"},
                 },
             })
         elif method == "textDocument/didOpen":
             td = params.get("textDocument", {})
             uri = str(td.get("uri", ""))
             txt = str(td.get("text", ""))
-            self.documents[uri] = txt
+            self._index_document(uri, txt)
             outgoing.append({
                 "jsonrpc": "2.0",
                 "method": "textDocument/publishDiagnostics",
@@ -156,7 +305,7 @@ class OmniLSPServer:
             changes = params.get("contentChanges", [])
             if changes:
                 txt = str(changes[-1].get("text", ""))
-                self.documents[uri] = txt
+                self._index_document(uri, txt)
                 outgoing.append({
                     "jsonrpc": "2.0",
                     "method": "textDocument/publishDiagnostics",
@@ -168,6 +317,22 @@ class OmniLSPServer:
             uri = str(td.get("uri", ""))
             hover_res = self.build_hover(uri, int(pos.get("line", 0)))
             outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": hover_res})
+        elif method == "textDocument/definition":
+            td = params.get("textDocument", {})
+            pos = params.get("position", {})
+            uri = str(td.get("uri", ""))
+            defs = self.find_definitions(uri, int(pos.get("line", 0)), int(pos.get("character", 0)))
+            outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": defs})
+        elif method == "textDocument/references":
+            td = params.get("textDocument", {})
+            pos = params.get("position", {})
+            uri = str(td.get("uri", ""))
+            refs = self.find_references(uri, int(pos.get("line", 0)), int(pos.get("character", 0)))
+            outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": refs})
+        elif method == "textDocument/documentSymbol":
+            td = params.get("textDocument", {})
+            uri = str(td.get("uri", ""))
+            outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": self.doc_symbols.get(uri, [])})
         elif method == "shutdown":
             self.shutdown_requested = True
             outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": None})
