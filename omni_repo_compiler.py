@@ -1976,8 +1976,10 @@ class OmniRepoCompiler:
                         elif (
                             sym_def.name.endswith(".cold")
                             or ".cold." in sym_def.name
-                            or fn_slice.endswith(b"\x0f\x0b")
+                            or fn_slice.endswith((b"\x0f\x0b", b"\xcc"))
+                            or (len(fn_slice) >= 2 and fn_slice[-2] == 0xEB)
                             or (len(fn_slice) >= 5 and fn_slice[-5] in (0xE8, 0xE9))
+                            or (len(fn_slice) >= 6 and fn_slice[-6:-4] == b"\xff\x25")
                         ):
                             continue
                     asm_rep = self.asm_auditor.audit_function_code(fn_slice, sym_def.name)

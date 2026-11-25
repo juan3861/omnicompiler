@@ -109,16 +109,29 @@ class TestAlphaC107CargoCMakeGoFederation(unittest.TestCase):
                 toolchain_mode="federated_lto",
             )
             has_linux_cpp = (
-                (sys.platform == "linux" and platform.machine() in ("x86_64", "AMD64") and bool(adapter.native_tools.get("g++")))
-                or (sys.platform == "win32" and bool(adapter.wsl_tools.get("g++")))
+                (sys.platform == "linux" and platform.machine() in ("x86_64", "AMD64") and bool(adapter.native_tools.get("g++") or adapter.native_tools.get("clang++")))
+                or (sys.platform == "win32" and bool(adapter.wsl_tools.get("g++") or adapter.wsl_tools.get("clang++")))
             )
             if has_linux_cpp and len(arts) >= 2:
-                linker = NativeObjectLinker()
-                for art in arts:
-                    if art.object_format == "elf":
-                        linker.add_module(load_elf_object(art.payload, repo_name=art.repo_name))
-                so_out = os.path.join(tmp, "libc107cmake.so")
-                linker.emit_linked_shared_library(so_out, export_name="c107_cmake_entry", target_format="elf_so")
+                from omni_repo_compiler import OmniRepoCompiler
+                so_base = os.path.join(tmp, "libc107cmake")
+                comp = OmniRepoCompiler()
+                try:
+                    comp_res = comp.compile_repositories(
+                        repo_paths=[tmp],
+                        output_path=so_base,
+                        target_format="shared_lib",
+                        entry_export="c107_cmake_entry",
+                        target_os="linux",
+                        target_arch="x86_64",
+                        toolchain_mode="federated_lto",
+                        export_all=True,
+                        emit_provenance=False,
+                    )
+                finally:
+                    comp.close()
+                so_out = comp_res["stages"]["emission"]["artifact_path"]
+                self.assertTrue(os.path.exists(so_out))
                 if sys.platform == "linux":
                     lib = ctypes.CDLL(so_out)
                     lib.c107_cmake_entry.argtypes = [ctypes.c_int]

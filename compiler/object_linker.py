@@ -679,6 +679,8 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                     mod.relocations.append(RelocationEntry(reloc_sec_name, r_off, target_sym_name, "TLS_GOTTPOFF", addend=r_addend + 4))
                 elif rtype in (1, 257):  # R_X86_64_64, R_AARCH64_ABS64
                     mod.relocations.append(RelocationEntry(reloc_sec_name, r_off, target_sym_name, "ADDR64", addend=r_addend))
+                elif rtype == 24:  # R_X86_64_PC64
+                    mod.relocations.append(RelocationEntry(reloc_sec_name, r_off, target_sym_name, "REL64", addend=r_addend))
                 elif rtype in (282, 283):  # R_AARCH64_JUMP26 / R_AARCH64_CALL26
                     mod.relocations.append(RelocationEntry(reloc_sec_name, r_off, target_sym_name, "ARM64_CALL26", addend=r_addend))
                 elif rtype in (275, 311):  # R_AARCH64_ADR_PREL_PG_HI21 / R_AARCH64_ADR_GOT_PAGE
@@ -1715,7 +1717,7 @@ class NativeObjectLinker:
                     buf_patch_off = t_base + reloc.offset
                     reloc_v_pos = buf_patch_off
 
-                reloc_size = 8 if reloc.reloc_type == "ADDR64" else 4
+                reloc_size = 8 if reloc.reloc_type in ("ADDR64", "REL64") else 4
                 if buf_patch_off + reloc_size > len(target_buf):
                     raise RelocationOutOfBoundsError(
                         f"Relocation slot [{buf_patch_off}..{buf_patch_off + reloc_size}] exceeds {reloc.section} bounds ({len(target_buf)}) in module {mod.repo_name}"
@@ -1734,6 +1736,11 @@ class NativeObjectLinker:
                     if not (-0x80000000 <= disp32 <= 0x7FFFFFFF):
                         raise RelocationOutOfBoundsError(f"REL32 displacement {disp32} overflows signed 32-bit range")
                     struct.pack_into("<i", target_buf, buf_patch_off, disp32)
+                    applied_relocs += 1
+
+                elif reloc.reloc_type == "REL64":
+                    disp64 = (target_offset + reloc.addend) - reloc_v_pos
+                    struct.pack_into("<q", target_buf, buf_patch_off, disp64)
                     applied_relocs += 1
 
                 elif reloc.reloc_type == "COFF_SECREL32":

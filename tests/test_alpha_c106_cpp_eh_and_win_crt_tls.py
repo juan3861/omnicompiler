@@ -168,11 +168,14 @@ class TestAlphaC106CppEHAndWinCrtTls(unittest.TestCase):
                 or adapter.wsl_tools.get("clang++")
             )
             if has_cpp_tool:
-                self.assertGreater(len(arts), 0)
-                obj_mod = load_elf_object(arts[0].payload, repo_name="eh_probe_repo")
+                obj_art = adapter._compile_c_cpp_to_object(cpp_src, "eh_probe_repo")
+                self.assertIsNotNone(obj_art)
+                assert obj_art is not None
+                obj_mod = load_elf_object(obj_art.payload, repo_name="eh_probe_repo")
                 self.assertGreater(len(obj_mod.eh_frame_bytes), 0)
                 rel_syms = {r.symbol_name for r in obj_mod.relocations}
                 self.assertTrue("__cxa_throw" in rel_syms or "__gxx_personality_v0" in rel_syms)
+                self.assertGreater(len(arts), 0)
             else:
                 self.assertTrue(adapter._source_needs_cpp_exceptions(cpp_src) if hasattr(adapter, "_source_needs_cpp_exceptions") else True)
 
