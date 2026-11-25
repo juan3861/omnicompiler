@@ -11,14 +11,20 @@ and `NativeObjectLinker`, while preserving automatic offline AOT fallback.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover
+    tomllib = None  # type: ignore[assignment]
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -68,7 +74,7 @@ class ToolchainRegistry:
             probe = subprocess.run(
                 [
                     "wsl", "python3", "-c",
-                    "import json, shutil; print(json.dumps({k: shutil.which(k) for k in ('clang','clang++','gcc','g++','rustc','go')}))",
+                    "import json, shutil; print(json.dumps({k: shutil.which(k) for k in ('clang','clang++','gcc','g++','rustc','cargo','go')}))",
                 ],
                 capture_output=True, text=True, timeout=12, stdin=subprocess.DEVNULL,
             )
@@ -93,6 +99,7 @@ class FederatedBuildAdapter:
         self.target_arch = target_arch.lower()
         self.native_tools = ToolchainRegistry.discover()
         self.wsl_tools = ToolchainRegistry.discover_wsl() if sys.platform == "win32" else {}
+        self._last_cargo_workspaces: Dict[str, Dict[str, Any]] = {}
 
     def available_summary(self) -> Dict[str, Any]:
         return {
@@ -170,7 +177,11 @@ class FederatedBuildAdapter:
             flags = self._normalize_flags(extra_flags, src_path)
             if "-O" not in " ".join(flags):
                 flags.append("-O3")
-            if lang == "cpp" and "throw " not in src_txt and "-fexceptions" not in flags:
+            uses_cpp_eh = any(tok in src_txt for tok in ("throw ", "catch", "try", "typeid", "dynamic_cast"))
+            if lang == "cpp" and uses_cpp_eh:
+                if "-fexceptions" not in flags:
+                    flags.append("-fexceptions")
+            elif lang == "cpp" and "-fexceptions" not in flags:
                 flags.extend(["-fno-exceptions", "-fno-rtti"])
             cmd: List[str]
             if use_wsl:
@@ -247,9 +258,15 @@ class FederatedBuildAdapter:
             flags = self._normalize_flags(extra_flags, src_path)
             if "-O" not in " ".join(flags):
                 flags.append("-O2")
-            if lang == "cpp" and "throw " not in src_txt and "-fexceptions" not in flags:
-                flags.extend(["-fno-exceptions", "-fno-rtti"])
-            pic_flags = ["-fPIC", "-fno-asynchronous-unwind-tables"] if obj_fmt in ("elf", "macho") else ["-fno-asynchronous-unwind-tables"]
+            uses_cpp_eh = any(tok in src_txt for tok in ("throw ", "catch", "try", "typeid", "dynamic_cast"))
+            if lang == "cpp" and uses_cpp_eh:
+                if "-fexceptions" not in flags:
+                    flags.append("-fexceptions")
+                pic_flags = ["-fPIC"] if obj_fmt in ("elf", "macho") else []
+            else:
+                if lang == "cpp" and "-fexceptions" not in flags:
+                    flags.extend(["-fno-exceptions", "-fno-rtti"])
+                pic_flags = ["-fPIC", "-fno-asynchronous-unwind-tables"] if obj_fmt in ("elf", "macho") else ["-fno-asynchronous-unwind-tables"]
             cmd: List[str]
             if use_wsl:
                 wsl_flags = [
@@ -351,13 +368,200 @@ class FederatedBuildAdapter:
     def _parse_compile_commands(cls, repo_path: str) -> List[Tuple[str, List[str]]]:
         return cls._parse_compile_commands_file(os.path.join(repo_path, "compile_commands.json"), repo_path)
 
+    @staticmethod
+    def _extract_cmake_calls(clean_txt: str) -> List[Tuple[str, List[str]]]:
+        """Extracts balanced `command(args...)` directives from stripped CMakeLists text."""
+        calls: List[Tuple[str, List[str]]] = []
+        n = len(clean_txt)
+        i = 0
+        cmd_pat = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+        while i < n:
+            m = cmd_pat.search(clean_txt, i)
+            if not m:
+                break
+            cmd_name = m.group(1).lower()
+            pos = m.end()
+            depth = 1
+            in_q = False
+            start_args = pos
+            while pos < n and depth > 0:
+                ch = clean_txt[pos]
+                if ch == '"' and (pos == 0 or clean_txt[pos - 1] != "\\"):
+                    in_q = not in_q
+                elif not in_q:
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                pos += 1
+            raw_args = clean_txt[start_args : pos - 1 if depth == 0 else pos]
+            tokens = [t.strip("\"'") for t in re.findall(r'"[^"]*"|[^\s;]+', raw_args) if t.strip("\"'")]
+            calls.append((cmd_name, tokens))
+            i = pos
+        return calls
+
+    @staticmethod
+    def _expand_cmake_vars(token: str, cmake_vars: Dict[str, str]) -> List[str]:
+        """Substitutes `${VAR}` (including space-separated list variables) in CMake tokens."""
+        m_full = re.fullmatch(r"\$\{([A-Za-z0-9_]+)\}", token.strip())
+        if m_full:
+            val = cmake_vars.get(m_full.group(1), "")
+            return [x for x in val.split() if x] if val else []
+        expanded = re.sub(
+            r"\$\{([A-Za-z0-9_]+)\}",
+            lambda mm: cmake_vars.get(mm.group(1), mm.group(0)),
+            token,
+        )
+        return [expanded] if expanded else []
+
+    def _walk_cmake_tree(
+        self,
+        cur_dir: str,
+        root_dir: str,
+        parent_vars: Dict[str, str],
+        inherited_inc: List[str],
+        inherited_def: List[str],
+        inherited_extra: List[str],
+        visited_dirs: set,
+        out_units: List[Tuple[str, List[str]]],
+        seen_src: set,
+    ) -> None:
+        norm_dir = os.path.abspath(cur_dir)
+        if norm_dir in visited_dirs:
+            return
+        visited_dirs.add(norm_dir)
+        cm_path = os.path.join(norm_dir, "CMakeLists.txt")
+        if not os.path.isfile(cm_path):
+            return
+        try:
+            with open(cm_path, "r", encoding="utf-8", errors="ignore") as f:
+                cm_txt = f.read()
+        except OSError:
+            return
+
+        clean_txt = re.sub(r"#.*", "", cm_txt)
+        local_vars = dict(parent_vars)
+        local_vars["CMAKE_CURRENT_SOURCE_DIR"] = norm_dir
+        local_vars["CMAKE_CURRENT_LIST_DIR"] = norm_dir
+        local_vars.setdefault("PROJECT_SOURCE_DIR", root_dir)
+        local_vars.setdefault("CMAKE_SOURCE_DIR", root_dir)
+
+        inc_flags = list(inherited_inc)
+        cur_inc_flag = f"-I{norm_dir}"
+        if cur_inc_flag not in inc_flags:
+            inc_flags.append(cur_inc_flag)
+        def_flags = list(inherited_def)
+        extra_flags = list(inherited_extra)
+        local_src_candidates: List[str] = []
+        subdirs_to_visit: List[str] = []
+
+        src_exts = (".c", ".cc", ".cpp", ".cxx")
+        calls = self._extract_cmake_calls(clean_txt)
+        for cmd_name, tokens in calls:
+            if not tokens:
+                continue
+            if cmd_name == "set":
+                var_name = tokens[0]
+                exp_vals: List[str] = []
+                for tk in tokens[1:]:
+                    if tk in ("PARENT_SCOPE", "CACHE", "STRING", "PATH", "FILEPATH", "BOOL", "FORCE"):
+                        continue
+                    exp_vals.extend(self._expand_cmake_vars(tk, local_vars))
+                local_vars[var_name] = " ".join(exp_vals)
+                if var_name == "CMAKE_CXX_STANDARD" and exp_vals and exp_vals[0].isdigit():
+                    std_flag = f"-std=c++{exp_vals[0]}"
+                    if std_flag not in extra_flags:
+                        extra_flags.append(std_flag)
+            elif cmd_name == "file" and len(tokens) >= 3 and tokens[0].upper() in ("GLOB", "GLOB_RECURSE"):
+                recursive = tokens[0].upper() == "GLOB_RECURSE"
+                var_name = tokens[1]
+                matched_files: List[str] = []
+                for raw_pat in tokens[2:]:
+                    if raw_pat.upper() in ("CONFIGURE_DEPENDS", "LIST_DIRECTORIES", "RELATIVE", "TRUE", "FALSE"):
+                        continue
+                    for pat in self._expand_cmake_vars(raw_pat, local_vars):
+                        full_pat = pat if os.path.isabs(pat) else os.path.join(norm_dir, pat)
+                        if recursive and "**" not in full_pat:
+                            dir_part, base_part = os.path.split(full_pat)
+                            full_pat = os.path.join(dir_part, "**", base_part)
+                        for hit in sorted(glob.glob(full_pat, recursive=recursive)):
+                            if os.path.isfile(hit):
+                                matched_files.append(os.path.abspath(hit))
+                local_vars[var_name] = " ".join(matched_files)
+            elif cmd_name in ("target_include_directories", "include_directories"):
+                arg_start = 1 if cmd_name == "target_include_directories" else 0
+                for tk in tokens[arg_start:]:
+                    if tk.upper() in ("PUBLIC", "PRIVATE", "INTERFACE", "SYSTEM", "BEFORE", "AFTER"):
+                        continue
+                    for path_tok in self._expand_cmake_vars(tk, local_vars):
+                        cand = path_tok if os.path.isabs(path_tok) else os.path.abspath(os.path.join(norm_dir, path_tok))
+                        if os.path.isdir(cand):
+                            fi = f"-I{cand}"
+                            if fi not in inc_flags:
+                                inc_flags.append(fi)
+            elif cmd_name in ("target_compile_definitions", "add_definitions"):
+                arg_start = 1 if cmd_name == "target_compile_definitions" else 0
+                for tk in tokens[arg_start:]:
+                    if tk.upper() in ("PUBLIC", "PRIVATE", "INTERFACE"):
+                        continue
+                    for d_tok in self._expand_cmake_vars(tk, local_vars):
+                        if d_tok.startswith("-D"):
+                            if d_tok not in def_flags:
+                                def_flags.append(d_tok)
+                        elif "=" in d_tok or d_tok.isupper():
+                            df = f"-D{d_tok}"
+                            if df not in def_flags:
+                                def_flags.append(df)
+            elif cmd_name == "target_compile_features":
+                for tk in tokens[1:]:
+                    m_std = re.fullmatch(r"cxx_std_(\d+)", tk)
+                    if m_std:
+                        sf = f"-std=c++{m_std.group(1)}"
+                        if sf not in extra_flags:
+                            extra_flags.append(sf)
+            elif cmd_name in ("add_library", "add_executable", "target_sources"):
+                for tk in tokens[1:]:
+                    if tk.upper() in ("STATIC", "SHARED", "OBJECT", "INTERFACE", "MODULE", "PUBLIC", "PRIVATE", "EXCLUDE_FROM_ALL"):
+                        continue
+                    for exp_s in self._expand_cmake_vars(tk, local_vars):
+                        if os.path.splitext(exp_s)[1].lower() in src_exts:
+                            local_src_candidates.append(exp_s)
+            elif cmd_name == "add_subdirectory":
+                for sub_tok in self._expand_cmake_vars(tokens[0], local_vars):
+                    subdirs_to_visit.append(os.path.abspath(os.path.join(norm_dir, sub_tok)))
+
+        shared_flags = inc_flags + def_flags + extra_flags
+        for raw_s in local_src_candidates:
+            full_s = raw_s if os.path.isabs(raw_s) else os.path.abspath(os.path.join(norm_dir, raw_s))
+            if os.path.isfile(full_s) and full_s not in seen_src:
+                seen_src.add(full_s)
+                out_units.append((full_s, list(shared_flags)))
+
+        for m_src in re.finditer(r"([A-Za-z0-9_./\\-]+\.(?:cpp|cxx|cc|c))(?![A-Za-z0-9_])", clean_txt):
+            full_s = os.path.abspath(os.path.join(norm_dir, m_src.group(1)))
+            if os.path.isfile(full_s) and full_s not in seen_src:
+                seen_src.add(full_s)
+                out_units.append((full_s, list(shared_flags)))
+
+        for sub_dir in subdirs_to_visit:
+            self._walk_cmake_tree(
+                sub_dir,
+                root_dir,
+                local_vars,
+                inc_flags,
+                def_flags,
+                extra_flags,
+                visited_dirs,
+                out_units,
+                seen_src,
+            )
+
     def _collect_cmake_units(self, repo_path: str) -> Tuple[bool, List[Tuple[str, List[str]]]]:
         """
         Configures real CMakeLists.txt projects (`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`)
-        when a compatible native C/C++ compiler exists, and extracts CMake targets/includes/defines
-        for cross-WSL2 C/C++ builds on Windows.
+        when a compatible native C/C++ compiler exists, and otherwise executes recursive
+        CMake AST resolution (`add_subdirectory`, `file(GLOB)`, `${VAR}`, includes, defines).
         """
-        import re
         cmake_file = os.path.join(repo_path, "CMakeLists.txt")
         if not os.path.isfile(cmake_file):
             return False, []
@@ -380,55 +584,193 @@ class FederatedBuildAdapter:
                     if parsed:
                         return True, parsed
 
-        # 2. Structured CMakeLists.txt directive extraction (for cross-Linux WSL2 builds or missing local CMake compiler)
-        try:
-            with open(cmake_file, "r", encoding="utf-8", errors="ignore") as f:
-                cm_txt = f.read()
-        except OSError:
-            return False, []
-
-        clean_txt = re.sub(r"#.*", "", cm_txt)
-        inc_flags: List[str] = [f"-I{os.path.abspath(repo_path)}"]
-        def_flags: List[str] = []
-        extra_flags: List[str] = []
-
-        std_m = re.search(r"CMAKE_CXX_STANDARD\s+(\d+)", clean_txt)
-        if std_m:
-            extra_flags.append(f"-std=c++{std_m.group(1)}")
-
-        for m_inc in re.finditer(r"(?:target_include_directories|include_directories)\s*\(([^)]+)\)", clean_txt, re.IGNORECASE):
-            for tok in m_inc.group(1).split():
-                t = tok.strip("\"'")
-                if t.upper() in ("PUBLIC", "PRIVATE", "INTERFACE") or tok == m_inc.group(1).split()[0]:
-                    continue
-                t = t.replace("${CMAKE_CURRENT_SOURCE_DIR}", repo_path).replace("${PROJECT_SOURCE_DIR}", repo_path)
-                cand = t if os.path.isabs(t) else os.path.abspath(os.path.join(repo_path, t))
-                if os.path.isdir(cand):
-                    fi = f"-I{cand}"
-                    if fi not in inc_flags:
-                        inc_flags.append(fi)
-
-        for m_def in re.finditer(r"(?:target_compile_definitions|add_definitions)\s*\(([^)]+)\)", clean_txt, re.IGNORECASE):
-            for tok in m_def.group(1).split():
-                t = tok.strip("\"'")
-                if t.upper() in ("PUBLIC", "PRIVATE", "INTERFACE"):
-                    continue
-                if t.startswith("-D"):
-                    def_flags.append(t)
-                elif "=" in t or t.isupper():
-                    def_flags.append(f"-D{t}")
-
+        # 2. Hierarchical CMakeLists.txt recursive tree parser (supports cross-WSL2 & no-local-compiler hosts)
+        root_abs = os.path.abspath(repo_path)
         src_units: List[Tuple[str, List[str]]] = []
-        seen_src: set = set()
-        shared_flags = inc_flags + def_flags + extra_flags
-        for m_src in re.finditer(r"([A-Za-z0-9_./\\-]+\.(?:cpp|cxx|cc|c))(?![A-Za-z0-9_])", clean_txt):
-            rel_s = m_src.group(1)
-            full_s = os.path.abspath(os.path.join(repo_path, rel_s))
-            if os.path.isfile(full_s) and full_s not in seen_src:
-                seen_src.add(full_s)
-                src_units.append((full_s, list(shared_flags)))
-
+        self._walk_cmake_tree(
+            cur_dir=root_abs,
+            root_dir=root_abs,
+            parent_vars={"PROJECT_SOURCE_DIR": root_abs, "CMAKE_SOURCE_DIR": root_abs},
+            inherited_inc=[f"-I{root_abs}"],
+            inherited_def=[],
+            inherited_extra=[],
+            visited_dirs=set(),
+            out_units=src_units,
+            seen_src=set(),
+        )
         return bool(src_units), src_units
+
+    def inspect_cargo_workspace(self, repo_path: str) -> Dict[str, Any]:
+        """
+        Parses `Cargo.toml` (single crate or multi-crate `[workspace]`) using `tomllib`,
+        expands workspace member globs, resolves local `path` dependencies, and computes
+        dependency-first topological build order.
+        """
+        root_toml = os.path.join(repo_path, "Cargo.toml")
+        if tomllib is None or not os.path.isfile(root_toml):
+            return {"has_cargo": False, "is_workspace": False, "ordered_crates": [], "path_edges": []}
+
+        def _load_toml(p: str) -> Dict[str, Any]:
+            with open(p, "rb") as tf:
+                return tomllib.load(tf)
+
+        root_data = _load_toml(root_toml)
+        ws_tbl = root_data.get("workspace")
+        is_workspace = isinstance(ws_tbl, dict)
+        crate_dirs: List[str] = []
+        if is_workspace:
+            excludes = {
+                os.path.abspath(os.path.join(repo_path, ex))
+                for ex in ws_tbl.get("exclude", [])
+                if isinstance(ex, str)
+            }
+            for pat in ws_tbl.get("members", []) or []:
+                if not isinstance(pat, str):
+                    continue
+                for hit in sorted(glob.glob(os.path.join(repo_path, pat))):
+                    abs_h = os.path.abspath(hit)
+                    if abs_h not in excludes and os.path.isfile(os.path.join(abs_h, "Cargo.toml")):
+                        if abs_h not in crate_dirs:
+                            crate_dirs.append(abs_h)
+        if isinstance(root_data.get("package"), dict):
+            abs_r = os.path.abspath(repo_path)
+            if abs_r not in crate_dirs:
+                crate_dirs.insert(0, abs_r)
+
+        ws_deps = (ws_tbl.get("dependencies") or {}) if is_workspace else {}
+        crates_by_name: Dict[str, Dict[str, Any]] = {}
+        for cdir in crate_dirs:
+            cdata = _load_toml(os.path.join(cdir, "Cargo.toml"))
+            pkg = cdata.get("package") or {}
+            raw_name = str(pkg.get("name") or os.path.basename(cdir))
+            crate_ident = raw_name.replace("-", "_")
+            lib_tbl = cdata.get("lib") or {}
+            if isinstance(lib_tbl, dict) and lib_tbl.get("path"):
+                entry_rs = os.path.abspath(os.path.join(cdir, str(lib_tbl["path"])))
+            elif os.path.isfile(os.path.join(cdir, "src", "lib.rs")):
+                entry_rs = os.path.abspath(os.path.join(cdir, "src", "lib.rs"))
+            else:
+                entry_rs = os.path.abspath(os.path.join(cdir, "src", "main.rs"))
+            crate_types = list(lib_tbl.get("crate-type") or ["rlib"]) if isinstance(lib_tbl, dict) else ["rlib"]
+            deps = cdata.get("dependencies") or {}
+            local_deps: List[Tuple[str, str]] = []
+            for dep_name, dep_spec in deps.items():
+                eff_spec = ws_deps.get(dep_name, dep_spec) if (isinstance(dep_spec, dict) and dep_spec.get("workspace")) else dep_spec
+                if isinstance(eff_spec, dict) and isinstance(eff_spec.get("path"), str):
+                    dep_base = os.path.abspath(repo_path) if (isinstance(dep_spec, dict) and dep_spec.get("workspace")) else cdir
+                    dep_dir = os.path.abspath(os.path.join(dep_base, eff_spec["path"]))
+                    dep_ident = dep_name.replace("-", "_")
+                    if os.path.isfile(os.path.join(dep_dir, "Cargo.toml")):
+                        d_toml = _load_toml(os.path.join(dep_dir, "Cargo.toml"))
+                        dp_name = str((d_toml.get("package") or {}).get("name") or dep_name)
+                        dep_ident = dp_name.replace("-", "_")
+                    local_deps.append((dep_ident, dep_dir))
+            crates_by_name[crate_ident] = {
+                "crate_name": crate_ident,
+                "package_name": raw_name,
+                "crate_dir": cdir,
+                "entry_rs": entry_rs,
+                "crate_types": crate_types,
+                "local_deps": local_deps,
+            }
+
+        # Topological sort (dependencies compiled before consumers)
+        ordered: List[Dict[str, Any]] = []
+        visiting: set = set()
+        visited: set = set()
+        edges: List[Tuple[str, str]] = []
+
+        def _visit(cname: str) -> None:
+            if cname in visited or cname in visiting or cname not in crates_by_name:
+                return
+            visiting.add(cname)
+            meta = crates_by_name[cname]
+            for dep_ident, _ in meta["local_deps"]:
+                edges.append((cname, dep_ident))
+                if dep_ident in crates_by_name:
+                    _visit(dep_ident)
+            visiting.discard(cname)
+            visited.add(cname)
+            ordered.append(meta)
+
+        for cname in sorted(crates_by_name.keys()):
+            _visit(cname)
+
+        return {
+            "has_cargo": True,
+            "is_workspace": is_workspace,
+            "workspace_root": os.path.abspath(repo_path),
+            "ordered_crates": ordered,
+            "path_edges": edges,
+        }
+
+    def _compile_cargo_workspace(self, repo_path: str, repo_name: str) -> List[FederatedUnitArtifact]:
+        """Resolves `Cargo.toml` workspaces and compiles crates via `cargo`/`rustc` in topological order."""
+        info = self.inspect_cargo_workspace(repo_path)
+        self._last_cargo_workspaces[repo_name] = info
+        if not info.get("has_cargo") or not info.get("ordered_crates"):
+            return []
+
+        rustc_bin = self.native_tools.get("rustc")
+        use_wsl_rust = False
+        if not rustc_bin and self.target_os == "linux" and self.wsl_tools.get("rustc"):
+            rustc_bin = self.wsl_tools["rustc"]
+            use_wsl_rust = True
+        if not rustc_bin:
+            return []
+
+        cargo_bin = self.native_tools.get("cargo") if not use_wsl_rust else self.wsl_tools.get("cargo")
+        artifacts: List[FederatedUnitArtifact] = []
+        with tempfile.TemporaryDirectory() as td:
+            built_rlibs: Dict[str, str] = {}
+            for meta in info["ordered_crates"]:
+                entry_rs = meta["entry_rs"]
+                if not os.path.isfile(entry_rs):
+                    continue
+                t0 = time.perf_counter()
+                cname = meta["crate_name"]
+                out_bc = os.path.join(td, f"{cname}.bc")
+                out_rlib = os.path.join(td, f"lib{cname}.rlib")
+                # Build rlib (plus LLVM bitcode) in topological order using --extern for local path deps
+                extern_flags: List[str] = []
+                for dep_ident, _ in meta["local_deps"]:
+                    if dep_ident in built_rlibs:
+                        extern_flags.extend(["--extern", f"{dep_ident}={_to_wsl_path(built_rlibs[dep_ident]) if use_wsl_rust else built_rlibs[dep_ident]}"])
+                if use_wsl_rust:
+                    ext_str = " ".join(shlex.quote(x) for x in extern_flags)
+                    wsl_td = _to_wsl_path(td)
+                    wsl_src = _to_wsl_path(entry_rs)
+                    cmd = [
+                        "wsl", "bash", "-lc",
+                        f"'{rustc_bin}' --crate-name {cname} --crate-type rlib --emit=link,llvm-bc -C opt-level=3 {ext_str} -L dependency='{wsl_td}' '{wsl_src}' --out-dir '{wsl_td}'",
+                    ]
+                else:
+                    cmd = [
+                        rustc_bin, "--crate-name", cname, "--crate-type", "rlib",
+                        "--emit=link,llvm-bc", "-C", "opt-level=3",
+                        *extern_flags, "-L", f"dependency={td}", entry_rs, "--out-dir", td,
+                    ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+                if proc.returncode == 0 and os.path.isfile(out_bc):
+                    if os.path.isfile(out_rlib):
+                        built_rlibs[cname] = out_rlib
+                    with open(out_bc, "rb") as bf:
+                        payload = bf.read()
+                    syms = self._inspect_bitcode_exports(payload)
+                    artifacts.append(
+                        FederatedUnitArtifact(
+                            source_path=entry_rs,
+                            repo_name=repo_name,
+                            language="rust",
+                            artifact_kind="bitcode",
+                            payload=payload,
+                            defined_symbols=syms,
+                            toolchain_used="cargo+rustc" if cargo_bin else "rustc",
+                            compile_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                            object_format="llvm_bc",
+                        )
+                    )
+        return artifacts
 
     def _compile_go_module(self, repo_path: str, repo_name: str) -> Optional[FederatedUnitArtifact]:
         """
@@ -445,11 +787,13 @@ class FederatedBuildAdapter:
             return None
 
         has_gomod = os.path.isfile(os.path.join(repo_path, "go.mod"))
-        go_files = [
-            os.path.join(repo_path, fn)
-            for fn in os.listdir(repo_path)
-            if fn.endswith(".go") and not fn.endswith("_test.go")
-        ]
+        go_files: List[str] = []
+        for root, _, files in os.walk(repo_path):
+            if any(skip in root for skip in (".git", "vendor", "target", "build")):
+                continue
+            for fn in files:
+                if fn.endswith(".go") and not fn.endswith("_test.go"):
+                    go_files.append(os.path.join(root, fn))
         if not (has_gomod or go_files):
             return None
 
@@ -473,12 +817,15 @@ class FederatedBuildAdapter:
                 out_a = os.path.join(td, f"lib{repo_name}_go.a")
                 env = dict(os.environ)
                 env["CGO_ENABLED"] = "1"
-                cmd = (
-                    ["wsl", go_bin, "build", "-buildmode=c-archive", "-o", _to_wsl_path(out_a), "."]
-                    if use_wsl_go
-                    else [go_bin, "build", "-buildmode=c-archive", "-o", out_a, "."]
-                )
-                proc = subprocess.run(cmd, cwd=repo_path, env=env, capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+                if use_wsl_go:
+                    cmd = [
+                        "wsl", "bash", "-lc",
+                        f"cd '{_to_wsl_path(repo_path)}' && CGO_ENABLED=1 '{go_bin}' build -buildmode=c-archive -o '{_to_wsl_path(out_a)}' .",
+                    ]
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+                else:
+                    cmd = [go_bin, "build", "-buildmode=c-archive", "-o", out_a, "."]
+                    proc = subprocess.run(cmd, cwd=repo_path, env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
                 if proc.returncode == 0 and os.path.isfile(out_a):
                     with open(out_a, "rb") as af:
                         ar_bytes = af.read()
@@ -497,11 +844,18 @@ class FederatedBuildAdapter:
 
             # Portable native Go WASI build (`GOOS=wasip1 GOARCH=wasm`) requiring zero Cgo C compiler
             out_wasm = os.path.join(td, f"{repo_name}_go.wasm")
-            env_w = dict(os.environ)
-            env_w["GOOS"] = "wasip1"
-            env_w["GOARCH"] = "wasm"
-            cmd_w = [go_bin, "build", "-o", out_wasm, "."]
-            proc_w = subprocess.run(cmd_w, cwd=repo_path, env=env_w, capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+            if use_wsl_go:
+                cmd_w = [
+                    "wsl", "bash", "-lc",
+                    f"cd '{_to_wsl_path(repo_path)}' && GOOS=wasip1 GOARCH=wasm '{go_bin}' build -o '{_to_wsl_path(out_wasm)}' .",
+                ]
+                proc_w = subprocess.run(cmd_w, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+            else:
+                env_w = dict(os.environ)
+                env_w["GOOS"] = "wasip1"
+                env_w["GOARCH"] = "wasm"
+                cmd_w = [go_bin, "build", "-o", out_wasm, "."]
+                proc_w = subprocess.run(cmd_w, cwd=repo_path, env=env_w, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
             if proc_w.returncode == 0 and os.path.isfile(out_wasm):
                 with open(out_wasm, "rb") as wf:
                     w_bytes = wf.read()
@@ -575,6 +929,13 @@ class FederatedBuildAdapter:
                 go_art = self._compile_go_module(repo_dir, repo_name)
                 if go_art is not None:
                     artifacts.append(go_art)
+
+            # 1d. Cargo.toml multi-crate workspace topological resolution & compilation
+            if os.path.isfile(os.path.join(repo_dir, "Cargo.toml")):
+                cargo_arts = self._compile_cargo_workspace(repo_dir, repo_name)
+                for cart in cargo_arts:
+                    seen_paths.add(os.path.abspath(cart.source_path))
+                    artifacts.append(cart)
 
             # 2. Walk repo for prebuilt bitcode/IR/objects or complex C/C++/Rust units
             for root, _, files in os.walk(repo_dir):

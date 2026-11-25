@@ -393,9 +393,11 @@ class StandaloneBinaryEmitter:
         image_base = self.IMAGE_BASE_DLL
 
         # 1. Text Section metrics (fixed length even before IAT patching)
-        text_prefix = b"\xb8\x01\x00\x00\x00\xc3" + (b"\x90" * 10)  # DllMain -> TRUE, aligned to 0x1010
-        base_fn_rva = 0x1000 + len(text_prefix)
-        raw_text_len = len(text_prefix) + len(func_code)
+        has_init_calls = int(init_array_size) > 0
+        text_prefix_len = 64 if has_init_calls else 16
+        text_prefix = (b"\x90" * 64) if has_init_calls else (b"\xb8\x01\x00\x00\x00\xc3" + (b"\x90" * 10))
+        base_fn_rva = 0x1000 + text_prefix_len
+        raw_text_len = text_prefix_len + len(func_code)
         aligned_text_len = self._align_up(max(1, raw_text_len), file_align)
         text_vspan = self._align_up(max(1, aligned_text_len), sec_align)
 
@@ -562,6 +564,33 @@ class StandaloneBinaryEmitter:
         rw_init = bytes(data_bytes or b"")
         has_data_sec = bool(rw_init) or (int(bss_size) > 0)
         rva_data = rva_pdata + pdata_vspan
+        if has_init_calls:
+            init_rva = rva_data + int(init_array_offset_in_data)
+            disp_init = init_rva - 0x1012
+            dllmain_stub = (
+                b"\x83\xfa\x01"
+                b"\x75\x2f"
+                b"\x53"
+                b"\x56"
+                b"\x48\x83\xec\x28"
+                + b"\x48\x8d\x1d" + struct.pack("<i", disp_init)
+                + b"\x48\x8d\xb3" + struct.pack("<I", int(init_array_size))
+                + b"\x48\x39\xf3"
+                b"\x73\x10"
+                b"\x48\x8b\x03"
+                b"\x48\x85\xc0"
+                b"\x74\x02"
+                b"\xff\xd0"
+                b"\x48\x83\xc3\x08"
+                b"\xeb\xeb"
+                b"\x48\x83\xc4\x28"
+                b"\x5e"
+                b"\x5b"
+                b"\xb8\x01\x00\x00\x00"
+                b"\xc3"
+                + (b"\x90" * 6)
+            )
+            raw_text = dllmain_stub + raw_text[64:]
         raw_data_sec = b""
         data_vsize = 0
         data_vspan = 0
@@ -570,10 +599,42 @@ class StandaloneBinaryEmitter:
             raw_data_sec = rw_init.ljust(self._align_up(max(1, len(rw_init)), file_align), b"\x00")
             data_vspan = self._align_up(data_vsize, sec_align)
 
+        # Optional .tls section (IMAGE_TLS_DIRECTORY64 + TLS template bytes + _tls_index)
+        tls_init_pe = bytes(tdata_bytes or b"")
+        has_tls_sec = bool(tls_init_pe) or (int(tbss_size) > 0)
+        rva_tls = rva_data + data_vspan
+        raw_tls_sec = b""
+        raw_tls_len = 0
+        tls_vspan = 0
+        tls_dir_rva = 0
+        tls_reloc_rvas: List[int] = []
+        if has_tls_sec:
+            tls_data_pad_len = max(8, self._align_up(len(tls_init_pe), 8))
+            tls_idx_off = tls_data_pad_len
+            tls_dir_off = tls_idx_off + 8
+            tls_dir_rva = rva_tls + tls_dir_off
+            start_va = image_base + rva_tls
+            end_va = image_base + rva_tls + len(tls_init_pe)
+            idx_va = image_base + rva_tls + tls_idx_off
+            tls_dir_bytes = struct.pack(
+                "<QQQQII",
+                start_va,
+                end_va,
+                idx_va,
+                0,
+                max(0, int(tbss_size)),
+                0,
+            )
+            tls_blob = tls_init_pe.ljust(tls_data_pad_len, b"\x00") + (b"\x00" * 8) + tls_dir_bytes
+            raw_tls_len = len(tls_blob)
+            raw_tls_sec = tls_blob.ljust(self._align_up(max(1, raw_tls_len), file_align), b"\x00")
+            tls_vspan = self._align_up(len(raw_tls_sec), sec_align)
+            tls_reloc_rvas = [tls_dir_rva, tls_dir_rva + 8, tls_dir_rva + 16]
+
         # Optional .reloc Base Relocation Table (`IMAGE_REL_BASED_DIR64`)
-        reloc_list = sorted(set(int(r) for r in (abs64_reloc_rvas or [])))
+        reloc_list = sorted(set([int(r) for r in (abs64_reloc_rvas or [])] + tls_reloc_rvas))
         has_reloc = bool(reloc_list)
-        rva_reloc = rva_data + data_vspan
+        rva_reloc = rva_tls + tls_vspan
         raw_reloc_sec = b""
         raw_reloc_len = 0
         reloc_vspan = 0
@@ -602,14 +663,21 @@ class StandaloneBinaryEmitter:
         dos_stub = b"This program cannot be run in DOS mode.\r\r\n$\0\0\0\0\0\0\0".ljust(64, b"\0")
         pe_sig = b"PE\0\0"
 
-        num_sections = 2 + (1 if has_idata else 0) + (1 if has_pdata else 0) + (1 if has_data_sec else 0) + (1 if has_reloc else 0)
+        num_sections = (
+            2
+            + (1 if has_idata else 0)
+            + (1 if has_pdata else 0)
+            + (1 if has_data_sec else 0)
+            + (1 if has_tls_sec else 0)
+            + (1 if has_reloc else 0)
+        )
         size_of_headers = self._align_up(64 + 64 + 4 + 20 + 96 + (16 * 8) + (40 * num_sections), file_align)
         coff = struct.pack("<HHIIIHH", 0x8664, num_sections, 0, 0, 0, 240, 0x2022)
 
         opt = struct.pack(
             "<HBBIIIIIQIIHHHHHHIIIIHHQQQQII",
             0x020B, 14, 0,
-            len(raw_text), len(raw_edata) + len(raw_idata) + len(raw_pdata) + len(raw_data_sec) + len(raw_reloc_sec), max(0, int(bss_size)),
+            len(raw_text), len(raw_edata) + len(raw_idata) + len(raw_pdata) + len(raw_data_sec) + len(raw_tls_sec) + len(raw_reloc_sec), max(0, int(bss_size)),
             0x1000, 0x1000,
             image_base,
             sec_align, file_align,
@@ -629,6 +697,8 @@ class StandaloneBinaryEmitter:
             struct.pack_into("<II", data_dirs, 3 * 8, rva_pdata, pdata_dir_size)
         if has_reloc:
             struct.pack_into("<II", data_dirs, 5 * 8, rva_reloc, raw_reloc_len)
+        if has_tls_sec:
+            struct.pack_into("<II", data_dirs, 9 * 8, tls_dir_rva, 40)
 
         cur_file_ptr = size_of_headers
         sec1 = struct.pack("<8sIIIIIIHHI", b".text\0\0\0", raw_text_len, 0x1000, len(raw_text), cur_file_ptr, 0, 0, 0, 0, 0x60000020)
@@ -646,12 +716,15 @@ class StandaloneBinaryEmitter:
         if has_data_sec:
             sec_hdrs += struct.pack("<8sIIIIIIHHI", b".data\0\0\0", data_vsize, rva_data, len(raw_data_sec), cur_file_ptr, 0, 0, 0, 0, 0xC0000040)
             cur_file_ptr += len(raw_data_sec)
+        if has_tls_sec:
+            sec_hdrs += struct.pack("<8sIIIIIIHHI", b".tls\0\0\0\0", raw_tls_len, rva_tls, len(raw_tls_sec), cur_file_ptr, 0, 0, 0, 0, 0xC0000040)
+            cur_file_ptr += len(raw_tls_sec)
         if has_reloc:
             sec_hdrs += struct.pack("<8sIIIIIIHHI", b".reloc\0\0", raw_reloc_len, rva_reloc, len(raw_reloc_sec), cur_file_ptr, 0, 0, 0, 0, 0x42000040)
             cur_file_ptr += len(raw_reloc_sec)
 
         headers = (dos_header + dos_stub + pe_sig + coff + opt + data_dirs + sec_hdrs).ljust(size_of_headers, b"\0")
-        return bytes(headers + raw_text + raw_edata + raw_idata + raw_pdata + raw_data_sec + raw_reloc_sec)
+        return bytes(headers + raw_text + raw_edata + raw_idata + raw_pdata + raw_data_sec + raw_tls_sec + raw_reloc_sec)
 
     # =========================================================================
     # 3. LINUX ELF64 (x86-64) STANDALONE EXECUTABLE + STDOUT EXECUTABLE
@@ -728,6 +801,43 @@ class StandaloneBinaryEmitter:
     # 4. LINUX ELF64 (x86-64) MULTI-SYMBOL SHARED OBJECT (.SO)
     # =========================================================================
 
+    @staticmethod
+    def _build_elf_eh_frame_hdr(
+        code: bytes,
+        code_vaddr: int,
+        eh_offset: int,
+        eh_size: int,
+        hdr_vaddr: int,
+    ) -> bytes:
+        if eh_size <= 0 or eh_offset < 0 or eh_offset + eh_size > len(code):
+            return b""
+        eh_slice = code[eh_offset:eh_offset + eh_size]
+        entries: List[Tuple[int, int]] = []
+        pos = 0
+        eh_base_vaddr = code_vaddr + eh_offset
+        while pos + 4 <= len(eh_slice):
+            rec_len = struct.unpack_from("<I", eh_slice, pos)[0]
+            if rec_len == 0 or rec_len == 0xFFFFFFFF:
+                break
+            next_pos = pos + 4 + rec_len
+            if next_pos > len(eh_slice):
+                break
+            if pos + 12 <= next_pos:
+                cie_id = struct.unpack_from("<I", eh_slice, pos + 4)[0]
+                if cie_id != 0:
+                    init_pc_s32 = struct.unpack_from("<i", eh_slice, pos + 8)[0]
+                    func_vaddr = eh_base_vaddr + pos + 8 + init_pc_s32
+                    fde_vaddr = eh_base_vaddr + pos
+                    entries.append((func_vaddr - hdr_vaddr, fde_vaddr - hdr_vaddr))
+            pos = next_pos
+        entries.sort(key=lambda kv: kv[0])
+        out = bytearray()
+        eh_ptr_disp = eh_base_vaddr - (hdr_vaddr + 4)
+        out.extend(struct.pack("<BBBBiI", 1, 0x1B, 0x03, 0x3B, eh_ptr_disp, len(entries)))
+        for init_loc_rel, fde_rel in entries:
+            out.extend(struct.pack("<ii", init_loc_rel, fde_rel))
+        return bytes(out)
+
     def build_elf64_so(
         self,
         func_code: bytes,
@@ -747,6 +857,9 @@ class StandaloneBinaryEmitter:
         fini_array_size: int = 0,
         tdata_bytes: Optional[bytes] = None,
         tbss_size: int = 0,
+        eh_frame_offset_in_code: int = 0,
+        eh_frame_size: int = 0,
+        external_dyn_relocs: Optional[List[Tuple[int, str, int, int]]] = None,
     ) -> bytes:
         """
         Builds a compliant Linux ELF64 Shared Object (ET_DYN) with
@@ -770,7 +883,9 @@ class StandaloneBinaryEmitter:
             exports_map["omni_compute"] = 0
 
         sorted_exports = sorted(exports_map.items(), key=lambda kv: kv[0])
-        ordered_imports = sorted(set(imported_funcs or (os_import_stubs.keys() if os_import_stubs else [])))
+        plt_imports = sorted(set(imported_funcs or (os_import_stubs.keys() if os_import_stubs else [])))
+        ext_reloc_list = list(external_dyn_relocs or [])
+        dynsym_imports = sorted(set(plt_imports) | {sym for _, sym, _, _ in ext_reloc_list})
         ordered_libs = list(needed_libs or [])
 
         dynstr = bytearray(b"\x00")
@@ -792,7 +907,7 @@ class StandaloneBinaryEmitter:
             ))
 
         imp_sym_indices: Dict[str, int] = {}
-        for idx_i, imp_sym in enumerate(ordered_imports):
+        for idx_i, imp_sym in enumerate(dynsym_imports):
             st_name = len(dynstr)
             dynstr.extend(imp_sym.encode("ascii") + b"\x00")
             imp_sym_indices[imp_sym] = 1 + len(sorted_exports) + idx_i
@@ -814,7 +929,7 @@ class StandaloneBinaryEmitter:
             return h & 0xFFFFFFFF
 
         nbucket = max(1, len(sorted_exports))
-        nchain = 1 + len(sorted_exports) + len(ordered_imports)
+        nchain = 1 + len(sorted_exports) + len(dynsym_imports)
         buckets = [0] * nbucket
         chains = [0] * nchain
         for idx, (sym_name, _sym_off) in enumerate(sorted_exports):
@@ -826,11 +941,11 @@ class StandaloneBinaryEmitter:
 
         hash_offset = self._align_up(dynsym_offset + len(dynsym), 8)
         got_plt_offset = self._align_up(hash_offset + len(hash_table), 8)
-        got_plt_len = (3 + len(ordered_imports)) * 8 if ordered_imports else 0
+        got_plt_len = (3 + len(plt_imports)) * 8 if plt_imports else 0
         rela_plt_offset = self._align_up(got_plt_offset + got_plt_len, 8)
         rela_plt = bytearray()
         got_slots: Dict[str, int] = {}
-        for idx_i, imp_sym in enumerate(ordered_imports):
+        for idx_i, imp_sym in enumerate(plt_imports):
             slot_vaddr = vaddr + got_plt_offset + (3 + idx_i) * 8
             got_slots[imp_sym] = slot_vaddr
             r_info = (imp_sym_indices[imp_sym] << 32) | r_type
@@ -842,21 +957,26 @@ class StandaloneBinaryEmitter:
         has_tls_seg = bool(tls_init) or (int(tbss_size) > 0)
         has_rw_seg = bool(rw_init) or (int(bss_size) > 0) or has_tls_seg
         rel_rvas = sorted(set(int(r) for r in (abs64_reloc_rvas or [])))
+        eh_hdr_probe_len = (
+            len(self._build_elf_eh_frame_hdr(code, code_vaddr, eh_frame_offset_in_code, eh_frame_size, 0))
+            if eh_frame_size > 0
+            else 0
+        )
         rela_dyn = bytearray()
-        if rel_rvas:
+        if rel_rvas or ext_reloc_list:
             r_rel_type = 1027 if is_arm64 else 8  # R_AARCH64_RELATIVE vs R_X86_64_RELATIVE
             # Preliminary dynamic size to locate rw_vaddr if needed for inspecting addends inside data_bytes
             n_dyn_tags = (
                 len(lib_str_offs)
                 + 5
-                + (5 if ordered_imports else 0)
+                + (5 if plt_imports else 0)
                 + 3
                 + (2 if init_array_size > 0 else 0)
                 + (2 if fini_array_size > 0 else 0)
                 + 1
             )
-            est_dyn_off = self._align_up(rela_dyn_offset + len(rel_rvas) * 24, 8)
-            est_ro_end = est_dyn_off + n_dyn_tags * 16
+            est_dyn_off = self._align_up(rela_dyn_offset + (len(rel_rvas) + len(ext_reloc_list)) * 24, 8)
+            est_ro_end = est_dyn_off + n_dyn_tags * 16 + eh_hdr_probe_len
             est_rw_vaddr = self._align_up(est_ro_end, 0x1000) if has_rw_seg else 0
             for rva_r in rel_rvas:
                 add_v = 0
@@ -865,18 +985,28 @@ class StandaloneBinaryEmitter:
                 elif code_vaddr <= rva_r and (rva_r - code_vaddr) + 8 <= len(code):
                     add_v = struct.unpack_from("<q", code, rva_r - code_vaddr)[0]
                 rela_dyn.extend(struct.pack("<QQq", rva_r, r_rel_type, add_v))
+            for ext_rva, ext_sym, ext_rtype, ext_addend in ext_reloc_list:
+                r_info_ext = (imp_sym_indices[ext_sym] << 32) | int(ext_rtype)
+                rela_dyn.extend(struct.pack("<QQq", int(ext_rva), r_info_ext, int(ext_addend)))
 
         dynamic_offset = self._align_up(rela_dyn_offset + len(rela_dyn), 8)
         pre_n_tags = (
             len(lib_str_offs)
             + 5
-            + (5 if ordered_imports else 0)
+            + (5 if plt_imports else 0)
             + (3 if rela_dyn else 0)
             + (2 if init_array_size > 0 else 0)
             + (2 if fini_array_size > 0 else 0)
             + 1
         )
-        ro_total_size = dynamic_offset + pre_n_tags * 16
+        eh_hdr_offset = dynamic_offset + pre_n_tags * 16
+        eh_frame_hdr = (
+            self._build_elf_eh_frame_hdr(code, code_vaddr, eh_frame_offset_in_code, eh_frame_size, vaddr + eh_hdr_offset)
+            if eh_frame_size > 0
+            else b""
+        )
+        has_eh_hdr = bool(eh_frame_hdr)
+        ro_total_size = eh_hdr_offset + len(eh_frame_hdr)
         rw_file_off = self._align_up(ro_total_size, 0x1000) if has_rw_seg else ro_total_size
         rw_vaddr = vaddr + rw_file_off
 
@@ -888,7 +1018,7 @@ class StandaloneBinaryEmitter:
             (10, len(dynstr)),              # DT_STRSZ
             (11, 24),                       # DT_SYMENT
         ])
-        if ordered_imports:
+        if plt_imports:
             dyn_entries.extend([
                 (3, vaddr + got_plt_offset),    # DT_PLTGOT
                 (20, 7),                        # DT_PLTREL = DT_RELA
@@ -937,7 +1067,7 @@ class StandaloneBinaryEmitter:
         tls_vaddr = (rw_vaddr + len(rw_init)) if has_tls_seg else 0
         rw_tail_end = (tls_file_off + len(tls_init)) if has_tls_seg else (rw_file_off + len(rw_init))
         total_size = rw_tail_end if has_rw_seg else ro_total_size
-        n_ph = 3 + (1 if has_rw_seg else 0) + (1 if has_tls_seg else 0)
+        n_ph = 3 + (1 if has_rw_seg else 0) + (1 if has_tls_seg else 0) + (1 if has_eh_hdr else 0)
 
         elf_ident = b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 8)
         elf_header = struct.pack(
@@ -972,9 +1102,10 @@ class StandaloneBinaryEmitter:
 
         file_bytes = bytearray(total_size)
         file_bytes[0:64] = elf_header
-        file_bytes[64:120] = ph_load
-        file_bytes[120:176] = ph_dynamic
-        file_bytes[176:232] = ph_gnu_stack
+        ph_pos = 64
+        for ph_bytes in (ph_load, ph_dynamic, ph_gnu_stack):
+            file_bytes[ph_pos:ph_pos + 56] = ph_bytes
+            ph_pos += 56
         if has_rw_seg:
             ph_load_rw = struct.pack(
                 "<IIQQQQQQ",
@@ -983,24 +1114,42 @@ class StandaloneBinaryEmitter:
                 len(rw_init) + max(0, int(bss_size)) + (len(tls_init) + max(0, int(tbss_size)) if has_tls_seg else 0),
                 0x1000,
             )
-            file_bytes[232:288] = ph_load_rw
+            file_bytes[ph_pos:ph_pos + 56] = ph_load_rw
+            ph_pos += 56
         if has_tls_seg:
             ph_tls = struct.pack(
                 "<IIQQQQQQ",
                 7, 4, tls_file_off, tls_vaddr, tls_vaddr,
                 len(tls_init), len(tls_init) + max(0, int(tbss_size)), 16,
             )
-            file_bytes[288:344] = ph_tls
+            file_bytes[ph_pos:ph_pos + 56] = ph_tls
+            ph_pos += 56
+        if has_eh_hdr:
+            ph_eh_frame = struct.pack(
+                "<IIQQQQQQ",
+                0x6474E550,  # PT_GNU_EH_FRAME
+                4,           # PF_R
+                eh_hdr_offset,
+                vaddr + eh_hdr_offset,
+                vaddr + eh_hdr_offset,
+                len(eh_frame_hdr),
+                len(eh_frame_hdr),
+                4,
+            )
+            file_bytes[ph_pos:ph_pos + 56] = ph_eh_frame
+            ph_pos += 56
         file_bytes[code_offset:code_offset + len(code)] = code
         file_bytes[dynstr_offset:dynstr_offset + len(dynstr)] = dynstr
         file_bytes[dynsym_offset:dynsym_offset + len(dynsym)] = dynsym
         file_bytes[hash_offset:hash_offset + len(hash_table)] = hash_table
-        if ordered_imports:
+        if plt_imports:
             file_bytes[got_plt_offset:got_plt_offset + 8] = struct.pack("<Q", vaddr + dynamic_offset)
             file_bytes[rela_plt_offset:rela_plt_offset + len(rela_plt)] = rela_plt
         if rela_dyn:
             file_bytes[rela_dyn_offset:rela_dyn_offset + len(rela_dyn)] = rela_dyn
         file_bytes[dynamic_offset:dynamic_offset + len(dyn_table)] = dyn_table
+        if has_eh_hdr:
+            file_bytes[eh_hdr_offset:eh_hdr_offset + len(eh_frame_hdr)] = eh_frame_hdr
         if has_rw_seg and rw_init:
             file_bytes[rw_file_off:rw_file_off + len(rw_init)] = rw_init
         if has_tls_seg and tls_init:
@@ -1875,6 +2024,9 @@ class StandaloneBinaryEmitter:
         num_abs64_relocs: Optional[int] = None,
         has_init_array: bool = False,
         has_fini_array: bool = False,
+        eh_frame_offset_in_code: int = 0,
+        eh_frame_size: int = 0,
+        external_dyn_relocs: Optional[List[Tuple[int, str, int, int]]] = None,
     ) -> Tuple[int, int, int]:
         """
         Deterministically computes `(image_base, text_va, data_va)` for two-pass
@@ -1904,7 +2056,8 @@ class StandaloneBinaryEmitter:
             if not eff_out.endswith(".dll"):
                 eff_out += ".dll"
             dll_name = os.path.basename(eff_out)
-            aligned_text_len = self._align_up(max(1, 16 + eff_code_len), self.FILE_ALIGN)
+            text_prefix_len = 64 if has_init_array else 16
+            aligned_text_len = self._align_up(max(1, text_prefix_len + eff_code_len), self.FILE_ALIGN)
             text_vspan = self._align_up(aligned_text_len, self.SEC_ALIGN)
 
             num_syms = len(sorted_exports)
@@ -1947,43 +2100,50 @@ class StandaloneBinaryEmitter:
                 pdata_vspan = self._align_up(self._align_up(max(1, combined_len), self.FILE_ALIGN), self.SEC_ALIGN)
 
             rva_data = 0x1000 + text_vspan + edata_vspan + idata_vspan + pdata_vspan
-            return self.IMAGE_BASE_DLL, 0x1010, rva_data
+            return self.IMAGE_BASE_DLL, 0x1000 + text_prefix_len, rva_data
 
         if target_format in ("elf_so", "arm64_elf_so"):
             needed_libs: List[str] = []
-            imported_funcs = sorted(os_stubs.keys())
-            for sym in imported_funcs:
+            plt_imports = sorted(os_stubs.keys())
+            ext_relocs = list(external_dyn_relocs or [])
+            dynsym_imports = sorted(set(plt_imports) | {sym for _, sym, _, _ in ext_relocs})
+            for sym in dynsym_imports:
                 so_name = imp_tbl[sym][1] if sym in imp_tbl else "libc.so.6"
                 if so_name not in needed_libs:
                     needed_libs.append(so_name)
             dynstr_len = 1 + sum(len(lb.encode("ascii")) + 1 for lb in needed_libs)
             dynstr_len += sum(len(s.encode("ascii")) + 1 for s, _ in sorted_exports)
-            dynstr_len += sum(len(s.encode("ascii")) + 1 for s in imported_funcs)
-            dynsym_len = (1 + len(sorted_exports) + len(imported_funcs)) * 24
+            dynstr_len += sum(len(s.encode("ascii")) + 1 for s in dynsym_imports)
+            dynsym_len = (1 + len(sorted_exports) + len(dynsym_imports)) * 24
             nbucket = max(1, len(sorted_exports))
-            nchain = 1 + len(sorted_exports) + len(imported_funcs)
+            nchain = 1 + len(sorted_exports) + len(dynsym_imports)
             hash_len = (2 + nbucket + nchain) * 4
 
             dynstr_offset = 0x200 + eff_code_len
             dynsym_offset = self._align_up(dynstr_offset + dynstr_len, 8)
             hash_offset = self._align_up(dynsym_offset + dynsym_len, 8)
             got_plt_offset = self._align_up(hash_offset + hash_len, 8)
-            got_plt_len = (3 + len(imported_funcs)) * 8 if imported_funcs else 0
+            got_plt_len = (3 + len(plt_imports)) * 8 if plt_imports else 0
             rela_plt_offset = self._align_up(got_plt_offset + got_plt_len, 8)
-            rela_plt_len = len(imported_funcs) * 24
+            rela_plt_len = len(plt_imports) * 24
             rela_dyn_offset = self._align_up(rela_plt_offset + rela_plt_len, 8)
-            rela_dyn_len = max(0, eff_abs64_count) * 24
+            rela_dyn_len = (max(0, eff_abs64_count) + len(ext_relocs)) * 24
             dynamic_offset = self._align_up(rela_dyn_offset + rela_dyn_len, 8)
             n_dyn_tags = (
                 len(needed_libs)
                 + 5
-                + (5 if imported_funcs else 0)
+                + (5 if plt_imports else 0)
                 + (3 if rela_dyn_len > 0 else 0)
                 + (2 if has_init_array else 0)
                 + (2 if has_fini_array else 0)
                 + 1
             )
-            ro_total_size = dynamic_offset + n_dyn_tags * 16
+            eh_hdr_len = (
+                len(self._build_elf_eh_frame_hdr(func_code, self.VADDR_SO + 0x200, eh_frame_offset_in_code, eh_frame_size, 0))
+                if eh_frame_size > 0
+                else 0
+            )
+            ro_total_size = dynamic_offset + n_dyn_tags * 16 + eh_hdr_len
             rw_vaddr = self._align_up(ro_total_size, 0x1000)
             return self.VADDR_SO, self.VADDR_SO + 0x200, self.VADDR_SO + rw_vaddr
 
@@ -2019,6 +2179,9 @@ class StandaloneBinaryEmitter:
         fini_array_size: int = 0,
         tdata_bytes: Optional[bytes] = None,
         tbss_size: int = 0,
+        eh_frame_offset_in_code: int = 0,
+        eh_frame_size: int = 0,
+        external_dyn_relocs: Optional[List[Tuple[int, str, int, int]]] = None,
     ) -> str:
         if target_format == "auto":
             target_format = "pe_dll" if sys.platform == "win32" else "elf_so"
@@ -2044,13 +2207,20 @@ class StandaloneBinaryEmitter:
                 data_bytes=data_bytes,
                 bss_size=bss_size,
                 abs64_reloc_rvas=abs64_reloc_rvas,
+                init_array_offset_in_data=init_array_offset_in_data,
+                init_array_size=init_array_size,
+                fini_array_offset_in_data=fini_array_offset_in_data,
+                fini_array_size=fini_array_size,
+                tdata_bytes=tdata_bytes,
+                tbss_size=tbss_size,
             )
         elif target_format in ("elf_so", "arm64_elf_so"):
             if not output_path.endswith(".so"):
                 output_path += ".so"
             needed_libs: List[str] = []
             imported_funcs = sorted(os_stubs.keys())
-            for sym in imported_funcs:
+            all_dyn_syms = sorted(set(imported_funcs) | {s for _, s, _, _ in (external_dyn_relocs or [])})
+            for sym in all_dyn_syms:
                 so_name = imp_tbl[sym][1] if sym in imp_tbl else "libc.so.6"
                 if so_name not in needed_libs:
                     needed_libs.append(so_name)
@@ -2072,6 +2242,9 @@ class StandaloneBinaryEmitter:
                 fini_array_size=fini_array_size,
                 tdata_bytes=tdata_bytes,
                 tbss_size=tbss_size,
+                eh_frame_offset_in_code=eh_frame_offset_in_code,
+                eh_frame_size=eh_frame_size,
+                external_dyn_relocs=external_dyn_relocs,
             )
         elif target_format in ("macho_dylib", "dylib"):
             if not output_path.endswith(".dylib"):

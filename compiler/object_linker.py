@@ -12,11 +12,12 @@ Supported Relocations:
 """
 
 import ctypes
+import hashlib
 import io
 import struct
 import sys
 import time
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Sequence
 
 from compiler.binary_emitter import StandaloneBinaryEmitter
 
@@ -78,6 +79,7 @@ class ObjectModule:
         self.tbss_size: int = 0
         self.init_array_bytes = bytearray()
         self.fini_array_bytes = bytearray()
+        self.eh_frame_bytes = bytearray()
         self.symbols: Dict[str, SymbolDef] = {}
         self.relocations: List[RelocationEntry] = []
 
@@ -178,7 +180,9 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
             "characteristics": s_chars,
         }
         sections.append(sec_info)
-        if sname == ".text" and text_sec_idx is None:
+        if sname == ".text":
+            text_sec_idx = s_idx
+        elif text_sec_idx is None and sname.startswith(".text$") and (s_chars & 0x20000020):
             text_sec_idx = s_idx
 
     if text_sec_idx is None:
@@ -188,24 +192,48 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
     mod = ObjectModule(repo_name=repo_name)
     mod.text_bytes.extend(obj_bytes[text_sec["raw_ptr"]:text_sec["raw_ptr"] + text_sec["raw_size"]])
 
+    exec_sec_offsets: Dict[int, Tuple[int, int]] = {
+        text_sec["index_1based"]: (0, text_sec["raw_size"])
+    }
     rodata_sec_offsets: Dict[int, int] = {}
     data_sec_offsets: Dict[int, int] = {}
     bss_sec_offsets: Dict[int, int] = {}
+    init_sec_offsets: Dict[int, int] = {}
+    tdata_sec_offsets: Dict[int, int] = {}
     for s_info in sections:
-        if s_info["index_1based"] == text_sec["index_1based"]:
+        s_idx_1 = s_info["index_1based"]
+        if s_idx_1 == text_sec["index_1based"]:
             continue
         chars = s_info["characteristics"]
         sname_l = s_info["name"]
-        if (chars & 0x00000080) or sname_l.startswith(".bss"):
+        if sname_l.startswith(".text") and (chars & 0x20000020) and s_info["raw_size"] > 0:
+            xpad = (16 - (len(mod.text_bytes) % 16)) % 16
+            if xpad:
+                mod.text_bytes.extend(b"\x90" * xpad)
+            exec_sec_offsets[s_idx_1] = (len(mod.text_bytes), s_info["raw_size"])
+            mod.text_bytes.extend(obj_bytes[s_info["raw_ptr"] : s_info["raw_ptr"] + s_info["raw_size"]])
+        elif sname_l.lower().startswith(".crt$xcu") and s_info["raw_size"] > 0:
+            ipad = (8 - (len(mod.init_array_bytes) % 8)) % 8
+            if ipad:
+                mod.init_array_bytes.extend(b"\x00" * ipad)
+            init_sec_offsets[s_idx_1] = len(mod.init_array_bytes)
+            mod.init_array_bytes.extend(obj_bytes[s_info["raw_ptr"] : s_info["raw_ptr"] + s_info["raw_size"]])
+        elif sname_l.startswith(".tls") and not (chars & 0x00000080) and s_info["raw_size"] > 0:
+            tpad = (8 - (len(mod.tdata_bytes) % 8)) % 8
+            if tpad:
+                mod.tdata_bytes.extend(b"\x00" * tpad)
+            tdata_sec_offsets[s_idx_1] = len(mod.tdata_bytes)
+            mod.tdata_bytes.extend(obj_bytes[s_info["raw_ptr"] : s_info["raw_ptr"] + s_info["raw_size"]])
+        elif (chars & 0x00000080) or sname_l.startswith(".bss"):
             bss_align = (16 - (mod.bss_size % 16)) % 16
             mod.bss_size += bss_align
-            bss_sec_offsets[s_info["index_1based"]] = mod.bss_size
+            bss_sec_offsets[s_idx_1] = mod.bss_size
             mod.bss_size += max(0, int(s_info["raw_size"]))
         elif sname_l.startswith(".data") and s_info["raw_size"] > 0:
             dpad = (16 - (len(mod.data_bytes) % 16)) % 16
             if dpad:
                 mod.data_bytes.extend(b"\x00" * dpad)
-            data_sec_offsets[s_info["index_1based"]] = len(mod.data_bytes)
+            data_sec_offsets[s_idx_1] = len(mod.data_bytes)
             mod.data_bytes.extend(
                 obj_bytes[s_info["raw_ptr"] : s_info["raw_ptr"] + s_info["raw_size"]]
             )
@@ -213,7 +241,7 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
             pad = (32 - (len(mod.text_bytes) % 32)) % 32
             if pad:
                 mod.text_bytes.extend(b"\x00" * pad)
-            rodata_sec_offsets[s_info["index_1based"]] = len(mod.text_bytes)
+            rodata_sec_offsets[s_idx_1] = len(mod.text_bytes)
             mod.text_bytes.extend(
                 obj_bytes[s_info["raw_ptr"] : s_info["raw_ptr"] + s_info["raw_size"]]
             )
@@ -229,7 +257,7 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
         sname = decode_coff_name(raw_name)
         sym_by_idx[idx] = (sname, val, sec_num, storage_cls)
         if (
-            sec_num == text_sec["index_1based"]
+            sec_num in exec_sec_offsets
             and sname
             and not sname.startswith(".")
             and not (
@@ -238,14 +266,26 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
             )
         ):
             is_exp = (storage_cls == 2)  # IMAGE_SYM_CLASS_EXTERNAL
+            xbase, xlen = exec_sec_offsets[sec_num]
             mod.symbols[sname] = SymbolDef(
                 name=sname,
                 section=".text",
-                offset=val,
-                size=max(1, text_sec["raw_size"] - val),
+                offset=xbase + val,
+                size=max(1, xlen - val),
                 is_exported=is_exp,
                 source_repo=repo_name,
             )
+        elif sec_num in tdata_sec_offsets:
+            coff_sec_sym = f"__coff_sym_{idx}__"
+            mod.symbols[coff_sec_sym] = SymbolDef(
+                name=coff_sec_sym, section=".tdata", offset=tdata_sec_offsets[sec_num] + val,
+                size=8, is_exported=False, source_repo=repo_name,
+            )
+            if sname and not sname.startswith("."):
+                mod.symbols[sname] = SymbolDef(
+                    name=sname, section=".tdata", offset=tdata_sec_offsets[sec_num] + val,
+                    size=8, is_exported=(storage_cls == 2), source_repo=repo_name,
+                )
         elif sec_num in rodata_sec_offsets:
             coff_sec_sym = f"__coff_sym_{idx}__"
             mod.symbols[coff_sec_sym] = SymbolDef(
@@ -307,11 +347,15 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
 
     # Parse .text and .data/.rdata Relocations (10 bytes each: VirtualAddress, SymbolTableIndex, Type)
     is_arm64_coff = (machine == 0xAA64)
-    reloc_sources: List[Tuple[str, int, Dict[str, Any], bytearray]] = [(".text", 0, text_sec, mod.text_bytes)]
+    reloc_sources: List[Tuple[str, int, Dict[str, Any], bytearray]] = []
     for s_info in sections:
         s_idx_1 = s_info["index_1based"]
         if s_info["num_relocs"] > 0:
-            if s_idx_1 in data_sec_offsets:
+            if s_idx_1 in exec_sec_offsets:
+                reloc_sources.append((".text", exec_sec_offsets[s_idx_1][0], s_info, mod.text_bytes))
+            elif s_idx_1 in init_sec_offsets:
+                reloc_sources.append((".init_array", init_sec_offsets[s_idx_1], s_info, mod.init_array_bytes))
+            elif s_idx_1 in data_sec_offsets:
                 reloc_sources.append((".data", data_sec_offsets[s_idx_1], s_info, mod.data_bytes))
             elif s_idx_1 in rodata_sec_offsets:
                 reloc_sources.append((".text", rodata_sec_offsets[s_idx_1], s_info, mod.text_bytes))
@@ -325,7 +369,12 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
             vaddr_off, sym_idx, rtype = struct.unpack_from("<IIH", obj_bytes, roff)
             patch_off = sec_base_off + vaddr_off
             sname, _sval, s_sec_num, _scls = sym_by_idx.get(sym_idx, ("", 0, 0, 0))
-            if (s_sec_num in rodata_sec_offsets or s_sec_num in data_sec_offsets or s_sec_num in bss_sec_offsets) and f"__coff_sym_{sym_idx}__" in mod.symbols:
+            if (
+                s_sec_num in rodata_sec_offsets
+                or s_sec_num in data_sec_offsets
+                or s_sec_num in bss_sec_offsets
+                or s_sec_num in tdata_sec_offsets
+            ) and f"__coff_sym_{sym_idx}__" in mod.symbols:
                 target_name = f"__coff_sym_{sym_idx}__"
             else:
                 target_name = sname
@@ -338,6 +387,9 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
                 elif rtype == 0x0001:  # IMAGE_REL_AMD64_ADDR64
                     init_abs = struct.unpack_from("<q", sec_buf, patch_off)[0] if patch_off + 8 <= len(sec_buf) else 0
                     mod.relocations.append(RelocationEntry(reloc_sec_name, patch_off, target_name, "ADDR64", addend=init_abs))
+                elif rtype == 0x000B:  # IMAGE_REL_AMD64_SECREL (TLS offset)
+                    init_sec_off = struct.unpack_from("<i", sec_buf, patch_off)[0] if patch_off + 4 <= len(sec_buf) else 0
+                    mod.relocations.append(RelocationEntry(reloc_sec_name, patch_off, target_name, "COFF_SECREL32", addend=init_sec_off))
             else:
                 if rtype == 0x0003:  # IMAGE_REL_ARM64_BRANCH26
                     mod.relocations.append(RelocationEntry(reloc_sec_name, patch_off, target_name, "ARM64_CALL26", addend=0))
@@ -386,10 +438,14 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
     tbss_sec_offsets: Dict[int, int] = {}
     init_sec_offsets: Dict[int, int] = {}
     fini_sec_offsets: Dict[int, int] = {}
+    eh_sec_offsets: Dict[int, int] = {}
     for i, s in enumerate(elf.iter_sections()):
         sh_type = s.header["sh_type"]
         sh_flags = int(s.header["sh_flags"])
-        if s.name == ".text":
+        if s.name == ".eh_frame" and s.data_size > 0:
+            eh_sec_offsets[i] = len(mod.eh_frame_bytes)
+            mod.eh_frame_bytes.extend(s.data())
+        elif s.name == ".text":
             text_shndx = i
             exec_sec_offsets[i] = (0, text_raw_len)
             sec_sym = f"__elf_sec_{i}__"
@@ -469,7 +525,7 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                 name=sec_sym, section=".data", offset=data_sec_offsets[i],
                 size=max(1, len(d_data)), is_exported=False, source_repo=repo_name,
             )
-        elif s.name.startswith((".rodata", ".rdata")) and s.data_size > 0:
+        elif (s.name.startswith((".rodata", ".rdata", ".gcc_except_table")) or (sh_type == "SHT_PROGBITS" and (sh_flags & 0x2) and not (sh_flags & 0x5) and not s.name.startswith((".debug", ".note", ".comment", ".eh_frame")))) and s.data_size > 0:
             pad = (32 - (len(mod.text_bytes) % 32)) % 32
             if pad:
                 mod.text_bytes.extend(b"\x00" * pad)
@@ -586,6 +642,8 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                 reloc_sec_name, sec_base_off = ".init_array", init_sec_offsets[target_shndx]
             elif target_shndx in fini_sec_offsets:
                 reloc_sec_name, sec_base_off = ".fini_array", fini_sec_offsets[target_shndx]
+            elif target_shndx in eh_sec_offsets:
+                reloc_sec_name, sec_base_off = ".eh_frame", eh_sec_offsets[target_shndx]
             elif target_shndx in rodata_sec_offsets:
                 reloc_sec_name, sec_base_off = ".text", rodata_sec_offsets[target_shndx]
             else:
@@ -1064,11 +1122,21 @@ _LIBM_SYMBOLS = frozenset({
 })
 
 
+def _is_cpp_abi_runtime_symbol(sym_name: str) -> bool:
+    return sym_name == "__gxx_personality_v0" or sym_name.startswith(
+        ("_Unwind_", "__cxa_", "_Z", "__dynamic_cast")
+    )
+
+
 def _infer_dynamic_lib_pair(sym_name: str, lib_hints: Optional[Dict[str, Tuple[str, str]]] = None) -> Tuple[str, str]:
     if lib_hints and sym_name in lib_hints:
         return lib_hints[sym_name]
     if sym_name in OS_C_ABI_IMPORT_TABLE:
         return OS_C_ABI_IMPORT_TABLE[sym_name]
+    if sym_name.startswith("_Unwind_"):
+        return ("KERNEL32.dll", "libgcc_s.so.1")
+    if sym_name == "__gxx_personality_v0" or sym_name.startswith(("__cxa_", "_Z", "__dynamic_cast")):
+        return ("VCRUNTIME140.dll", "libstdc++.so.6")
     if sym_name.startswith("pthread_"):
         return ("KERNEL32.dll", "libpthread.so.0")
     if sym_name in _LIBM_SYMBOLS:
@@ -1091,6 +1159,8 @@ class NativeObjectLinker:
         target_os: Optional[str] = None,
         allow_open_dynamic_imports: bool = False,
         external_lib_hints: Optional[Dict[str, Tuple[str, str]]] = None,
+        gc_sections: bool = False,
+        icf_folding: bool = False,
     ):
         self.modules: List[ObjectModule] = []
         self.archives: List[List[ObjectModule]] = []
@@ -1099,6 +1169,8 @@ class NativeObjectLinker:
         self.allow_open_dynamic_imports: bool = bool(allow_open_dynamic_imports)
         self.external_lib_hints: Dict[str, Tuple[str, str]] = dict(external_lib_hints or {})
         self.hot_weights: Dict[str, int] = {}
+        self.gc_sections: bool = bool(gc_sections)
+        self.icf_folding: bool = bool(icf_folding)
 
     def add_module(self, module: ObjectModule):
         self.modules.append(module)
@@ -1132,6 +1204,9 @@ class NativeObjectLinker:
         text_vaddr_base: int = 0,
         image_base: int = 0,
         hot_weights: Optional[Dict[str, int]] = None,
+        gc_sections: Optional[bool] = None,
+        icf_folding: Optional[bool] = None,
+        gc_roots: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """
         Executes static linking pass across all modules + static archives (`.a`/`.lib`):
@@ -1159,10 +1234,10 @@ class NativeObjectLinker:
             get_sanitizer_kernels = None
 
         work_modules: List[ObjectModule] = list(self.modules)
-        defined_syms: set = {s for mod in work_modules for s in mod.symbols}
 
         # 0. Demand-driven Static Archive (.a / .lib) member extraction (fixed-point worklist)
         if self.archives:
+            defined_pre: set = {s for mod in work_modules for s in mod.symbols}
             archive_index: Dict[str, Tuple[int, int, ObjectModule]] = {}
             for p_idx, pool in enumerate(self.archives):
                 for m_idx, member in enumerate(pool):
@@ -1176,13 +1251,60 @@ class NativeObjectLinker:
                 for mod in list(work_modules):
                     for reloc in mod.relocations:
                         sym_n = reloc.symbol_name
-                        if sym_n not in defined_syms and sym_n in archive_index:
+                        if sym_n not in defined_pre and sym_n in archive_index:
                             p_i, m_i, cand = archive_index[sym_n]
                             if (p_i, m_i) not in pulled_members:
                                 pulled_members.add((p_i, m_i))
                                 work_modules.append(cand)
-                                defined_syms.update(cand.symbols.keys())
+                                defined_pre.update(cand.symbols.keys())
                                 changed_arch = True
+
+        # 0b. Reachable --gc-sections Dead-Module Elimination (BFS from entry/exported/init roots)
+        use_gc = self.gc_sections if gc_sections is None else bool(gc_sections)
+        gc_eliminated_modules = 0
+        gc_bytes_reclaimed = 0
+        if use_gc and len(work_modules) > 1:
+            sym_to_mod_idxs: Dict[str, List[int]] = {}
+            for m_i, mod in enumerate(work_modules):
+                for sname in mod.symbols:
+                    sym_to_mod_idxs.setdefault(sname, []).append(m_i)
+            alive_idxs: set = set()
+            if gc_roots is not None:
+                root_syms = set(gc_roots)
+                for rs in root_syms:
+                    alive_idxs.update(sym_to_mod_idxs.get(rs, ()))
+            else:
+                if entry_symbol and entry_symbol in sym_to_mod_idxs:
+                    alive_idxs.update(sym_to_mod_idxs[entry_symbol])
+                for m_i, mod in enumerate(work_modules):
+                    if mod.init_array_bytes or mod.fini_array_bytes:
+                        alive_idxs.add(m_i)
+                        continue
+                    if any(
+                        sd.is_exported and not sname.startswith(("__elf_sec_", "__coff_sec_", "__macho_sec_"))
+                        for sname, sd in mod.symbols.items()
+                    ):
+                        alive_idxs.add(m_i)
+                if not alive_idxs:
+                    alive_idxs.add(0)
+            bfs_q = list(sorted(alive_idxs))
+            while bfs_q:
+                cur_i = bfs_q.pop(0)
+                for rel in work_modules[cur_i].relocations:
+                    for dep_i in sym_to_mod_idxs.get(rel.symbol_name, ()):
+                        if dep_i not in alive_idxs:
+                            alive_idxs.add(dep_i)
+                            bfs_q.append(dep_i)
+            kept_modules: List[ObjectModule] = []
+            for m_i, mod in enumerate(work_modules):
+                if m_i in alive_idxs:
+                    kept_modules.append(mod)
+                else:
+                    gc_eliminated_modules += 1
+                    gc_bytes_reclaimed += len(mod.text_bytes) + len(mod.data_bytes)
+            work_modules = kept_modules
+
+        defined_syms: set = {s for mod in work_modules for s in mod.symbols}
 
         needed_runtime_syms = set()
         needed_atomic_syms = set()
@@ -1192,6 +1314,8 @@ class NativeObjectLinker:
         needed_tls_got_syms = set()
         for mod in work_modules:
             for reloc in mod.relocations:
+                if reloc.symbol_name == "_GLOBAL_OFFSET_TABLE_":
+                    continue
                 if reloc.reloc_type in ("GOT_REL32", "ARM64_GOT_PAGE21", "ARM64_GOT_LO12"):
                     needed_got_syms.add(reloc.symbol_name)
                 elif reloc.reloc_type == "TLS_GOTTPOFF":
@@ -1203,7 +1327,7 @@ class NativeObjectLinker:
                         needed_atomic_syms.add(reloc.symbol_name)
                     elif reloc.symbol_name in NATIVE_COLLECTION_SYMBOLS:
                         needed_runtime_syms.add(reloc.symbol_name)
-                    elif reloc.symbol_name in OS_C_ABI_IMPORT_TABLE:
+                    elif reloc.symbol_name in OS_C_ABI_IMPORT_TABLE or _is_cpp_abi_runtime_symbol(reloc.symbol_name):
                         needed_os_syms.add(reloc.symbol_name)
                     elif (
                         self.allow_open_dynamic_imports
@@ -1306,12 +1430,56 @@ class NativeObjectLinker:
         module_init_offsets: Dict[int, int] = {}
         module_fini_offsets: Dict[int, int] = {}
 
+        use_icf = self.icf_folding if icf_folding is None else bool(icf_folding)
+        icf_seen_canon: Dict[Tuple[bytes, Tuple[Any, ...]], int] = {}
+        icf_folded_indices: set = set()
+        icf_folded_modules = 0
+        icf_bytes_saved = 0
+        icf_folded_symbols: List[str] = []
+
         for idx, mod in enumerate(work_modules):
-            pad = (32 - (len(combined_text) % 32)) % 32
-            if pad:
-                combined_text.extend(b"\x90" * pad)
-            module_text_offsets[idx] = len(combined_text)
-            combined_text.extend(mod.text_bytes)
+            can_icf = (
+                use_icf
+                and not mod.repo_name.startswith("__omni_")
+                and len(mod.text_bytes) >= 4
+                and not mod.data_bytes
+                and mod.bss_size == 0
+                and not mod.tdata_bytes
+                and mod.tbss_size == 0
+                and not mod.init_array_bytes
+                and not mod.fini_array_bytes
+                and not getattr(mod, "eh_frame_bytes", b"")
+                and all(sd.section == ".text" for sd in mod.symbols.values())
+                and all(r.section == ".text" for r in mod.relocations)
+            )
+            folded_into_off: Optional[int] = None
+            if can_icf:
+                reloc_sig = tuple(
+                    (
+                        r.offset,
+                        ("LOCAL", mod.symbols[r.symbol_name].offset) if r.symbol_name in mod.symbols else ("EXT", r.symbol_name),
+                        r.reloc_type,
+                        r.addend,
+                    )
+                    for r in sorted(mod.relocations, key=lambda x: (x.offset, x.symbol_name, x.reloc_type, x.addend))
+                )
+                icf_key = (bytes(mod.text_bytes), reloc_sig)
+                if icf_key in icf_seen_canon:
+                    folded_into_off = icf_seen_canon[icf_key]
+            if folded_into_off is not None:
+                module_text_offsets[idx] = folded_into_off
+                icf_folded_indices.add(idx)
+                icf_folded_modules += 1
+                icf_bytes_saved += len(mod.text_bytes)
+                icf_folded_symbols.extend(sorted(s for s in mod.symbols if not s.startswith("__")))
+            else:
+                pad = (32 - (len(combined_text) % 32)) % 32
+                if pad:
+                    combined_text.extend(b"\x90" * pad)
+                module_text_offsets[idx] = len(combined_text)
+                if can_icf:
+                    icf_seen_canon[icf_key] = module_text_offsets[idx]  # type: ignore[possibly-undefined]
+                combined_text.extend(mod.text_bytes)
 
             if mod.data_bytes:
                 dpad = (16 - (len(combined_data) % 16)) % 16
@@ -1346,6 +1514,34 @@ class NativeObjectLinker:
                 total_tbss_size += mod.tbss_size
             else:
                 module_tbss_offsets[idx] = total_tbss_size
+
+        # Append combined DWARF .eh_frame tables after .text/.rodata in RX segment
+        module_eh_offsets: Dict[int, int] = {}
+        eh_frame_offset_in_code = 0
+        eh_frame_size = 0
+        if any(getattr(mod, "eh_frame_bytes", b"") for mod in work_modules):
+            eh_pad = (8 - (len(combined_text) % 8)) % 8
+            if eh_pad:
+                combined_text.extend(b"\x90" * eh_pad)
+            eh_frame_offset_in_code = len(combined_text)
+            for idx, mod in enumerate(work_modules):
+                eh_raw = bytes(getattr(mod, "eh_frame_bytes", b""))
+                if not eh_raw:
+                    continue
+                if len(eh_raw) >= 4 and eh_raw.endswith(b"\x00\x00\x00\x00"):
+                    eh_raw = eh_raw[:-4]
+                if not eh_raw:
+                    continue
+                sub_eh_pad = (8 - (len(combined_text) % 8)) % 8
+                if sub_eh_pad:
+                    combined_text.extend(b"\x00" * sub_eh_pad)
+                module_eh_offsets[idx] = len(combined_text)
+                combined_text.extend(eh_raw)
+            if len(combined_text) > eh_frame_offset_in_code:
+                combined_text.extend(b"\x00\x00\x00\x00")
+                eh_frame_size = len(combined_text) - eh_frame_offset_in_code
+            else:
+                eh_frame_offset_in_code = 0
 
         # Reserve internal GOT slots & TLS GOTTPOFF slots inside writable .data
         got_slot_data_offsets: Dict[str, int] = {}
@@ -1446,10 +1642,24 @@ class NativeObjectLinker:
         unresolved_symbols = []
         applied_relocs = 0
         abs64_reloc_rvas: List[int] = []
+        external_dyn_relocs: List[Tuple[int, str, int, int]] = []
+        is_arm64_link = any(
+            r.reloc_type.startswith("ARM64_")
+            for m in work_modules
+            for r in m.relocations
+        )
 
-        # Populate internal GOT slots (holding absolute pointer to target symbol)
+        # Populate internal GOT slots (or emit R_X86_64_GLOB_DAT for external shared library symbols)
         for gsym, g_data_off in got_slot_data_offsets.items():
-            if gsym in global_symbol_table:
+            if gsym in external_os_imports:
+                struct.pack_into("<Q", combined_data, g_data_off, 0)
+                external_dyn_relocs.append((
+                    text_vaddr_base + eff_data_delta + g_data_off,
+                    gsym,
+                    1025 if is_arm64_link else 6,
+                    0,
+                ))
+            elif gsym in global_symbol_table:
                 target_va = image_base + text_vaddr_base + global_symbol_table[gsym]
                 struct.pack_into("<Q", combined_data, g_data_off, target_va)
                 abs64_reloc_rvas.append(text_vaddr_base + eff_data_delta + g_data_off)
@@ -1460,13 +1670,18 @@ class NativeObjectLinker:
                 struct.pack_into("<q", combined_data, tg_off, tpoff_i64)
 
         for idx, mod in enumerate(work_modules):
+            if idx in icf_folded_indices:
+                continue
             t_base = module_text_offsets[idx]
             d_base = module_data_offsets[idx]
             i_base = module_init_offsets.get(idx, 0)
             f_base = module_fini_offsets.get(idx, 0)
+            eh_base = module_eh_offsets.get(idx, eh_frame_offset_in_code)
             for reloc in mod.relocations:
                 target_sym = reloc.symbol_name
-                if (idx, target_sym) in local_symbol_offsets:
+                if target_sym == "_GLOBAL_OFFSET_TABLE_":
+                    target_offset = eff_data_delta if has_rw_section else len(combined_text)
+                elif (idx, target_sym) in local_symbol_offsets:
                     target_offset = local_symbol_offsets[(idx, target_sym)]
                 elif target_sym in global_symbol_table:
                     target_offset = global_symbol_table[target_sym]
@@ -1491,6 +1706,10 @@ class NativeObjectLinker:
                     target_buf = combined_data
                     buf_patch_off = f_base + reloc.offset
                     reloc_v_pos = eff_data_delta + buf_patch_off
+                elif reloc.section == ".eh_frame":
+                    target_buf = combined_text
+                    buf_patch_off = eh_base + reloc.offset
+                    reloc_v_pos = buf_patch_off
                 else:
                     target_buf = combined_text
                     buf_patch_off = t_base + reloc.offset
@@ -1502,8 +1721,8 @@ class NativeObjectLinker:
                         f"Relocation slot [{buf_patch_off}..{buf_patch_off + reloc_size}] exceeds {reloc.section} bounds ({len(target_buf)}) in module {mod.repo_name}"
                     )
 
-                is_tls_reloc = reloc.reloc_type in ("TLS_TPOFF32", "TLS_GOTTPOFF")
-                if not is_tls_reloc:
+                is_tls_reloc = reloc.reloc_type in ("TLS_TPOFF32", "TLS_GOTTPOFF", "COFF_SECREL32")
+                if not is_tls_reloc and target_sym != "_GLOBAL_OFFSET_TABLE_":
                     max_valid_off = (eff_data_delta + bss_start_in_data + total_bss_size) if has_rw_section else len(combined_text)
                     if target_offset < 0 or target_offset >= max(len(combined_text), max_valid_off):
                         raise RelocationOutOfBoundsError(
@@ -1515,6 +1734,11 @@ class NativeObjectLinker:
                     if not (-0x80000000 <= disp32 <= 0x7FFFFFFF):
                         raise RelocationOutOfBoundsError(f"REL32 displacement {disp32} overflows signed 32-bit range")
                     struct.pack_into("<i", target_buf, buf_patch_off, disp32)
+                    applied_relocs += 1
+
+                elif reloc.reloc_type == "COFF_SECREL32":
+                    tls_off = tls_symbol_offsets.get((idx, target_sym), global_tls_offsets.get(target_sym, target_offset))
+                    struct.pack_into("<I", target_buf, buf_patch_off, (tls_off + reloc.addend) & 0xFFFFFFFF)
                     applied_relocs += 1
 
                 elif reloc.reloc_type == "TLS_TPOFF32":
@@ -1542,9 +1766,18 @@ class NativeObjectLinker:
                     applied_relocs += 1
 
                 elif reloc.reloc_type == "ADDR64":
-                    target_va = image_base + text_vaddr_base + target_offset + reloc.addend
-                    struct.pack_into("<Q", target_buf, buf_patch_off, target_va)
-                    abs64_reloc_rvas.append(text_vaddr_base + reloc_v_pos)
+                    if target_sym in external_os_imports:
+                        struct.pack_into("<Q", target_buf, buf_patch_off, 0)
+                        external_dyn_relocs.append((
+                            text_vaddr_base + reloc_v_pos,
+                            target_sym,
+                            257 if is_arm64_link else 1,
+                            reloc.addend,
+                        ))
+                    else:
+                        target_va = image_base + text_vaddr_base + target_offset + reloc.addend
+                        struct.pack_into("<Q", target_buf, buf_patch_off, target_va)
+                        abs64_reloc_rvas.append(text_vaddr_base + reloc_v_pos)
                     applied_relocs += 1
 
                 elif reloc.reloc_type in ("ARM64_CALL26",):
@@ -1620,10 +1853,20 @@ class NativeObjectLinker:
                 key=lambda s: global_symbol_table[s],
             ),
             "hot_first_applied": bool(eff_hot_weights),
+            "gc_sections_applied": use_gc,
+            "gc_eliminated_modules": gc_eliminated_modules,
+            "gc_bytes_reclaimed": gc_bytes_reclaimed,
+            "icf_folding_applied": use_icf,
+            "icf_folded_modules": icf_folded_modules,
+            "icf_bytes_saved": icf_bytes_saved,
+            "icf_folded_symbols": sorted(set(icf_folded_symbols)),
             "external_os_imports": external_os_imports,
             "os_import_table": resolved_os_import_table,
             "relocations_applied": applied_relocs,
             "abs64_reloc_rvas": sorted(set(abs64_reloc_rvas)),
+            "external_dyn_relocs": external_dyn_relocs,
+            "eh_frame_offset_in_code": eh_frame_offset_in_code,
+            "eh_frame_size": eh_frame_size,
             "combined_code": bytes(combined_text),
             "combined_data": bytes(combined_data),
             "bss_start_in_data": bss_start_in_data,
@@ -1644,11 +1887,12 @@ class NativeObjectLinker:
         dwarf_sections: Optional[Dict[str, bytes]] = None,
     ) -> str:
         """Links modules and emits a dynamic shared library exporting ALL exported module symbols."""
-        link_res = self.link()
+        link_res = self.link(entry_symbol=export_name)
         has_rw = (
             bool(link_res["combined_data"])
             or (link_res["total_bss_size"] > 0)
             or bool(link_res["abs64_reloc_rvas"])
+            or bool(link_res["external_dyn_relocs"])
             or bool(link_res["combined_tdata"])
             or (link_res["total_tbss_size"] > 0)
         )
@@ -1677,8 +1921,12 @@ class NativeObjectLinker:
                 abs64_reloc_rvas=link_res["abs64_reloc_rvas"],
                 has_init_array=link_res.get("init_array_size", 0) > 0,
                 has_fini_array=link_res.get("fini_array_size", 0) > 0,
+                eh_frame_offset_in_code=link_res.get("eh_frame_offset_in_code", 0),
+                eh_frame_size=link_res.get("eh_frame_size", 0),
+                external_dyn_relocs=link_res.get("external_dyn_relocs") or None,
             )
             link_res = self.link(
+                entry_symbol=export_name,
                 data_vaddr_delta=(data_va - text_va),
                 text_vaddr_base=text_va,
                 image_base=image_base,
@@ -1715,6 +1963,9 @@ class NativeObjectLinker:
             fini_array_size=link_res.get("fini_array_size", 0),
             tdata_bytes=link_res.get("combined_tdata") or None,
             tbss_size=link_res.get("total_tbss_size", 0),
+            eh_frame_offset_in_code=link_res.get("eh_frame_offset_in_code", 0),
+            eh_frame_size=link_res.get("eh_frame_size", 0),
+            external_dyn_relocs=link_res.get("external_dyn_relocs") or None,
         )
 
     def emit_linked_executable(

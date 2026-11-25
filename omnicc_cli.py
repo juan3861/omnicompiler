@@ -43,6 +43,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
             verify_reproducibility=args.repro_check,
             sanitize=args.sanitize,
             distributed_workers=args.workers,
+            auto_pgo=args.auto_pgo,
+            gc_sections=args.gc_sections,
+            icf_folding=args.icf,
         )
     finally:
         compiler.close()
@@ -56,6 +59,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "reproducibility": res["stages"].get("reproducibility"),
             "sanitizers": res["stages"].get("sanitizers"),
             "federation": res["stages"].get("federation"),
+            "auto_pgo": res["stages"].get("auto_pgo"),
+            "linking": res["stages"].get("linking"),
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
@@ -177,6 +182,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_b.add_argument("--toolchain-mode", default="auto", choices=["auto", "aot_only", "federated_lto"])
     p_b.add_argument("--sanitize", default=None, help="Enable sanitizers e.g. 'asan,ubsan'")
     p_b.add_argument("--workers", type=int, default=0, help="Enable distributed RBE worker pool (>=2)")
+    p_b.add_argument("--auto-pgo", action="store_true", help="Enable closed-loop SSA Auto-PGO trace & hot-first layout")
+    p_b.add_argument("--gc-sections", action="store_true", help="Enable BFS dead-module/symbol elimination during link")
+    p_b.add_argument("--icf", action="store_true", help="Enable safe Identical Code Folding (ICF) during link")
     p_b.add_argument("--entry", default="omni_main")
     p_b.add_argument("--export-all", action="store_true")
     p_b.add_argument("--no-provenance", action="store_true")

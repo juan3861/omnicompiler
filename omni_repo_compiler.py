@@ -358,13 +358,20 @@ class OmniRepoCompiler:
         sanitize: Optional[str] = None,
         distributed_workers: int = 0,
         profile_weights: Optional[Dict[str, int]] = None,
+        auto_pgo: bool = False,
+        gc_sections: bool = False,
+        icf_folding: bool = False,
     ) -> Dict[str, Any]:
         """
         Executes the full 9-stage multi-repository compilation pipeline with real AST->SSA->Native/LLVM/GCC/WASM
         code generation, cross-repository call linking, Unicorn silicon verification, and provenance signing.
         """
         # Fresh linker instance per compilation prevents cross-call module accumulation
-        self.linker = NativeObjectLinker(allow_open_dynamic_imports=True)
+        self.linker = NativeObjectLinker(
+            allow_open_dynamic_imports=True,
+            gc_sections=gc_sections,
+            icf_folding=icf_folding,
+        )
         if profile_weights:
             self.linker.hot_weights = {str(k): int(v) for k, v in profile_weights.items()}
 
@@ -700,6 +707,8 @@ class OmniRepoCompiler:
         rotated_loops = 0
         slp_clusters_formed = 0
         pgo_profiled_functions = 0
+        auto_pgo_weights: Dict[str, int] = {}
+        auto_pgo_unrolls: Dict[str, int] = {}
         gvn_eliminated_exprs = 0
         sccp_folded_branches = 0
         specialized_functions = 0
@@ -976,6 +985,10 @@ class OmniRepoCompiler:
                         eff_unroll = max(host_unroll_factor, pgo_prof.recommended_unroll)
                         ssa_fn, unroll_stats = LoopUnrollPass(unroll_factor=eff_unroll).unroll_function(ssa_fn)
                         unrolled_loops += unroll_stats.get("unrolled_loops", 0)
+                        if auto_pgo:
+                            est_w = max(1, sum(pgo_prof.block_counts.values()) + pgo_prof.total_steps_sampled)
+                            auto_pgo_weights[exp.name] = est_w
+                            auto_pgo_unrolls[exp.name] = eff_unroll
                     except Exception:
                         pass
 
@@ -1402,14 +1415,28 @@ class OmniRepoCompiler:
             from compiler.sanitizer_pass import SanitizerInstrumentationPass
             san_pass = SanitizerInstrumentationPass(mode=sanitize)
 
+        eff_profile_weights: Dict[str, int] = {}
+        if auto_pgo and auto_pgo_weights:
+            eff_profile_weights.update(auto_pgo_weights)
+        if profile_weights:
+            eff_profile_weights.update({str(k): int(v) for k, v in profile_weights.items()})
+        if eff_profile_weights:
+            self.linker.hot_weights = eff_profile_weights
+            results["stages"]["auto_pgo"] = {
+                "enabled": bool(auto_pgo),
+                "profiled_functions": len(auto_pgo_weights),
+                "hot_weights": dict(eff_profile_weights),
+                "recommended_unrolls": dict(auto_pgo_unrolls),
+            }
+
         for m, obj_mod, stub_list in repo_order_objs:
             repo_ssas = [
                 ssa_program[fn_n]
                 for fn_n, owner in unit_owner_repo.items()
                 if owner == m.repo_name
             ]
-            if profile_weights:
-                repo_ssas.sort(key=lambda s: -int(profile_weights.get(s.name, 0)))
+            if eff_profile_weights:
+                repo_ssas.sort(key=lambda s: -int(eff_profile_weights.get(s.name, 0)))
             if san_pass is not None:
                 for _s_fn in repo_ssas:
                     _s_rep = san_pass.instrument_function(_s_fn)
@@ -1942,9 +1969,17 @@ class OmniRepoCompiler:
                                     changed = True
                                     break
                     if is_external_obj and fn_slice and fn_slice[-1] != 0xC3:
-                        # GCC/Clang stack-protector functions emit cold `call __stack_chk_fail` / `ud2` after main RET
-                        if len(fn_slice) >= 5 and (fn_slice[-5] == 0xE8 or fn_slice.endswith(b"\x0f\x0b")) and b"\xc3" in fn_slice:
+                        # GCC/Clang stack-protector and C++ exception landing-pad functions emit cold
+                        # `call __stack_chk_fail` / `call _Unwind_Resume` / `jmp` / `ud2` blocks.
+                        if b"\xc3" in fn_slice:
                             fn_slice = fn_slice[:fn_slice.rfind(b"\xc3") + 1]
+                        elif (
+                            sym_def.name.endswith(".cold")
+                            or ".cold." in sym_def.name
+                            or fn_slice.endswith(b"\x0f\x0b")
+                            or (len(fn_slice) >= 5 and fn_slice[-5] in (0xE8, 0xE9))
+                        ):
+                            continue
                     asm_rep = self.asm_auditor.audit_function_code(fn_slice, sym_def.name)
                     if not asm_rep.is_valid:
                         asm_all_valid = False
@@ -1968,6 +2003,13 @@ class OmniRepoCompiler:
             "exported_symbols": sorted(link_res["exported_symbols"].keys()),
             "layout_order": link_res.get("layout_order", []),
             "hot_first_applied": bool(link_res.get("hot_first_applied", False)),
+            "gc_sections_applied": bool(link_res.get("gc_sections_applied", False)),
+            "gc_eliminated_modules": int(link_res.get("gc_eliminated_modules", 0)),
+            "gc_bytes_reclaimed": int(link_res.get("gc_bytes_reclaimed", 0)),
+            "icf_folding_applied": bool(link_res.get("icf_folding_applied", False)),
+            "icf_folded_modules": int(link_res.get("icf_folded_modules", 0)),
+            "icf_bytes_saved": int(link_res.get("icf_bytes_saved", 0)),
+            "icf_folded_symbols": list(link_res.get("icf_folded_symbols", [])),
             "external_os_imports": sorted((link_res.get("external_os_imports") or {}).keys()),
         }
 
@@ -2338,6 +2380,9 @@ class OmniRepoCompiler:
                         sanitize=sanitize,
                         distributed_workers=0,
                         profile_weights=profile_weights,
+                        auto_pgo=auto_pgo,
+                        gc_sections=gc_sections,
+                        icf_folding=icf_folding,
                     )
                     rep_art = rep_res["stages"]["emission"]["artifact_path"]
                     with open(rep_art, "rb") as rf:
