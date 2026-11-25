@@ -73,13 +73,14 @@ Documentation = "https://github.com/juan3861/omnicompiler#readme"
 Issues = "https://github.com/juan3861/omnicompiler/issues"
 
 [project.scripts]
+omnicc = "omnicc_cli:main"
 omnicompiler = "cli:main"
 omnicompiler-native = "omnicompiler_cli:main"
 omnicompiler-evolver = "evolution.recursive_bootstrap_loop:main"
 omnicompiler-status = "evolution.status_dashboard:main"
 
 [tool.setuptools]
-py-modules = ["cli", "omnicompiler_cli", "omni_repo_compiler"]
+py-modules = ["cli", "omnicc_cli", "omnicompiler_cli", "omni_repo_compiler"]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -102,5 +103,6 @@ include = [
     "slicer*",
     "snapshots*",
     "adapters*",
-    "benchmarks*"
+    "benchmarks*",
+    "lsp*"
 ]

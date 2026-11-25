@@ -1320,3 +1320,253 @@ class OSSandboxController:
             "kernel_enforced": bool(caps.get("landlock")) if sys.platform.startswith("linux") else True,
             "landlock_restricted": bool(caps.get("landlock")),
         }
+
+
+def apply_windows_job_sandbox(
+    proc_handle: int,
+    max_memory_mb: int = 512,
+    active_process_limit: int = 16,
+    kill_on_close: bool = True,
+) -> Optional[int]:
+    """
+    Attaches an external Windows process handle to a hard Win32 Job Object
+    enforcing memory caps, active child count caps, and automatic teardown on close.
+    Returns the Job HANDLE (caller closes via kernel32.CloseHandle) or None on non-win32.
+    """
+    import sys
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class _BASIC_INFO(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+        )]
+
+    class _EXT_INFO(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BASIC_INFO),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k32.AssignProcessToJobObject.restype = wintypes.BOOL
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError("CreateJobObjectW failed")
+    info = _EXT_INFO()
+    flags = 0x0008 | 0x0100 | (0x2000 if kill_on_close else 0)
+    info.BasicLimitInformation.LimitFlags = flags
+    info.BasicLimitInformation.ActiveProcessLimit = max(1, int(active_process_limit))
+    info.ProcessMemoryLimit = max(32, int(max_memory_mb)) * 1024 * 1024
+    ok_set = bool(k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)))
+    ok_assign = bool(k32.AssignProcessToJobObject(job, wintypes.HANDLE(int(proc_handle))))
+    if not (ok_set and ok_assign):
+        k32.CloseHandle(job)
+        return None
+    return int(job)
+
+
+class RBEClusterPool:
+    """
+    Multi-process RBE Execution Cluster (Alpha-C98):
+    Spawns `num_workers` isolated OS worker processes (`REAPIGrpcServer` over HTTP/2
+    when `grpc` is available, or `RBEWorkerNode` HTTP fallback), attached to Win32 Job Objects
+    on Windows, sharing one `ContentAddressableStore` with topological DAG scheduling.
+    """
+
+    def __init__(
+        self,
+        cas: ContentAddressableStore,
+        num_workers: int = 2,
+        prefer_grpc: bool = True,
+        max_memory_mb: int = 512,
+    ):
+        self.cas = cas
+        self.num_workers = max(1, int(num_workers))
+        self.prefer_grpc = prefer_grpc
+        self.max_memory_mb = max_memory_mb
+        self._procs: List[Any] = []
+        self._job_handles: List[int] = []
+        self.endpoints: List[str] = []
+        self.worker_pids: List[int] = []
+        self.coordinator: Optional[RBECoordinator] = None
+
+    def start(self) -> "RBEClusterPool":
+        import subprocess
+        import sys
+
+        if self._procs:
+            return self
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for idx in range(self.num_workers):
+            wid = f"rbe_proc_worker_{idx}"
+            cmd = [
+                sys.executable,
+                "-m",
+                "orchestrator.rbe_cas",
+                "--worker",
+                "--cas-dir",
+                self.cas.root_dir,
+                "--worker-id",
+                wid,
+                "--transport",
+                "grpc" if self.prefer_grpc else "http",
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                cwd=project_root,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            self._procs.append(proc)
+            if sys.platform == "win32":
+                try:
+                    jh = apply_windows_job_sandbox(int(proc._handle), max_memory_mb=self.max_memory_mb)
+                    if jh:
+                        self._job_handles.append(jh)
+                except Exception:
+                    pass
+            ready_line = proc.stdout.readline().strip() if proc.stdout else ""
+            if not ready_line:
+                err = proc.stderr.read() if proc.stderr else ""
+                raise RuntimeError(f"RBEClusterPool worker {wid} failed to bind: {err}")
+            info = json.loads(ready_line)
+            self.endpoints.append(info["endpoint"])
+            self.worker_pids.append(int(info.get("pid", proc.pid)))
+
+        self.coordinator = RBECoordinator(self.cas, self.endpoints)
+        return self
+
+    def execute_dag(self, actions: List[ActionSpec]) -> Dict[str, Any]:
+        if self.coordinator is None:
+            self.start()
+        assert self.coordinator is not None
+        res_map = self.coordinator.execute_dag(actions, max_workers=max(1, len(self.endpoints)))
+        hits = sum(1 for r in res_map.values() if r.cache_hit)
+        workers_used = sorted({r.worker_id for r in res_map.values()})
+        return {
+            "results": res_map,
+            "total_actions": len(actions),
+            "cache_hits": hits,
+            "executed_misses": len(actions) - hits,
+            "workers_used": workers_used,
+            "worker_pids": list(self.worker_pids),
+            "endpoints": list(self.endpoints),
+        }
+
+    def close(self) -> None:
+        import sys
+        for proc in self._procs:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        for proc in self._procs:
+            try:
+                proc.wait(timeout=5.0)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    if pipe:
+                        pipe.close()
+                except Exception:
+                    pass
+        self._procs.clear()
+        if sys.platform == "win32" and self._job_handles:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            for jh in self._job_handles:
+                try:
+                    k32.CloseHandle(jh)
+                except Exception:
+                    pass
+            self._job_handles.clear()
+        self.endpoints.clear()
+        self.worker_pids.clear()
+        self.coordinator = None
+
+    def __enter__(self) -> "RBEClusterPool":
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+
+def _run_worker_cli(argv: Optional[List[str]] = None) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="OmniCompiler RBE Worker Node Daemon")
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--cas-dir", required=True)
+    parser.add_argument("--worker-id", default="worker_0")
+    parser.add_argument("--transport", default="grpc", choices=["grpc", "http"])
+    args = parser.parse_args(argv)
+
+    cas = ContentAddressableStore(args.cas_dir)
+    srv = None
+    if args.transport == "grpc":
+        try:
+            srv = REAPIGrpcServer(args.worker_id, cas)
+            ep = srv.start()
+        except Exception:
+            srv = None
+    if srv is None:
+        srv = RBEWorkerNode(args.worker_id, cas)
+        ep = srv.start()
+
+    sys.stdout.write(json.dumps({"endpoint": ep, "pid": os.getpid(), "worker_id": args.worker_id}) + "\n")
+    sys.stdout.flush()
+    try:
+        sys.stdin.read()
+    except Exception:
+        pass
+    finally:
+        srv.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_worker_cli())

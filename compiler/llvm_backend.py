@@ -6,7 +6,7 @@ to LLVM IR, applies LLVM O3 PassBuilder optimization pipelines (auto-vectorizati
 loop unrolling, GVN, instcombine), and compiles to MCJIT silicon or COFF/ELF object files.
 """
 
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Sequence, Union
 import ctypes
 import re
 import struct
@@ -117,6 +117,80 @@ class LLVMBackend:
         finally:
             if prev_triple is not None:
                 mod.triple = prev_triple
+
+    def parse_bitcode(self, bitcode_bytes: bytes, optimize: bool = False) -> Any:
+        """Parses and verifies an LLVM Bitcode (`.bc`) payload, running O3 optimization if requested."""
+        if not self.is_available:
+            raise RuntimeError("LLVM backend is not available.")
+        mod = llvm.parse_bitcode(bitcode_bytes)
+        mod.verify()
+        if optimize and self._target_machine:
+            pto = llvm.create_pipeline_tuning_options(speed_level=self.opt_level)
+            pto.loop_vectorization = True
+            pto.slp_vectorization = True
+            pto.loop_unrolling = True
+            pb = llvm.create_pass_builder(self._target_machine, pto)
+            pb.getModulePassManager().run(mod, pb)
+        return mod
+
+    def parse_ir_or_bitcode(self, payload: Union[bytes, str], optimize: bool = False) -> Any:
+        """Parses either binary LLVM Bitcode (`.bc`) or textual LLVM IR (`.ll`)."""
+        if not self.is_available:
+            raise RuntimeError("LLVM backend is not available.")
+        if isinstance(payload, (bytes, bytearray)):
+            raw = bytes(payload)
+            if raw.startswith((b"BC\xc0\xde", b"\xde\xc0\x17\x0b")):
+                return self.parse_bitcode(raw, optimize=optimize)
+            text_ir = raw.decode("utf-8", errors="replace")
+            return self.compile_ir(text_ir, optimize=optimize)
+        return self.compile_ir(payload, optimize=optimize)
+
+    def link_bitcode_modules(
+        self,
+        units: Sequence[Union[bytes, str, Any]],
+        optimize: bool = True,
+        align_target_triple: bool = True,
+    ) -> Any:
+        """
+        Fuses multiple LLVM Bitcode (`.bc`), textual LLVM IR (`.ll`), or `ModuleRef`
+        objects into a single LTO compilation unit and runs full PassBuilder O3 optimizations.
+        """
+        if not self.is_available:
+            raise RuntimeError("LLVM backend is not available.")
+        if not units:
+            raise ValueError("link_bitcode_modules requires at least one IR/Bitcode unit.")
+
+        tm = self._obj_target_machine or self._target_machine
+
+        def _clone_to_mod(item: Any) -> Any:
+            if isinstance(item, (bytes, bytearray, str)):
+                m = self.parse_ir_or_bitcode(item, optimize=False)
+            else:
+                # Clone ModuleRef via bitcode roundtrip so callers retain unmodified inputs
+                m = llvm.parse_bitcode(item.as_bitcode())
+                m.verify()
+            if align_target_triple and tm is not None:
+                try:
+                    m.triple = tm.triple
+                except Exception:
+                    pass
+            return m
+
+        base_mod = _clone_to_mod(units[0])
+        for extra in units[1:]:
+            sub_mod = _clone_to_mod(extra)
+            base_mod.link_in(sub_mod, preserve=False)
+        base_mod.verify()
+
+        if optimize and self._target_machine:
+            pto = llvm.create_pipeline_tuning_options(speed_level=self.opt_level)
+            pto.loop_vectorization = True
+            pto.slp_vectorization = True
+            pto.loop_unrolling = True
+            pb = llvm.create_pass_builder(self._target_machine, pto)
+            pb.getModulePassManager().run(base_mod, pb)
+
+        return base_mod
 
     def emit_assembly(self, mod: Any) -> str:
         """Emits target assembly code text from an LLVM module."""

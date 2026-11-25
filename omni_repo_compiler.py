@@ -115,8 +115,10 @@ def _has_only_numeric_cfg_syntax(fn_def: ast.FunctionDef) -> bool:
 
 def _compute_native_compilable_set(
     all_ast_funcs: Dict[str, ast.FunctionDef],
+    external_defined_syms: Optional[Set[str]] = None,
 ) -> Set[str]:
     """Fixed-point closure of functions whose body and transitive callees are 100% native-compilable."""
+    ext_syms = external_defined_syms or set()
     candidates = {
         fname for fname, fdef in all_ast_funcs.items()
         if _has_only_numeric_cfg_syntax(fdef)
@@ -136,7 +138,7 @@ def _compute_native_compilable_set(
                             local_closures.add(tgt.id)
             callees = _extract_called_names(fdef)
             for c in callees:
-                if c not in NATIVE_BUILTIN_CALLS and c not in OS_C_ABI_IMPORT_TABLE and c not in candidates and c not in local_closures:
+                if c not in NATIVE_BUILTIN_CALLS and c not in OS_C_ABI_IMPORT_TABLE and c not in candidates and c not in local_closures and c not in ext_syms:
                     candidates.discard(fname)
                     changed = True
                     break
@@ -350,6 +352,10 @@ class OmniRepoCompiler:
         homeostasis_policy: str = "consensus",
         homeostasis_probes: Optional[Dict[str, Any]] = None,
         homeostasis_function_overrides: Optional[Dict[str, str]] = None,
+        toolchain_mode: str = "auto",
+        emit_provenance: bool = True,
+        verify_reproducibility: bool = False,
+        sanitize: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes the full 9-stage multi-repository compilation pipeline with real AST->SSA->Native/LLVM/GCC/WASM
@@ -357,6 +363,12 @@ class OmniRepoCompiler:
         """
         # Fresh linker instance per compilation prevents cross-call module accumulation
         self.linker = NativeObjectLinker()
+
+        resolved_toolchain_mode = toolchain_mode.lower().strip()
+        if resolved_toolchain_mode not in ("auto", "aot_only", "federated_lto"):
+            raise ValueError(
+                f"Unsupported toolchain_mode '{toolchain_mode}'. Expected 'auto', 'aot_only', or 'federated_lto'."
+            )
 
         resolved_backend = backend.lower().strip()
         if resolved_backend not in ("native", "llvm", "wasm", "gcc", "homeostasis"):
@@ -489,6 +501,31 @@ class OmniRepoCompiler:
             "manifests": [m.repo_name for m in manifests],
             "salsa_ast_hits": self._salsa_hits,
             "salsa_ast_misses": self._salsa_misses,
+        }
+
+        # Stage 1.5 (Alpha-C96): Federated LLVM Bitcode / External Toolchain Object Ingestion
+        from frontends.toolchain_federation import FederatedBuildAdapter
+        fed_adapter = FederatedBuildAdapter(target_os=effective_os, target_arch=effective_arch)
+        federated_artifacts = fed_adapter.collect_federated_artifacts(
+            manifests,
+            parsed_symbols=set(all_ast_funcs.keys()),
+            toolchain_mode=resolved_toolchain_mode,
+        )
+        federated_bc_units = [a for a in federated_artifacts if a.artifact_kind in ("bitcode", "ir")]
+        federated_obj_units = [a for a in federated_artifacts if a.artifact_kind == "object"]
+        federated_archive_units = [a for a in federated_artifacts if a.artifact_kind == "static_archive"]
+        federated_defined_syms: Set[str] = {
+            sym for art in federated_artifacts for sym in art.defined_symbols
+        }
+        results["stages"]["federation"] = {
+            "toolchain_mode": resolved_toolchain_mode,
+            "available_toolchains": fed_adapter.available_summary(),
+            "federated_units_count": len(federated_artifacts),
+            "bitcode_units": len(federated_bc_units),
+            "object_units": len(federated_obj_units),
+            "static_archive_units": len(federated_archive_units),
+            "exported_symbols": sorted(federated_defined_syms),
+            "cross_lto_fused": False,
         }
 
         # Stage 2: Inter-Repo Topology Resolution
@@ -628,7 +665,9 @@ class OmniRepoCompiler:
         compilable_ast_pool = {
             k: v for k, v in all_ast_funcs.items() if k in retained_export_names
         }
-        native_compilable_syms = _compute_native_compilable_set(compilable_ast_pool)
+        native_compilable_syms = _compute_native_compilable_set(
+            compilable_ast_pool, external_defined_syms=federated_defined_syms
+        )
         from compiler.native_codegen import detect_host_simd_features
         host_os_name = "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "linux")
         host_avx512 = bool(
@@ -1350,12 +1389,30 @@ class OmniRepoCompiler:
         homeostasis_emitter_used = "native"
         homeostasis_function_emitters: Dict[str, str] = {}
         target_llvm = self._get_llvm_for_target(effective_os, effective_arch)
+        sanitizer_reports: List[Dict[str, Any]] = []
+        san_pass = None
+        if sanitize and sanitize.strip().lower() not in ("", "none"):
+            from compiler.sanitizer_pass import SanitizerInstrumentationPass
+            san_pass = SanitizerInstrumentationPass(mode=sanitize)
+
         for m, obj_mod, stub_list in repo_order_objs:
             repo_ssas = [
                 ssa_program[fn_n]
                 for fn_n, owner in unit_owner_repo.items()
                 if owner == m.repo_name
             ]
+            if san_pass is not None:
+                for _s_fn in repo_ssas:
+                    _s_rep = san_pass.instrument_function(_s_fn)
+                    sanitizer_reports.append({
+                        "function": _s_rep.function_name,
+                        "modes": _s_rep.modes,
+                        "ubsan_div_checks": _s_rep.ubsan_div_checks,
+                        "ubsan_shift_checks": _s_rep.ubsan_shift_checks,
+                        "asan_null_checks": _s_rep.asan_null_checks,
+                        "asan_bounds_checks": _s_rep.asan_bounds_checks,
+                        "trap_blocks_inserted": _s_rep.trap_blocks_inserted,
+                    })
             llvm_handled: Set[str] = set()
             prefer_gcc_emitter = False
             gcc_partition_ssas: Optional[List[SSAFunction]] = None
@@ -1635,12 +1692,54 @@ class OmniRepoCompiler:
                     homeostasis_function_emitters.setdefault(ssa_fn.name, "native")
 
             for stub_name, is_exp in stub_list:
+                if stub_name in federated_defined_syms:
+                    continue
                 stub_bytes = _default_entrypoint_bytes(effective_arch, effective_os)
                 obj_mod.add_symbol(stub_name, stub_bytes, is_exported=is_exp)
                 defined_symbols_across_mods.add(stub_name)
 
             if obj_mod.symbols or obj_mod.text_bytes:
                 self.linker.add_module(obj_mod)
+
+        # Ingest & Cross-LTO Fuse Federated Bitcode (.bc/.ll) & Object (.o/.obj) Modules (Alpha-C96)
+        if federated_bc_units:
+            fed_llvm = target_llvm if target_llvm is not None else self._get_llvm_for_target(effective_os, effective_arch)
+            if fed_llvm is not None:
+                fused_bc_mod = fed_llvm.link_bitcode_modules(
+                    [u.payload for u in federated_bc_units], optimize=True
+                )
+                bc_obj_bytes = fed_llvm.emit_object(fused_bc_mod)
+                if effective_os == "windows":
+                    fed_bc_obj = load_coff_object(bc_obj_bytes, repo_name="__omni_fed_bc")
+                elif effective_os == "macos":
+                    fed_bc_obj = load_macho_object(bc_obj_bytes, repo_name="__omni_fed_bc")
+                else:
+                    fed_bc_obj = load_elf_object(bc_obj_bytes, repo_name="__omni_fed_bc")
+                for sym_name, sym_def in fed_bc_obj.symbols.items():
+                    if getattr(sym_def, "section", ".text") == ".text" and sym_name not in defined_symbols_across_mods:
+                        sym_def.is_exported = True
+                        defined_symbols_across_mods.add(sym_name)
+                self.linker.add_module(fed_bc_obj)
+                results["stages"]["federation"]["cross_lto_fused"] = True
+
+        for f_idx, f_obj in enumerate(federated_obj_units):
+            if f_obj.object_format == "coff" or effective_os == "windows":
+                ext_mod = load_coff_object(f_obj.payload, repo_name=f"{f_obj.repo_name}_{f_idx}_fed_obj")
+            elif f_obj.object_format == "macho" or effective_os == "macos":
+                ext_mod = load_macho_object(f_obj.payload, repo_name=f"{f_obj.repo_name}_{f_idx}_fed_obj")
+            else:
+                ext_mod = load_elf_object(f_obj.payload, repo_name=f"{f_obj.repo_name}_{f_idx}_fed_obj")
+            for sym_name, sym_def in ext_mod.symbols.items():
+                if getattr(sym_def, "section", ".text") == ".text" and sym_name not in defined_symbols_across_mods:
+                    sym_def.is_exported = True
+                    defined_symbols_across_mods.add(sym_name)
+            self.linker.add_module(ext_mod)
+
+        for a_idx, f_ar in enumerate(federated_archive_units):
+            self.linker.add_static_archive(
+                f_ar.payload,
+                repo_name=f"{f_ar.repo_name}_{a_idx}_fed_ar",
+            )
 
         # Synthesize `entry_export` if not present in any input repository
         if entry_export not in defined_symbols_across_mods:
@@ -1774,6 +1873,15 @@ class OmniRepoCompiler:
             "effective_arch": effective_arch,
         }
 
+        if sanitizer_reports:
+            results["stages"]["sanitizers"] = {
+                "enabled": True,
+                "mode": sanitize,
+                "functions_instrumented": len(sanitizer_reports),
+                "total_traps_inserted": sum(r["trap_blocks_inserted"] for r in sanitizer_reports),
+                "reports": sanitizer_reports,
+            }
+
         # Stage 5.5a: Pre-Link Assembly Invariant Audit (Halts pipeline BEFORE linking on corrupt machine code!)
         asm_all_valid = True
         if effective_arch == "x86_64":
@@ -1797,7 +1905,7 @@ class OmniRepoCompiler:
                     next_off = sorted_syms[idx_s + 1].offset if idx_s + 1 < len(sorted_syms) else sym_def.offset + sym_def.size
                     end_off = min(sym_def.offset + sym_def.size, next_off)
                     fn_slice = bytes(mod.text_bytes[sym_def.offset:end_off])
-                    if resolved_backend in ("llvm", "gcc", "homeostasis"):
+                    if resolved_backend in ("llvm", "gcc", "homeostasis") or getattr(mod, "repo_name", "").endswith(("_llvm", "_gcc", "_fed_bc", "_fed_obj")):
                         changed = True
                         while changed and fn_slice:
                             changed = False
@@ -1822,7 +1930,10 @@ class OmniRepoCompiler:
         results["stages"]["linking"] = {
             "success": link_res["success"],
             "total_text_size": link_res["total_text_size"],
+            "total_data_size": link_res.get("total_data_size", 0),
+            "total_bss_size": link_res.get("total_bss_size", 0),
             "relocations_applied": link_res["relocations_applied"],
+            "abs64_relocs_count": len(link_res.get("abs64_reloc_rvas", [])),
             "exported_symbols": sorted(link_res["exported_symbols"].keys()),
             "external_os_imports": sorted((link_res.get("external_os_imports") or {}).keys()),
         }
@@ -2062,6 +2173,99 @@ class OmniRepoCompiler:
             formal_proofs_passed=formal_proofs,
         )
         save_audit_ledger(ledger_record, ledger_path)
+
+        # Stage 9.5 (Alpha-C98): CycloneDX 1.5 SBOM + Signed Ed25519 DSSE SLSA v1.0 Provenance + Reproducibility Check
+        if emit_provenance:
+            from packaging.packager import PackagerEngine
+
+            bin_sha256 = hashlib.sha256(bin_data).hexdigest()
+            sbom_components = [
+                {
+                    "type": "library",
+                    "name": getattr(m, "repo_name", f"repo_{idx}"),
+                    "version": "1.0.0",
+                    "properties": [
+                        {"name": "omni:source_files", "value": str(len(getattr(m, "files", []) or []))}
+                    ],
+                }
+                for idx, m in enumerate(manifests)
+            ]
+            for f_art in federated_artifacts:
+                sbom_components.append({
+                    "type": "library",
+                    "name": os.path.basename(f_art.source_path),
+                    "version": f_art.toolchain_used,
+                    "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(f_art.payload).hexdigest()}],
+                })
+            packager = PackagerEngine()
+            sbom_path = artifact_path + ".cdx.json"
+            sbom_obj = packager.build_cyclonedx_sbom(
+                artifact_name=os.path.basename(artifact_path),
+                artifact_sha256=bin_sha256,
+                components=sbom_components,
+                out_path=sbom_path,
+            )
+            prov_path = artifact_path + ".intoto.jsonl"
+            prov_env, prov_pubkey = packager.generate_slsa_provenance(
+                subjects=[artifact_path],
+                sbom=sbom_obj,
+                out_path=prov_path,
+            )
+            results["sbom_path"] = sbom_path
+            results["provenance_path"] = prov_path
+            results["stages"]["supply_chain"] = {
+                "sbom_format": "CycloneDX-1.5",
+                "sbom_path": sbom_path,
+                "provenance_format": "in-toto-v1+SLSA-v1.0+Ed25519-DSSE",
+                "provenance_path": prov_path,
+                "keyid": prov_env["signatures"][0]["keyid"],
+                "public_key_b64": prov_env.get("publicKeyB64"),
+                "artifact_sha256": bin_sha256,
+            }
+
+        if verify_reproducibility:
+            import tempfile
+            bin_sha_1 = hashlib.sha256(bin_data).hexdigest()
+            with tempfile.TemporaryDirectory() as rep_td:
+                rep_out_base = os.path.join(rep_td, os.path.basename(output_path))
+                rep_compiler = OmniRepoCompiler()
+                try:
+                    rep_res = rep_compiler.compile_repositories(
+                        repo_paths=repo_paths,
+                        output_path=rep_out_base,
+                        target_format=target_format,
+                        entry_export=entry_export,
+                        target_os=target_os,
+                        target_arch=target_arch,
+                        audit_nonce=audit_nonce,
+                        export_all=export_all,
+                        emit_debug_info=emit_debug_info,
+                        backend=backend,
+                        speculative_targets=speculative_targets,
+                        homeostasis_policy=homeostasis_policy,
+                        homeostasis_probes=homeostasis_probes,
+                        homeostasis_function_overrides=homeostasis_function_overrides,
+                        toolchain_mode=toolchain_mode,
+                        emit_provenance=False,
+                        verify_reproducibility=False,
+                        sanitize=sanitize,
+                    )
+                    rep_art = rep_res["stages"]["emission"]["artifact_path"]
+                    with open(rep_art, "rb") as rf:
+                        bin_sha_2 = hashlib.sha256(rf.read()).hexdigest()
+                finally:
+                    rep_compiler.close()
+            if bin_sha_1 != bin_sha_2:
+                raise RuntimeError(
+                    f"Bit-for-bit reproducibility verification FAILED: run1={bin_sha_1} != run2={bin_sha_2}"
+                )
+            results["stages"]["reproducibility"] = {
+                "verified": True,
+                "bit_for_bit_equal": True,
+                "sha256_run1": bin_sha_1,
+                "sha256_run2": bin_sha_2,
+            }
+
         _timings_ms["stage7_9_emit_audit_ledger"] = round((time.perf_counter() - _t_stage) * 1000.0, 2)
         _timings_ms["total_measured_stages"] = round(sum(_timings_ms.values()), 2)
         results["stages"]["timings_ms"] = _timings_ms

@@ -89,3 +89,34 @@ class PackagerEngine:
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(json.dumps(envelope, sort_keys=True) + "\n")
         return envelope, gen.public_key
+
+    def build_cyclonedx_sbom(
+        self,
+        artifact_name: str,
+        artifact_sha256: str,
+        components: list,
+        out_path: str = None,
+    ) -> dict:
+        """Builds a canonical deterministic CycloneDX 1.5 SBOM JSON document."""
+        import json
+
+        sbom = {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "serialNumber": f"urn:uuid:00000000-0000-4000-8000-{artifact_sha256[:12]}",
+            "metadata": {
+                "component": {
+                    "type": "application",
+                    "name": artifact_name,
+                    "hashes": [{"alg": "SHA-256", "content": artifact_sha256}],
+                },
+                "tools": [{"vendor": "OmniCompiler", "name": "omnicc", "version": "2.0.0"}],
+            },
+            "components": list(components),
+        }
+        if out_path:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(sbom, sort_keys=True, indent=2) + "\n")
+        return sbom
