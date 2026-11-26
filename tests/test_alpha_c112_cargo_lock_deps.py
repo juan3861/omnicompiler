@@ -1,5 +1,6 @@
 """Alpha-C112 verification: Rust Cargo.lock, vendor/offline Cargo DAG, build.rs & CycloneDX SBOM."""
 
+import hashlib
 import json
 import os
 import sys
@@ -21,12 +22,21 @@ class TestAlphaC112CargoLockDeps(unittest.TestCase):
             with open(os.path.join(tmp, ".cargo", "config.toml"), "w", encoding="utf-8") as f:
                 f.write('[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "vendor"\n')
 
+            vendor_cargo_toml = '[package]\nname = "tiny_hash"\nversion = "0.4.2"\nedition = "2021"\n'
+            vendor_lib_rs = "pub fn mix32(x: u32) -> u32 { x.wrapping_mul(2654435761) ^ 0xA5A5 }\n"
             with open(os.path.join(vendor_crate, "Cargo.toml"), "w", encoding="utf-8") as f:
-                f.write('[package]\nname = "tiny_hash"\nversion = "0.4.2"\nedition = "2021"\n')
+                f.write(vendor_cargo_toml)
             with open(os.path.join(vendor_crate, "src", "lib.rs"), "w", encoding="utf-8") as f:
-                f.write("pub fn mix32(x: u32) -> u32 { x.wrapping_mul(2654435761) ^ 0xA5A5 }\n")
+                f.write(vendor_lib_rs)
+            cksum_manifest = {
+                "package": "a" * 64,
+                "files": {
+                    "Cargo.toml": hashlib.sha256(vendor_cargo_toml.encode("utf-8")).hexdigest(),
+                    "src/lib.rs": hashlib.sha256(vendor_lib_rs.encode("utf-8")).hexdigest(),
+                },
+            }
             with open(os.path.join(vendor_crate, ".cargo-checksum.json"), "w", encoding="utf-8") as f:
-                f.write('{"files":{}}')
+                json.dump(cksum_manifest, f)
 
             with open(os.path.join(tmp, "Cargo.toml"), "w", encoding="utf-8") as f:
                 f.write(
@@ -81,7 +91,8 @@ class TestAlphaC112CargoLockDeps(unittest.TestCase):
 
             if adapter.native_tools.get("cargo") or (sys.platform == "win32" and adapter.wsl_tools.get("cargo")):
                 arts = adapter._compile_cargo_workspace(tmp, "c112_rust_repo")
-                self.assertGreater(len(arts), 0)
+                err_msg = adapter._last_cargo_workspaces.get("c112_rust_repo", {}).get("cargo_build_stderr", "")
+                self.assertGreater(len(arts), 0, f"Cargo workspace build failed: {err_msg}")
                 self.assertIn("cargo", arts[0].toolchain_used)
 
             # Verify CycloneDX 1.5 SBOM captures locked Rust crates & checksums automatically

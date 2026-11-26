@@ -826,9 +826,11 @@ class FederatedBuildAdapter:
                     env_c = dict(os.environ)
                     env_c["CARGO_TARGET_DIR"] = c_td
                     cmd_c = [cargo_bin, "build", "--release", *offline_args, "--manifest-path", os.path.join(repo_path, "Cargo.toml")]
-                    proc_c = subprocess.run(cmd_c, env=env_c, capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+                    proc_c = subprocess.run(cmd_c, env=env_c, cwd=repo_path, capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
                 if use_wsl_rust:
                     proc_c = subprocess.run(cmd_c, capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+                if proc_c.returncode != 0:
+                    info["cargo_build_stderr"] = (proc_c.stderr or proc_c.stdout or "").strip()
                 if proc_c.returncode == 0:
                     rel_dir = os.path.join(c_td, "release")
                     for fn in sorted(os.listdir(rel_dir)) if os.path.isdir(rel_dir) else []:
