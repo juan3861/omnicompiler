@@ -361,6 +361,8 @@ class OmniRepoCompiler:
         auto_pgo: bool = False,
         gc_sections: bool = False,
         icf_folding: bool = False,
+        emit_sarif: bool = False,
+        sarif_out_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes the full 9-stage multi-repository compilation pipeline with real AST->SSA->Native/LLVM/GCC/WASM
@@ -1737,29 +1739,43 @@ class OmniRepoCompiler:
             if obj_mod.symbols or obj_mod.text_bytes:
                 self.linker.add_module(obj_mod)
 
-        # Ingest & Cross-LTO Fuse Federated Bitcode (.bc/.ll) & Object (.o/.obj) Modules (Alpha-C96)
+        # Ingest & Cross-LTO Fuse Federated Bitcode (.bc/.ll) & Object (.o/.obj) Modules (Alpha-C96 / C114 ThinLTO Shards)
         if federated_bc_units:
             fed_llvm = target_llvm if target_llvm is not None else self._get_llvm_for_target(effective_os, effective_arch)
             if fed_llvm is not None:
-                fused_bc_mod = fed_llvm.link_bitcode_modules(
-                    [u.payload for u in federated_bc_units], optimize=True
-                )
-                bc_obj_bytes = fed_llvm.emit_object(fused_bc_mod)
-                if effective_os == "windows":
-                    fed_bc_obj = load_coff_object(bc_obj_bytes, repo_name="__omni_fed_bc")
-                elif effective_os == "macos":
-                    fed_bc_obj = load_macho_object(bc_obj_bytes, repo_name="__omni_fed_bc")
+                use_thin_shards = (distributed_workers >= 2 and len(federated_bc_units) >= 2)
+                if use_thin_shards:
+                    thin_res = fed_llvm.thin_lto_partition(
+                        [u.payload for u in federated_bc_units],
+                        num_shards=min(distributed_workers, len(federated_bc_units)),
+                    )
+                    obj_blobs = thin_res["shard_objects"]
+                    results["stages"]["federation"]["thin_lto_shards"] = thin_res["num_shards"]
+                    results["stages"]["federation"]["thin_lto_summary_symbols"] = len(thin_res["summary_symbols"])
+                    results["stages"]["federation"]["thin_lto_cross_edges"] = len(thin_res["cross_module_edges"])
                 else:
-                    fed_bc_obj = load_elf_object(bc_obj_bytes, repo_name="__omni_fed_bc")
-                for sym_name, sym_def in fed_bc_obj.symbols.items():
-                    if (
-                        getattr(sym_def, "section", ".text") == ".text"
-                        and not sym_name.startswith(("__elf_sec_", "__coff_sec_", "__macho_sec_"))
-                        and sym_name not in defined_symbols_across_mods
-                    ):
-                        sym_def.is_exported = True
-                        defined_symbols_across_mods.add(sym_name)
-                self.linker.add_module(fed_bc_obj)
+                    fused_bc_mod = fed_llvm.link_bitcode_modules(
+                        [u.payload for u in federated_bc_units], optimize=True
+                    )
+                    obj_blobs = [fed_llvm.emit_object(fused_bc_mod)]
+
+                for sh_i, bc_obj_bytes in enumerate(obj_blobs):
+                    sh_repo = f"__omni_shard{sh_i}_fed_bc" if len(obj_blobs) > 1 else "__omni_fed_bc"
+                    if effective_os == "windows":
+                        fed_bc_obj = load_coff_object(bc_obj_bytes, repo_name=sh_repo)
+                    elif effective_os == "macos":
+                        fed_bc_obj = load_macho_object(bc_obj_bytes, repo_name=sh_repo)
+                    else:
+                        fed_bc_obj = load_elf_object(bc_obj_bytes, repo_name=sh_repo)
+                    for sym_name, sym_def in fed_bc_obj.symbols.items():
+                        if (
+                            getattr(sym_def, "section", ".text") == ".text"
+                            and not sym_name.startswith(("__elf_sec_", "__coff_sec_", "__macho_sec_"))
+                            and sym_name not in defined_symbols_across_mods
+                        ):
+                            sym_def.is_exported = True
+                            defined_symbols_across_mods.add(sym_name)
+                    self.linker.add_module(fed_bc_obj)
                 results["stages"]["federation"]["cross_lto_fused"] = True
 
         for f_idx, f_obj in enumerate(federated_obj_units):
@@ -2328,6 +2344,29 @@ class OmniRepoCompiler:
                     "version": f_art.toolchain_used,
                     "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(f_art.payload).hexdigest()}],
                 })
+            # Ingest Cargo.lock external crate dependencies & checksums into CycloneDX 1.5 SBOM (Alpha-C112)
+            seen_cargo_purls: set = set()
+            for m in manifests:
+                rdir = getattr(m, "repo_path", "")
+                if rdir and os.path.isfile(os.path.join(rdir, "Cargo.lock")):
+                    from frontends.toolchain_federation import FederatedBuildAdapter
+                    c_lock = FederatedBuildAdapter(target_os=effective_os, target_arch=effective_arch).inspect_cargo_lock(rdir)
+                    for cp in c_lock.get("packages", []):
+                        cname = cp["name"]
+                        cver = cp.get("version", "0.0.0")
+                        purl = f"pkg:cargo/{cname}@{cver}"
+                        if purl in seen_cargo_purls:
+                            continue
+                        seen_cargo_purls.add(purl)
+                        comp_ent: Dict[str, Any] = {
+                            "type": "library",
+                            "name": cname,
+                            "version": cver,
+                            "purl": purl,
+                        }
+                        if cp.get("checksum"):
+                            comp_ent["hashes"] = [{"alg": "SHA-256", "content": cp["checksum"]}]
+                        sbom_components.append(comp_ent)
             packager = PackagerEngine()
             sbom_path = artifact_path + ".cdx.json"
             sbom_obj = packager.build_cyclonedx_sbom(
@@ -2407,6 +2446,32 @@ class OmniRepoCompiler:
         results["stages"]["timings_ms"] = _timings_ms
         results["stages"]["audit_ledger"] = ledger_record
         results["ledger_path"] = ledger_path
+
+        if emit_sarif or sarif_out_path:
+            try:
+                from packaging.sarif_exporter import SARIFExporter
+            except ModuleNotFoundError:
+                import importlib.util
+                _sarif_mod_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "packaging", "sarif_exporter.py")
+                _spec = importlib.util.spec_from_file_location("_omni_sarif_exporter", _sarif_mod_path)
+                _mod = importlib.util.module_from_spec(_spec)
+                assert _spec is not None and _spec.loader is not None
+                _spec.loader.exec_module(_mod)
+                SARIFExporter = _mod.SARIFExporter
+
+            eff_sarif = sarif_out_path or (artifact_path + ".sarif")
+            sarif_doc = SARIFExporter.write_sarif(
+                results,
+                eff_sarif,
+                artifact_path=artifact_path,
+                repo_paths=repo_paths,
+            )
+            results["sarif_path"] = eff_sarif
+            results["stages"]["sarif"] = {
+                "schema": sarif_doc.get("version", "2.1.0"),
+                "sarif_path": eff_sarif,
+                "results_count": len((sarif_doc.get("runs") or [{}])[0].get("results", [])),
+            }
 
         results["success"] = True
         return results

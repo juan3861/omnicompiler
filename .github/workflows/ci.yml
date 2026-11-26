@@ -95,6 +95,16 @@ jobs:
         python run_c108_tests.py
         python run_c109_tests.py
 
+    - name: 13. Verify C111-C115 MSVC SEH/PDB, Cargo.lock, Meson/Make/ARM64 EH, ThinLTO LZ4 & SARIF/LSP
+      run: |
+        python benchmarks/oss_real_library_bench.py
+        python run_c111_tests.py
+        python run_c112_tests.py
+        python run_c113_tests.py
+        python run_c114_tests.py
+        python run_c115_tests.py
+        python -c "import os, tempfile, json, pathlib; from omnicc_cli import main; d = tempfile.mkdtemp(); r = os.path.join(d, 'r'); os.makedirs(r); pathlib.Path(r, 'm.py').write_text('def omni_main(x: int) -> int:\n    return (x // 2) + 1\n', encoding='utf-8'); out = os.path.join(d, 'o'); sp = os.path.join(d, 'o.sarif'); assert main(['build', '--repos', r, '--output', out, '--sanitize', 'ubsan', '--no-provenance', '--sarif', sp, '--json']) == 0; doc = json.loads(pathlib.Path(sp).read_text(encoding='utf-8')); assert doc['version'] == '2.1.0'"
+
   verify-macos-arm64:
     name: Apple Silicon ARM64 Mach-O & Native Execution (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -293,8 +293,16 @@ class AssemblyInvariantAuditor:
                 free_sizes.append(matched)
 
         total_alloc = stack_alloc + prologue_push_bytes if (stack_free > 0 or stack_alloc > 0) else 0
-        stack_balanced = (total_alloc == stack_free) or (
-            total_alloc > 0 and len(free_sizes) >= 1 and all(f == total_alloc for f in free_sizes)
+        has_page_probe = (b"\x48\x81\xec\x00\x10\x00\x00" in code_bytes)
+        stack_balanced = (
+            (total_alloc == stack_free)
+            or (total_alloc > 0 and len(free_sizes) >= 1 and all(f == total_alloc for f in free_sizes))
+            or (
+                has_page_probe
+                and total_alloc > 0
+                and len(free_sizes) >= 1
+                and all(f >= total_alloc and (f - total_alloc) % 4096 == 0 for f in free_sizes)
+            )
         )
         if not stack_balanced:
             errors.append(f"Stack frame imbalance in {symbol_name}: allocated {total_alloc} bytes but freed {stack_free} bytes")

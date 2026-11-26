@@ -46,6 +46,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             auto_pgo=args.auto_pgo,
             gc_sections=args.gc_sections,
             icf_folding=args.icf,
+            emit_sarif=(args.sarif is not None),
+            sarif_out_path=(args.sarif if args.sarif else None),
         )
     finally:
         compiler.close()
@@ -56,6 +58,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "artifact_path": res["stages"]["emission"]["artifact_path"],
             "sbom_path": res.get("sbom_path"),
             "provenance_path": res.get("provenance_path"),
+            "sarif_path": res.get("sarif_path"),
+            "sarif": res["stages"].get("sarif"),
             "reproducibility": res["stages"].get("reproducibility"),
             "sanitizers": res["stages"].get("sanitizers"),
             "federation": res["stages"].get("federation"),
@@ -69,6 +73,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
             print(f"[omnicc] SBOM:  {res['sbom_path']}")
         if res.get("provenance_path"):
             print(f"[omnicc] SLSA:  {res['provenance_path']}")
+        if res.get("sarif_path"):
+            print(f"[omnicc] SARIF: {res['sarif_path']}")
     return 0
 
 
@@ -189,6 +195,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_b.add_argument("--export-all", action="store_true")
     p_b.add_argument("--no-provenance", action="store_true")
     p_b.add_argument("--repro-check", action="store_true")
+    p_b.add_argument("--sarif", nargs="?", const="", default=None, help="Emit OASIS SARIF 2.1.0 report (optional path, default <artifact>.sarif)")
     p_b.add_argument("--json", action="store_true")
     p_b.set_defaults(func=_cmd_build)
 

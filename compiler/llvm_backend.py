@@ -192,6 +192,93 @@ class LLVMBackend:
 
         return base_mod
 
+    def thin_lto_partition(
+        self,
+        units: Sequence[Union[bytes, str, Any]],
+        num_shards: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Builds a ThinLTO combined module summary index (defined exports & external imports),
+        partitions bitcode/IR units across `num_shards`, and optimizes/emits relocatable objects
+        concurrently across shards for multi-worker builds.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        if not self.is_available:
+            raise RuntimeError("LLVM backend is not available.")
+        if not units:
+            raise ValueError("thin_lto_partition requires at least one IR/Bitcode unit.")
+
+        tm_ref = self._obj_target_machine or self._target_machine
+        eff_triple = tm_ref.triple if tm_ref is not None else self.target_triple
+        exports_by_unit: List[List[str]] = []
+        imports_by_unit: List[List[str]] = []
+        owner_of_sym: Dict[str, int] = {}
+        bc_bytes_list: List[bytes] = []
+
+        for u_idx, item in enumerate(units):
+            m = self.parse_ir_or_bitcode(item, optimize=False) if isinstance(item, (bytes, bytearray, str)) else item
+            try:
+                m.triple = eff_triple
+            except Exception:
+                pass
+            bc_bytes_list.append(m.as_bitcode())
+            defs: List[str] = []
+            decls: List[str] = []
+            for fn in m.functions:
+                if fn.name.startswith("llvm."):
+                    continue
+                if fn.is_declaration:
+                    decls.append(fn.name)
+                else:
+                    defs.append(fn.name)
+                    owner_of_sym.setdefault(fn.name, u_idx)
+            exports_by_unit.append(sorted(set(defs)))
+            imports_by_unit.append(sorted(set(decls)))
+
+        cross_edges: List[Tuple[int, int, str]] = []
+        for src_idx, decls in enumerate(imports_by_unit):
+            for sym in decls:
+                tgt_idx = owner_of_sym.get(sym)
+                if tgt_idx is not None and tgt_idx != src_idx:
+                    cross_edges.append((src_idx, tgt_idx, sym))
+
+        n_shards = min(len(bc_bytes_list), max(1, int(num_shards)))
+        shard_buckets: List[List[bytes]] = [[] for _ in range(n_shards)]
+        for u_idx, bc_b in enumerate(bc_bytes_list):
+            shard_buckets[u_idx % n_shards].append(bc_b)
+
+        def _compile_shard(bucket: List[bytes]) -> bytes:
+            shard_tm = self._target.create_target_machine(
+                cpu=self._cpu, opt=self.opt_level, reloc="pic", codemodel="small"
+            )
+            base_m = llvm.parse_bitcode(bucket[0])
+            base_m.triple = eff_triple
+            for extra_b in bucket[1:]:
+                sub_m = llvm.parse_bitcode(extra_b)
+                sub_m.triple = eff_triple
+                base_m.link_in(sub_m, preserve=False)
+            base_m.verify()
+            pto = llvm.create_pipeline_tuning_options(speed_level=self.opt_level)
+            pto.loop_vectorization = True
+            pto.slp_vectorization = True
+            pto.loop_unrolling = True
+            pb = llvm.create_pass_builder(shard_tm, pto)
+            pb.getModulePassManager().run(base_m, pb)
+            return shard_tm.emit_object(base_m)
+
+        with ThreadPoolExecutor(max_workers=n_shards) as pool:
+            shard_objects = list(pool.map(_compile_shard, shard_buckets))
+
+        return {
+            "num_shards": n_shards,
+            "summary_symbols": sorted(owner_of_sym.keys()),
+            "exports_by_unit": exports_by_unit,
+            "imports_by_unit": imports_by_unit,
+            "cross_module_edges": cross_edges,
+            "shard_objects": shard_objects,
+        }
+
     def emit_assembly(self, mod: Any) -> str:
         """Emits target assembly code text from an LLVM module."""
         if not self.is_available:

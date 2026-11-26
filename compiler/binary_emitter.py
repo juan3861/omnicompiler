@@ -364,6 +364,88 @@ class StandaloneBinaryEmitter:
     # 2. WINDOWS PE32+ (AMD64) MULTI-EXPORT SHARED LIBRARY (.DLL) + UNWIND
     # =========================================================================
 
+    @staticmethod
+    def build_pdb_msf_rsds(
+        dll_name: str,
+        exports_map: Dict[str, int],
+        base_fn_rva: int = 0x1010,
+        pdb_guid: Optional[bytes] = None,
+        age: int = 1,
+    ) -> Tuple[bytes, bytes, bytes]:
+        """
+        Synthesizes a deterministic Microsoft CodeView RSDS debug record and
+        a standards-compliant MSF 7.0 `.pdb` symbol container mapping exported
+        functions for Windows debuggers (`WinDbg`, `pefile`, `llvm-pdbutil`).
+        """
+        if pdb_guid is None:
+            sig_seed = f"{dll_name}:{sorted(exports_map.items())}".encode("utf-8")
+            pdb_guid = hashlib.sha256(sig_seed).digest()[:16]
+        pdb_base = os.path.splitext(os.path.basename(dll_name))[0] + ".pdb"
+        rsds_record = b"RSDS" + pdb_guid + struct.pack("<I", age) + pdb_base.encode("utf-8") + b"\x00"
+
+        block_size = 4096
+        # Stream 0: old directory (0B)
+        # Stream 1: PDB Info stream (Version 20000404 + Signature + Age + GUID + NamedMapSize=0)
+        s1_info = struct.pack("<III16sI", 20000404, 0x6F6D6E69, age, pdb_guid, 0)
+        # Stream 2: TPI minimal 56-byte header (Version 20040203)
+        s2_tpi = struct.pack("<IIIIIIIIIIIIII", 20040203, 56, 0x1000, 0x1000, 0, 0xFFFFFFFF, 0, 0, 0, 0, 0, 0, 0, 0)
+        # Stream 3: DBI header (64B) + encoded public export table payload
+        sym_recs = bytearray()
+        for sym_name, sym_off in sorted(exports_map.items(), key=lambda kv: kv[0]):
+            name_b = sym_name.encode("utf-8") + b"\x00"
+            rec_len = 14 + len(name_b)
+            sym_recs.extend(struct.pack("<HHIIH", rec_len, 0x110E, 2, base_fn_rva + int(sym_off), 1) + name_b)
+            while len(sym_recs) % 4:
+                sym_recs.append(0)
+        s3_dbi = struct.pack("<IiiiHHIiiHIIHHII", 0xFFFFFFFF, 19990903, age, -1, 0, 0, 0, len(sym_recs), 0, 0, 0, 0, 0, 0, 0, 0)[:64]
+        s3_full = s3_dbi + bytes(sym_recs)
+        s4_ipi = struct.pack("<IIIIIIIIIIIIII", 20040203, 56, 0x1000, 0x1000, 0, 0xFFFFFFFF, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        streams = [b"", s1_info, s2_tpi, s3_full, s4_ipi]
+        stream_blocks: List[List[int]] = []
+        next_blk = 5  # Blocks: 0=Super, 1=FPM0, 2=FPM1, 3=DirMap, 4=Dir
+        for st in streams:
+            n_b = (len(st) + block_size - 1) // block_size if st else 0
+            blks = list(range(next_blk, next_blk + n_b))
+            stream_blocks.append(blks)
+            next_blk += n_b
+
+        dir_bytes = bytearray()
+        dir_bytes.extend(struct.pack("<I", len(streams)))
+        for st in streams:
+            dir_bytes.extend(struct.pack("<I", len(st)))
+        for blks in stream_blocks:
+            for b in blks:
+                dir_bytes.extend(struct.pack("<I", b))
+
+        num_dir_blocks = (len(dir_bytes) + block_size - 1) // block_size
+        # Reserve block 4..4+num_dir_blocks-1 if needed (stream sizes fit comfortably in 1 block < 4096)
+        assert num_dir_blocks == 1, "Stream directory overflowed 1 block"
+        num_blocks = next_blk
+
+        msf = bytearray(num_blocks * block_size)
+        magic = b"Microsoft C/C++ MSF 7.00\r\n\x1a\x44\x53\x00\x00\x00"
+        super_blk = struct.pack("<32sIIIIII", magic, block_size, 1, num_blocks, len(dir_bytes), 0, 3)
+        msf[0:len(super_blk)] = super_blk
+
+        # Free Page Maps (Block 1 and Block 2)
+        fpm = bytearray(b"\xff" * block_size)
+        for b_idx in range(num_blocks):
+            fpm[b_idx // 8] &= ~(1 << (b_idx % 8))
+        msf[1 * block_size:2 * block_size] = fpm
+        msf[2 * block_size:3 * block_size] = fpm
+
+        # Block 3: Directory Block Map -> [4]
+        msf[3 * block_size:3 * block_size + 4] = struct.pack("<I", 4)
+        # Block 4: Stream Directory
+        msf[4 * block_size:4 * block_size + len(dir_bytes)] = dir_bytes
+        # Blocks 5..: Stream data
+        for st, blks in zip(streams, stream_blocks):
+            if st and blks:
+                msf[blks[0] * block_size:blks[0] * block_size + len(st)] = st
+
+        return rsds_record, bytes(msf), pdb_guid
+
     def build_pe64_dll(
         self,
         func_code: bytes,
@@ -382,6 +464,9 @@ class StandaloneBinaryEmitter:
         fini_array_size: int = 0,
         tdata_bytes: Optional[bytes] = None,
         tbss_size: int = 0,
+        pdata_prelinked: bool = False,
+        emit_pdb_path: Optional[str] = None,
+        emit_debug_dir: bool = True,
     ) -> bytes:
         """
         Builds a compliant Windows PE32+ (AMD64) Dynamic Link Library (.dll)
@@ -544,15 +629,16 @@ class StandaloneBinaryEmitter:
             pdata_dir_size = len(pdata_raw)
             xdata_off_in_sec = self._align_up(len(pdata_raw), 8)
             patched_pdata = bytearray(pdata_raw)
-            fn_rva_shift = base_fn_rva - 0x1000
-            for p_off in range(0, len(patched_pdata), 12):
-                if p_off + 12 <= len(patched_pdata):
-                    b_rva, e_rva, u_off = struct.unpack_from("<III", patched_pdata, p_off)
-                    if b_rva >= 0x1000:
-                        b_rva += fn_rva_shift
-                        e_rva += fn_rva_shift
-                    rel_xdata_off = u_off if u_off < len(xdata_raw) else 0
-                    struct.pack_into("<III", patched_pdata, p_off, b_rva, e_rva, rva_pdata + xdata_off_in_sec + rel_xdata_off)
+            if not pdata_prelinked:
+                fn_rva_shift = base_fn_rva - 0x1000
+                for p_off in range(0, len(patched_pdata), 12):
+                    if p_off + 12 <= len(patched_pdata):
+                        b_rva, e_rva, u_off = struct.unpack_from("<III", patched_pdata, p_off)
+                        if b_rva >= 0x1000:
+                            b_rva += fn_rva_shift
+                            e_rva += fn_rva_shift
+                        rel_xdata_off = u_off if u_off < len(xdata_raw) else 0
+                        struct.pack_into("<III", patched_pdata, p_off, b_rva, e_rva, rva_pdata + xdata_off_in_sec + rel_xdata_off)
             combined_unwind = bytes(patched_pdata).ljust(xdata_off_in_sec, b"\x00") + xdata_raw
             raw_pdata_len = len(combined_unwind)
             raw_pdata = combined_unwind.ljust(self._align_up(max(1, raw_pdata_len), file_align), b"\x00")
@@ -631,10 +717,26 @@ class StandaloneBinaryEmitter:
             tls_vspan = self._align_up(len(raw_tls_sec), sec_align)
             tls_reloc_rvas = [tls_dir_rva, tls_dir_rva + 8, tls_dir_rva + 16]
 
+        # Optional CodeView RSDS Debug Directory (.debug) + MSF 7.0 .pdb
+        has_debug_sec = bool(emit_debug_dir or emit_pdb_path)
+        rva_debug = rva_tls + tls_vspan
+        raw_debug_sec = b""
+        raw_debug_len = 0
+        debug_vspan = 0
+        if has_debug_sec:
+            rsds_rec, pdb_bytes, _guid = self.build_pdb_msf_rsds(dll_name, exports_map, base_fn_rva=base_fn_rva)
+            if emit_pdb_path:
+                self._write_file(emit_pdb_path, pdb_bytes)
+            raw_debug_len = 28 + len(rsds_rec)
+            # Defer PointerToRawData fill until size_of_headers is computed below
+            raw_debug_sec = bytearray(self._align_up(max(1, raw_debug_len), file_align))
+            raw_debug_sec[28:28 + len(rsds_rec)] = rsds_rec
+            debug_vspan = self._align_up(len(raw_debug_sec), sec_align)
+
         # Optional .reloc Base Relocation Table (`IMAGE_REL_BASED_DIR64`)
         reloc_list = sorted(set([int(r) for r in (abs64_reloc_rvas or [])] + tls_reloc_rvas))
         has_reloc = bool(reloc_list)
-        rva_reloc = rva_tls + tls_vspan
+        rva_reloc = rva_debug + debug_vspan
         raw_reloc_sec = b""
         raw_reloc_len = 0
         reloc_vspan = 0
@@ -669,15 +771,41 @@ class StandaloneBinaryEmitter:
             + (1 if has_pdata else 0)
             + (1 if has_data_sec else 0)
             + (1 if has_tls_sec else 0)
+            + (1 if has_debug_sec else 0)
             + (1 if has_reloc else 0)
         )
         size_of_headers = self._align_up(64 + 64 + 4 + 20 + 96 + (16 * 8) + (40 * num_sections), file_align)
+        if has_debug_sec:
+            ptr_to_debug_sec = (
+                size_of_headers
+                + len(raw_text)
+                + len(raw_edata)
+                + len(raw_idata)
+                + len(raw_pdata)
+                + len(raw_data_sec)
+                + len(raw_tls_sec)
+            )
+            struct.pack_into(
+                "<IIHHIIII",
+                raw_debug_sec,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,  # IMAGE_DEBUG_TYPE_CODEVIEW
+                raw_debug_len - 28,
+                rva_debug + 28,
+                ptr_to_debug_sec + 28,
+            )
+            raw_debug_sec = bytes(raw_debug_sec)
+
         coff = struct.pack("<HHIIIHH", 0x8664, num_sections, 0, 0, 0, 240, 0x2022)
 
         opt = struct.pack(
             "<HBBIIIIIQIIHHHHHHIIIIHHQQQQII",
             0x020B, 14, 0,
-            len(raw_text), len(raw_edata) + len(raw_idata) + len(raw_pdata) + len(raw_data_sec) + len(raw_tls_sec) + len(raw_reloc_sec), max(0, int(bss_size)),
+            len(raw_text), len(raw_edata) + len(raw_idata) + len(raw_pdata) + len(raw_data_sec) + len(raw_tls_sec) + len(raw_debug_sec) + len(raw_reloc_sec), max(0, int(bss_size)),
             0x1000, 0x1000,
             image_base,
             sec_align, file_align,
@@ -697,6 +825,8 @@ class StandaloneBinaryEmitter:
             struct.pack_into("<II", data_dirs, 3 * 8, rva_pdata, pdata_dir_size)
         if has_reloc:
             struct.pack_into("<II", data_dirs, 5 * 8, rva_reloc, raw_reloc_len)
+        if has_debug_sec:
+            struct.pack_into("<II", data_dirs, 6 * 8, rva_debug, 28)
         if has_tls_sec:
             struct.pack_into("<II", data_dirs, 9 * 8, tls_dir_rva, 40)
 
@@ -719,12 +849,15 @@ class StandaloneBinaryEmitter:
         if has_tls_sec:
             sec_hdrs += struct.pack("<8sIIIIIIHHI", b".tls\0\0\0\0", raw_tls_len, rva_tls, len(raw_tls_sec), cur_file_ptr, 0, 0, 0, 0, 0xC0000040)
             cur_file_ptr += len(raw_tls_sec)
+        if has_debug_sec:
+            sec_hdrs += struct.pack("<8sIIIIIIHHI", b".debug\0\0", raw_debug_len, rva_debug, len(raw_debug_sec), cur_file_ptr, 0, 0, 0, 0, 0x40000040)
+            cur_file_ptr += len(raw_debug_sec)
         if has_reloc:
             sec_hdrs += struct.pack("<8sIIIIIIHHI", b".reloc\0\0", raw_reloc_len, rva_reloc, len(raw_reloc_sec), cur_file_ptr, 0, 0, 0, 0, 0x42000040)
             cur_file_ptr += len(raw_reloc_sec)
 
         headers = (dos_header + dos_stub + pe_sig + coff + opt + data_dirs + sec_hdrs).ljust(size_of_headers, b"\0")
-        return bytes(headers + raw_text + raw_edata + raw_idata + raw_pdata + raw_data_sec + raw_tls_sec + raw_reloc_sec)
+        return bytes(headers + raw_text + raw_edata + raw_idata + raw_pdata + raw_data_sec + raw_tls_sec + raw_debug_sec + raw_reloc_sec)
 
     # =========================================================================
     # 3. LINUX ELF64 (x86-64) STANDALONE EXECUTABLE + STDOUT EXECUTABLE
@@ -1693,6 +1826,8 @@ class StandaloneBinaryEmitter:
         fini_array_size: int = 0,
         tdata_bytes: Optional[bytes] = None,
         tbss_size: int = 0,
+        eh_frame_offset_in_code: int = 0,
+        eh_frame_size: int = 0,
     ) -> bytes:
         """
         Synthesizes a 64-bit Mach-O dynamic shared library (`MH_DYLIB`) with:
@@ -1808,8 +1943,13 @@ class StandaloneBinaryEmitter:
             d_sz = self._align_up(24 + len(d_raw), 8)
             dylib_cmds.append(struct.pack("<IIIIII", 0x0C, d_sz, 24, 2, 0x010000, 0x010000) + d_raw.ljust(d_sz - 24, b"\x00"))
 
+        has_macho_eh = (
+            eh_frame_size > 0
+            and eh_frame_offset_in_code > 0
+            and eh_frame_offset_in_code + eh_frame_size <= len(raw_code)
+        )
         n_data_sects = (1 if need_got else 0) + (1 if raw_rw_data else 0) + (1 if rw_bss_size > 0 else 0)
-        cmd_text_size = 72 + 80
+        cmd_text_size = 72 + 80 * (2 if has_macho_eh else 1)
         cmd_data_size = (72 + 80 * n_data_sects) if has_data_seg else 0
         cmd_linkedit_size = 72
         cmd_dyld_info_size = 48
@@ -1837,14 +1977,25 @@ class StandaloneBinaryEmitter:
         cmd_text = struct.pack(
             "<II16sQQQQIIII",
             0x19, cmd_text_size, b"__TEXT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-            0, text_vmsize, 0, text_file_end, 5, 5, 1, 0
+            0, text_vmsize, 0, text_file_end, 5, 5, 2 if has_macho_eh else 1, 0
         )
+        sec_text_len = eh_frame_offset_in_code if has_macho_eh else len(raw_code)
         sec_text = struct.pack(
             "<16s16sQQIIIIIIII",
             b"__text\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
             b"__TEXT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-            code_vaddr, len(raw_code), code_offset, 2, 0, 0, 0x80000400, 0, 0, 0
+            code_vaddr, sec_text_len, code_offset, 2, 0, 0, 0x80000400, 0, 0, 0
         )
+        if has_macho_eh:
+            sec_text += struct.pack(
+                "<16s16sQQIIIIIIII",
+                b"__eh_frame\x00\x00\x00\x00\x00\x00",
+                b"__TEXT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+                code_vaddr + eh_frame_offset_in_code,
+                eh_frame_size,
+                code_offset + eh_frame_offset_in_code,
+                3, 0, 0, 0x6800000B, 0, 0, 0
+            )
         cmd_data_bytes = b""
         if has_data_seg:
             cmd_data_bytes = struct.pack(
@@ -2004,6 +2155,68 @@ class StandaloneBinaryEmitter:
             raise ValueError(f"Unsupported stdout binary format: {target_format}")
         self._write_file(output_path, data)
         return output_path
+
+    def compute_pe_pdata_rva(
+        self,
+        output_path: str = "",
+        func_code: bytes = b"",
+        export_name: str = "omni_compute",
+        extra_exports: Optional[Dict[str, int]] = None,
+        os_import_stubs: Optional[Dict[str, int]] = None,
+        os_import_table: Optional[Dict[str, Tuple[str, str]]] = None,
+        has_init_array: bool = False,
+        lib_name: str = "omni_linked",
+    ) -> int:
+        """Returns the exact RVA of the `.pdata` section inside a PE32+ DLL."""
+        eff_out = output_path or lib_name
+        if not eff_out.endswith(".dll"):
+            eff_out += ".dll"
+        dll_name = os.path.basename(eff_out)
+        text_prefix_len = 64 if has_init_array else 16
+        aligned_text_len = self._align_up(max(1, text_prefix_len + len(func_code)), self.FILE_ALIGN)
+        text_vspan = self._align_up(aligned_text_len, self.SEC_ALIGN)
+
+        exports_map: Dict[str, int] = dict(extra_exports) if extra_exports else {}
+        if export_name and export_name not in exports_map:
+            exports_map[export_name] = 0
+        if not exports_map:
+            exports_map["omni_compute"] = 0
+        sorted_exports = sorted(exports_map.items(), key=lambda kv: kv[0].encode("ascii"))
+        num_syms = len(sorted_exports)
+        ot_bytes_len = 2 * num_syms
+        pad_after_ot = (4 - (ot_bytes_len % 4)) % 4
+        strings_start = 40 + 4 * num_syms + 4 * num_syms + ot_bytes_len + pad_after_ot
+        str_blob_len = len(dll_name.encode("ascii") + b"\x00") + sum(
+            len(s.encode("ascii") + b"\x00") for s, _ in sorted_exports
+        )
+        raw_edata_len = strings_start + str_blob_len
+        edata_vspan = self._align_up(self._align_up(max(1, raw_edata_len), self.FILE_ALIGN), self.SEC_ALIGN)
+
+        os_stubs = os_import_stubs or {}
+        imp_tbl = os_import_table or {}
+        imports_by_dll: Dict[str, List[str]] = {}
+        for sym in sorted(os_stubs.keys()):
+            win_dll = imp_tbl[sym][0] if sym in imp_tbl else "MSVCRT.dll"
+            imports_by_dll.setdefault(win_dll, []).append(sym)
+        dll_items = [(d, list(s)) for d, s in imports_by_dll.items() if s]
+        idata_vspan = 0
+        if dll_items:
+            cur = (len(dll_items) + 1) * 20
+            for _, syms in dll_items:
+                cur += (len(syms) + 1) * 8
+            for _, syms in dll_items:
+                cur += (len(syms) + 1) * 8
+            imp_str_len = 0
+            for dll, syms in dll_items:
+                enc_d = dll.encode("ascii") + b"\x00"
+                imp_str_len += len(enc_d) + (len(enc_d) % 2)
+                for sym in syms:
+                    enc_s = b"\x00\x00" + sym.encode("ascii") + b"\x00"
+                    imp_str_len += len(enc_s) + (len(enc_s) % 2)
+            raw_idata_len = cur + imp_str_len
+            idata_vspan = self._align_up(self._align_up(max(1, raw_idata_len), self.FILE_ALIGN), self.SEC_ALIGN)
+
+        return 0x1000 + text_vspan + edata_vspan + idata_vspan
 
     def compute_shared_lib_layout(
         self,
@@ -2182,6 +2395,8 @@ class StandaloneBinaryEmitter:
         eh_frame_offset_in_code: int = 0,
         eh_frame_size: int = 0,
         external_dyn_relocs: Optional[List[Tuple[int, str, int, int]]] = None,
+        pdata_prelinked: bool = False,
+        emit_pdb: bool = True,
     ) -> str:
         if target_format == "auto":
             target_format = "pe_dll" if sys.platform == "win32" else "elf_so"
@@ -2196,6 +2411,7 @@ class StandaloneBinaryEmitter:
             for sym in sorted(os_stubs.keys()):
                 win_dll = imp_tbl[sym][0] if sym in imp_tbl else "MSVCRT.dll"
                 imports_by_dll.setdefault(win_dll, []).append(sym)
+            pdb_out = (os.path.splitext(output_path)[0] + ".pdb") if emit_pdb else None
             data = self.build_pe64_dll(
                 func_code=func_code,
                 export_name=export_name,
@@ -2213,6 +2429,9 @@ class StandaloneBinaryEmitter:
                 fini_array_size=fini_array_size,
                 tdata_bytes=tdata_bytes,
                 tbss_size=tbss_size,
+                pdata_prelinked=pdata_prelinked,
+                emit_pdb_path=pdb_out,
+                emit_debug_dir=True,
             )
         elif target_format in ("elf_so", "arm64_elf_so"):
             if not output_path.endswith(".so"):
@@ -2262,6 +2481,8 @@ class StandaloneBinaryEmitter:
                 data_bytes=data_bytes,
                 bss_size=bss_size,
                 abs64_reloc_rvas=abs64_reloc_rvas,
+                eh_frame_offset_in_code=eh_frame_offset_in_code,
+                eh_frame_size=eh_frame_size,
             )
         elif target_format in ("arm64_macho_dylib", "macho_arm64_dylib"):
             if not output_path.endswith(".dylib"):
@@ -2279,6 +2500,8 @@ class StandaloneBinaryEmitter:
                 data_bytes=data_bytes,
                 bss_size=bss_size,
                 abs64_reloc_rvas=abs64_reloc_rvas,
+                eh_frame_offset_in_code=eh_frame_offset_in_code,
+                eh_frame_size=eh_frame_size,
             )
         else:
             raise ValueError(f"Unsupported shared library target: {target_format}")

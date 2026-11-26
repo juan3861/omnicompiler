@@ -256,6 +256,115 @@ class OmniLSPServer:
         )
         return {"contents": {"kind": "markdown", "value": md}}
 
+    def build_code_actions(
+        self,
+        uri: str,
+        range_obj: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Generates automated CodeAction quick-fixes for UBSan/syntax diagnostics."""
+        actions: List[Dict[str, Any]] = []
+        txt = self.documents.get(uri, "")
+        lines = txt.splitlines()
+        diags = (context or {}).get("diagnostics") or []
+        if not diags and lines:
+            diags = self.analyze_diagnostics(uri, txt)
+
+        req_line = int(((range_obj or {}).get("start") or {}).get("line", 0))
+        for d in diags:
+            msg = str(d.get("message", ""))
+            d_rng = d.get("range") or {}
+            d_line = int(((d_rng.get("start") or {}).get("line", req_line)))
+            if "DIVIDE_BY_ZERO" in msg or "divisor is 0" in msg.lower():
+                if 0 <= d_line < len(lines):
+                    src_line = lines[d_line]
+                    indent = src_line[: len(src_line) - len(src_line.lstrip())]
+                    guarded = f"{indent}# guarded by omnicc UBSan quickfix\n{indent}return 0  # replaced div-by-zero: {src_line.strip()}"
+                    actions.append({
+                        "title": "Guard constant division-by-zero (OmniCompiler UBSan)",
+                        "kind": "quickfix",
+                        "diagnostics": [d],
+                        "isPreferred": True,
+                        "edit": {
+                            "changes": {
+                                uri: [{
+                                    "range": {
+                                        "start": {"line": d_line, "character": 0},
+                                        "end": {"line": d_line, "character": len(src_line)},
+                                    },
+                                    "newText": guarded,
+                                }]
+                            }
+                        },
+                    })
+        return actions
+
+    def build_completions(self, uri: str, line: int, character: int) -> List[Dict[str, Any]]:
+        """Returns workspace-wide symbol completions sorted deterministically."""
+        txt = self.documents.get(uri, "")
+        prefix = self._ident_at(txt, line, max(0, character - 1)) or ""
+        pref_low = prefix.lower()
+        items: List[Dict[str, Any]] = []
+        seen: set = set()
+        for sym_name in sorted(self.symbol_defs.keys()):
+            if sym_name in seen:
+                continue
+            if pref_low and not sym_name.lower().startswith(pref_low):
+                continue
+            seen.add(sym_name)
+            defs = self.symbol_defs[sym_name]
+            meta = defs[0] if defs else {}
+            lang = meta.get("lang", "omni")
+            base_f = os.path.basename(self._uri_to_path(str(meta.get("uri", ""))))
+            lsp_kind = 7 if meta.get("kind") == 5 else 3  # Class=7, Function=3
+            items.append({
+                "label": sym_name,
+                "kind": lsp_kind,
+                "detail": f"[{lang}] {base_f}",
+                "insertText": sym_name,
+            })
+        return items
+
+    def build_semantic_tokens(self, uri: str) -> Dict[str, List[int]]:
+        """Encodes LSP delta-encoded 5-int semantic tokens over Python AST definitions/params."""
+        text = self.documents.get(uri, "")
+        raw_tokens: List[Tuple[int, int, int, int, int]] = []
+        # Legend indices: 0=function, 1=class, 2=parameter, 3=variable, 4=keyword
+        try:
+            tree = ast.parse(text, filename=uri)
+            lines = text.splitlines()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    ln = max(0, node.lineno - 1)
+                    if ln < len(lines):
+                        col = lines[ln].find(node.name, getattr(node, "col_offset", 0))
+                        if col >= 0:
+                            raw_tokens.append((ln, col, len(node.name), 0, 1))
+                    for arg in node.args.args:
+                        aln = max(0, getattr(arg, "lineno", node.lineno) - 1)
+                        acol = max(0, getattr(arg, "col_offset", 0))
+                        raw_tokens.append((aln, acol, len(arg.arg), 2, 1))
+                elif isinstance(node, ast.ClassDef):
+                    ln = max(0, node.lineno - 1)
+                    if ln < len(lines):
+                        col = lines[ln].find(node.name, getattr(node, "col_offset", 0))
+                        if col >= 0:
+                            raw_tokens.append((ln, col, len(node.name), 1, 1))
+        except SyntaxError:
+            pass
+
+        raw_tokens.sort(key=lambda t: (t[0], t[1]))
+        data: List[int] = []
+        prev_line = 0
+        prev_char = 0
+        for ln, col, length, ttype, tmod in raw_tokens:
+            d_line = ln - prev_line
+            d_char = (col - prev_char) if d_line == 0 else col
+            data.extend([d_line, d_char, length, ttype, tmod])
+            prev_line = ln
+            prev_char = col
+        return {"data": data}
+
     def handle_message(self, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
         method = msg.get("method")
         msg_id = msg.get("id")
@@ -285,8 +394,17 @@ class OmniLSPServer:
                         "definitionProvider": True,
                         "referencesProvider": True,
                         "documentSymbolProvider": True,
+                        "codeActionProvider": True,
+                        "completionProvider": {"triggerCharacters": [".", ":"]},
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["function", "class", "parameter", "variable", "keyword"],
+                                "tokenModifiers": ["declaration", "definition"],
+                            },
+                            "full": True,
+                        },
                     },
-                    "serverInfo": {"name": "omnicc-lsp", "version": "1.1.0"},
+                    "serverInfo": {"name": "omnicc-lsp", "version": "1.2.0"},
                 },
             })
         elif method == "textDocument/didOpen":
@@ -333,6 +451,22 @@ class OmniLSPServer:
             td = params.get("textDocument", {})
             uri = str(td.get("uri", ""))
             outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": self.doc_symbols.get(uri, [])})
+        elif method == "textDocument/codeAction":
+            td = params.get("textDocument", {})
+            uri = str(td.get("uri", ""))
+            actions = self.build_code_actions(uri, params.get("range") or {}, params.get("context") or {})
+            outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": actions})
+        elif method == "textDocument/completion":
+            td = params.get("textDocument", {})
+            pos = params.get("position", {})
+            uri = str(td.get("uri", ""))
+            items = self.build_completions(uri, int(pos.get("line", 0)), int(pos.get("character", 0)))
+            outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": items})
+        elif method == "textDocument/semanticTokens/full":
+            td = params.get("textDocument", {})
+            uri = str(td.get("uri", ""))
+            toks = self.build_semantic_tokens(uri)
+            outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": toks})
         elif method == "shutdown":
             self.shutdown_requested = True
             outgoing.append({"jsonrpc": "2.0", "id": msg_id, "result": None})
