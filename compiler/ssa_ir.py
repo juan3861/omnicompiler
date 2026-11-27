@@ -354,6 +354,10 @@ class AstToSsaLowering:
         self._fn: Optional[SSAFunction] = None
         self._cur_block: Optional[BasicBlock] = None
         self.struct_layouts: Dict[str, Dict[str, Tuple[int, str]]] = dict(struct_layouts or {})
+        self.struct_fields_order: Dict[str, List[str]] = {
+            sn: [k for k, _ in sorted(lay.items(), key=lambda kv: kv[1][0])]
+            for sn, lay in self.struct_layouts.items()
+        }
         self.struct_meta: Dict[str, Tuple[int, int]] = {}
         self._var_struct_types: Dict[str, str] = {}
         self.global_luts: Dict[str, Tuple[str, Tuple[Any, ...]]] = dict(global_luts or {})
@@ -384,6 +388,7 @@ class AstToSsaLowering:
                 "i32": "i32", "u32": "u32", "int32": "i32", "uint32": "u32",
                 "f32": "f32", "float32": "f32",
                 "i64": "i64", "u64": "u64", "int64": "i64", "uint64": "u64", "int": "i64",
+                "bool": "i64", "boolean": "i64",
                 "f64": "f64", "float64": "f64", "double": "f64", "float": "f64",
                 "ptr": "ptr", "pointer": "ptr",
             }
@@ -438,6 +443,7 @@ class AstToSsaLowering:
             cur_off += sz
         tail_pad = (max_al - (cur_off % max_al)) % max_al
         self.struct_layouts[cls_node.name] = layout
+        self.struct_fields_order[cls_node.name] = [fname for fname, _ in fields]
         self.struct_meta[cls_node.name] = (cur_off + tail_pad, max_al)
         return layout
 
@@ -1099,6 +1105,7 @@ class AstToSsaLowering:
             and n not in self._CLOSURE_BUILTINS
             and n not in self.global_luts
             and n not in self.global_return_types
+            and n not in self.struct_layouts
             and n not in self._closures
             and n in self._current_def
         )
@@ -1107,7 +1114,12 @@ class AstToSsaLowering:
         lifted_args = list(args_node.args)
         for cap_n in captured:
             cur_v = self._read_variable(cap_n, self._cur_block)
-            cap_ann = ast.Name(id="float", ctx=ast.Load()) if cur_v.var_type == "f64" else ast.Name(id="int", ctx=ast.Load())
+            if cap_n in self._var_struct_types:
+                cap_ann = ast.Name(id=self._var_struct_types[cap_n], ctx=ast.Load())
+            elif cur_v.var_type == "f64":
+                cap_ann = ast.Name(id="float", ctx=ast.Load())
+            else:
+                cap_ann = ast.Name(id="int", ctx=ast.Load())
             lifted_args.append(ast.arg(arg=cap_n, annotation=cap_ann))
 
         lifted_fn_ast = ast.FunctionDef(
@@ -1273,6 +1285,14 @@ class AstToSsaLowering:
                     return
 
             val = self._lower_expr(stmt.value)
+            if (
+                len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id in self.struct_layouts
+            ):
+                self._var_struct_types[stmt.targets[0].id] = stmt.value.func.id
             for target in stmt.targets:
                 self._assign_target(target, val, line=line)
 
@@ -1796,6 +1816,28 @@ class AstToSsaLowering:
                 self._emit(res, opcode, [lf, rf], line=line)
                 return res
             opcode = self.BINOP_MAP.get(type(node.op), "add")
+            if opcode in ("sdiv", "srem") and self._try_handler_stack:
+                handler_bb, exc_n = self._try_handler_stack[-1]
+                div_ok_bb = self._new_block("div_ok", seal=False)
+                z_v = self._emit_const(0, line=line)
+                is_zero = self._next_var("div_zero")
+                self._emit(is_zero, "cmp_eq", [right_var, z_v], line=line)
+                if exc_n:
+                    div_err_bb = self._new_block("div_err", seal=False)
+                    self._cur_block.connect_to(div_err_bb)
+                    self._cur_block.connect_to(div_ok_bb)
+                    self._emit(None, "br_cond", [is_zero, div_err_bb.name, div_ok_bb.name], line=line)
+                    self._seal_block(div_err_bb)
+                    self._cur_block = div_err_bb
+                    self._write_variable(exc_n, div_err_bb, self._emit_const(1, line=line))
+                    div_err_bb.connect_to(handler_bb)
+                    self._emit(None, "br", [handler_bb.name], line=line)
+                else:
+                    self._cur_block.connect_to(handler_bb)
+                    self._cur_block.connect_to(div_ok_bb)
+                    self._emit(None, "br_cond", [is_zero, handler_bb.name, div_ok_bb.name], line=line)
+                self._seal_block(div_ok_bb)
+                self._cur_block = div_ok_bb
             res = self._next_var("t")
             self._emit(res, opcode, [left_var, right_var], line=line)
             return res
@@ -2054,6 +2096,30 @@ class AstToSsaLowering:
                     res = self._next_var("fcall", var_type="f64")
                     self._emit(res, "call", [fname] + arg_vars, line=line)
                     return res
+                elif fname in self.struct_layouts:
+                    layout = self.struct_layouts[fname]
+                    sz_bytes = max(8, self._get_type_size_align(fname)[0])
+                    ptr_v = self._next_var(f"{fname}_st", var_type="ptr")
+                    self._emit(ptr_v, "alloca", [sz_bytes], line=line)
+                    f_order = self.struct_fields_order.get(fname) or sorted(layout.keys(), key=lambda fn: layout[fn][0])
+                    assigned_fields: Dict[str, ast.AST] = {}
+                    for a_idx, a_node in enumerate(node.args):
+                        if a_idx < len(f_order):
+                            assigned_fields[f_order[a_idx]] = a_node
+                    for kw in node.keywords:
+                        if kw.arg and kw.arg in layout:
+                            assigned_fields[kw.arg] = kw.value
+                    for fn_key in f_order:
+                        f_off, f_wt = layout[fn_key]
+                        if fn_key in assigned_fields:
+                            f_val = self._lower_expr(assigned_fields[fn_key])
+                        else:
+                            f_val = self._emit_fconst(0.0, line=line) if f_wt in ("f32", "f64") else self._emit_const(0, line=line)
+                        if f_wt in ("f32", "f64") and f_val.var_type != "f64":
+                            f_val = self._promote_to_f64(f_val, line=line)
+                        off_v = self._emit_const(f_off, line=line)
+                        self._emit(None, "store_off", [ptr_v, off_v, f_val, f_wt], line=line)
+                    return ptr_v
                 elif fname in self._closures:
                     lifted_name, captured_names, ret_ty = self._closures[fname]
                     arg_vars = [self._lower_expr(a) for a in node.args] + [
@@ -2068,8 +2134,33 @@ class AstToSsaLowering:
                     res = self._next_var("call", var_type=ret_ty)
                     self._emit(res, "call", [fname] + arg_vars, line=line)
                     return res
+            elif isinstance(node.func, ast.Lambda):
+                lam_name = f"_anon_lam_{len(self._lifted_closures)}"
+                self._lift_closure_def(
+                    lam_name,
+                    node.func.args,
+                    [ast.Return(value=node.func.body, lineno=line)],
+                    None,
+                    line=line,
+                )
+                lifted_name, captured_names, ret_ty = self._closures[lam_name]
+                arg_vars = [self._lower_expr(a) for a in node.args] + [
+                    self._read_variable(cn, self._cur_block) for cn in captured_names
+                ]
+                res = self._next_var("call", var_type=ret_ty)
+                self._emit(res, "call", [lifted_name] + arg_vars, line=line)
+                return res
             elif isinstance(node.func, ast.Attribute):
                 attr = node.func.attr
+                if isinstance(node.func.value, ast.Name) and node.func.value.id in self._var_struct_types:
+                    cls_name = self._var_struct_types[node.func.value.id]
+                    mangled = f"{cls_name}__{attr}"
+                    self_ptr = self._read_variable(node.func.value.id, self._cur_block)
+                    arg_vars = [self_ptr] + [self._lower_expr(a) for a in node.args]
+                    ret_ty = self.global_return_types.get(mangled, "i64")
+                    res = self._next_var("mcall", var_type=ret_ty)
+                    self._emit(res, "call", [mangled] + arg_vars, line=line)
+                    return res
                 if attr == "append" and len(node.args) == 1:
                     obj_v = self._lower_expr(node.func.value)
                     val_v = self._lower_expr(node.args[0])

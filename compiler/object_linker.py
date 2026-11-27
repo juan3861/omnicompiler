@@ -23,7 +23,7 @@ from compiler.binary_emitter import StandaloneBinaryEmitter
 
 
 class SymbolDef:
-    __slots__ = ("name", "section", "offset", "size", "is_exported", "source_repo")
+    __slots__ = ("name", "section", "offset", "size", "is_exported", "source_repo", "binding")
 
     def __init__(
         self,
@@ -32,7 +32,8 @@ class SymbolDef:
         offset: int = 0,
         size: int = 0,
         is_exported: bool = True,
-        source_repo: str = ""
+        source_repo: str = "",
+        binding: str = "global",
     ):
         self.name = name
         self.section = section
@@ -40,9 +41,10 @@ class SymbolDef:
         self.size = size
         self.is_exported = is_exported
         self.source_repo = source_repo
+        self.binding = binding
 
     def __repr__(self) -> str:
-        return f"SymbolDef({self.name}@{self.section}+{self.offset}, repo={self.source_repo})"
+        return f"SymbolDef({self.name}@{self.section}+{self.offset}, repo={self.source_repo}, bind={self.binding})"
 
 
 class RelocationEntry:
@@ -84,6 +86,7 @@ class ObjectModule:
         self.coff_xdata_bytes = bytearray()
         self.symbols: Dict[str, SymbolDef] = {}
         self.relocations: List[RelocationEntry] = []
+        self.import_lib_hints: Dict[str, str] = {}
 
     def add_symbol(self, name: str, code: bytes, is_exported: bool = True) -> SymbolDef:
         offset = len(self.text_bytes)
@@ -262,7 +265,12 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
                 obj_bytes[s_info["raw_ptr"] : s_info["raw_ptr"] + s_info["raw_size"]]
             )
 
-    # Parse COFF Symbol Table (18 bytes per entry, skipping auxiliary records)
+    # Parse COFF Symbol Table (18 bytes per entry, inspecting aux records for COMDAT selection)
+    comdat_sec_binding: Dict[int, str] = {
+        s["index_1based"]: "comdat_any"
+        for s in sections
+        if (s["characteristics"] & 0x00001000)  # IMAGE_SCN_LNK_COMDAT
+    }
     sym_by_idx: Dict[int, Tuple[str, int, int, int]] = {}
     idx = 0
     while idx < num_symbols:
@@ -272,6 +280,13 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
         raw_name, val, sec_num, _stype, storage_cls, num_aux = struct.unpack_from("<8sIhHBB", obj_bytes, soff)
         sname = decode_coff_name(raw_name)
         sym_by_idx[idx] = (sname, val, sec_num, storage_cls)
+        if storage_cls == 3 and sec_num in comdat_sec_binding and num_aux >= 1:
+            aux_off = soff + 18
+            if aux_off + 18 <= len(obj_bytes):
+                sel = obj_bytes[aux_off + 14]
+                if sel == 6:  # IMAGE_COMDAT_SELECT_LARGEST
+                    comdat_sec_binding[sec_num] = "comdat_largest"
+        sym_bind = comdat_sec_binding.get(sec_num, "weak" if storage_cls == 105 else "global")
         if sec_num in exec_sec_offsets:
             xbase, xlen = exec_sec_offsets[sec_num]
             coff_sec_sym = f"__coff_sym_{idx}__"
@@ -291,7 +306,7 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
                     and (sname in ("$x", "$d", "$a", "$t") or sname.startswith(("$x.", "$d.", "$a.", "$t.")))
                 )
             ):
-                is_exp = (storage_cls == 2)  # IMAGE_SYM_CLASS_EXTERNAL
+                is_exp = storage_cls in (2, 105)  # IMAGE_SYM_CLASS_EXTERNAL / WEAK_EXTERNAL
                 mod.symbols[sname] = SymbolDef(
                     name=sname,
                     section=".text",
@@ -299,6 +314,7 @@ def load_coff_object(obj_bytes: bytes, repo_name: str = "coff_object") -> Object
                     size=max(1, xlen - val),
                     is_exported=is_exp,
                     source_repo=repo_name,
+                    binding=sym_bind,
                 )
         elif sec_num in tdata_sec_offsets:
             coff_sec_sym = f"__coff_sym_{idx}__"
@@ -506,8 +522,14 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
     init_sec_offsets: Dict[int, int] = {}
     fini_sec_offsets: Dict[int, int] = {}
     eh_sec_offsets: Dict[int, int] = {}
+    comdat_sections: set = set()
     for i, s in enumerate(elf.iter_sections()):
         sh_type = s.header["sh_type"]
+        if sh_type == "SHT_GROUP":
+            g_data = s.data()
+            if len(g_data) >= 8 and (struct.unpack_from("<I", g_data, 0)[0] & 0x1):  # GRP_COMDAT
+                for g_off in range(4, len(g_data) - 3, 4):
+                    comdat_sections.add(struct.unpack_from("<I", g_data, g_off)[0])
         sh_flags = int(s.header["sh_flags"])
         if s.name == ".eh_frame" and s.data_size > 0:
             eh_sec_offsets[i] = len(mod.eh_frame_bytes)
@@ -615,6 +637,7 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
             shndx = sym["st_shndx"]
             bind = sym["st_info"]["bind"]
             is_exp = bind in ("STB_GLOBAL", "STB_WEAK")
+            sym_bind = "weak" if bind == "STB_WEAK" else ("comdat_any" if shndx in comdat_sections else "global")
             if (
                 sym.name
                 and shndx in exec_sec_offsets
@@ -635,6 +658,7 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                     size=max(1, int(sym["st_size"]) or max(1, sec_len_x - int(sym["st_value"]))),
                     is_exported=is_exp,
                     source_repo=repo_name,
+                    binding=sym_bind,
                 )
             elif sym.name and shndx in rodata_sec_offsets:
                 mod.symbols[sym.name] = SymbolDef(
@@ -644,6 +668,7 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                     size=max(1, int(sym["st_size"]) or 8),
                     is_exported=is_exp,
                     source_repo=repo_name,
+                    binding=sym_bind,
                 )
             elif sym.name and shndx in data_sec_offsets:
                 mod.symbols[sym.name] = SymbolDef(
@@ -653,6 +678,7 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                     size=max(1, int(sym["st_size"]) or 8),
                     is_exported=is_exp,
                     source_repo=repo_name,
+                    binding=sym_bind,
                 )
             elif sym.name and shndx in bss_sec_offsets:
                 mod.symbols[sym.name] = SymbolDef(
@@ -662,6 +688,7 @@ def load_elf_object(obj_bytes: bytes, repo_name: str = "elf_object") -> ObjectMo
                     size=max(1, int(sym["st_size"]) or 8),
                     is_exported=is_exp,
                     source_repo=repo_name,
+                    binding=sym_bind,
                 )
             elif sym.name and shndx in tdata_sec_offsets:
                 mod.symbols[sym.name] = SymbolDef(
@@ -1044,7 +1071,17 @@ def load_static_archive(archive_bytes: bytes, repo_name: str = "static_archive")
         m_label = f"{repo_name}:{member_name or member_idx}"
         member_idx += 1
         try:
-            if member_data[:4] == b"\x7fELF":
+            if len(member_data) >= 20 and struct.unpack_from("<HH", member_data, 0) == (0x0000, 0xFFFF):
+                # Microsoft COFF Short-Import descriptor (IMPORT_OBJECT_HEADER)
+                rest_bytes = member_data[20:]
+                parts = rest_bytes.split(b"\x00", 2)
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    imp_sym_n = parts[0].decode("utf-8", errors="replace")
+                    imp_dll_n = parts[1].decode("utf-8", errors="replace")
+                    hint_mod = ObjectModule(repo_name=f"{repo_name}:implib")
+                    hint_mod.import_lib_hints[imp_sym_n] = imp_dll_n
+                    modules.append(hint_mod)
+            elif member_data[:4] == b"\x7fELF":
                 modules.append(load_elf_object(member_data, repo_name=m_label))
             elif member_data[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
                 modules.append(load_macho_object(member_data, repo_name=m_label))
@@ -1323,6 +1360,10 @@ class NativeObjectLinker:
             get_sanitizer_kernels = None
 
         work_modules: List[ObjectModule] = list(self.modules)
+        archive_import_hints: Dict[str, str] = {}
+        for mod_w in work_modules:
+            if getattr(mod_w, "import_lib_hints", None):
+                archive_import_hints.update(mod_w.import_lib_hints)
 
         # 0. Demand-driven Static Archive (.a / .lib) member extraction (fixed-point worklist)
         if self.archives:
@@ -1330,6 +1371,8 @@ class NativeObjectLinker:
             archive_index: Dict[str, Tuple[int, int, ObjectModule]] = {}
             for p_idx, pool in enumerate(self.archives):
                 for m_idx, member in enumerate(pool):
+                    if getattr(member, "import_lib_hints", None):
+                        archive_import_hints.update(member.import_lib_hints)
                     for sname, sdef in member.symbols.items():
                         if sdef.is_exported and sname not in archive_index:
                             archive_index[sname] = (p_idx, m_idx, member)
@@ -1416,6 +1459,8 @@ class NativeObjectLinker:
                         needed_atomic_syms.add(reloc.symbol_name)
                     elif reloc.symbol_name in NATIVE_COLLECTION_SYMBOLS:
                         needed_runtime_syms.add(reloc.symbol_name)
+                    elif reloc.symbol_name in archive_import_hints:
+                        needed_os_syms.add(reloc.symbol_name)
                     elif reloc.symbol_name in OS_C_ABI_IMPORT_TABLE or _is_cpp_abi_runtime_symbol(reloc.symbol_name):
                         needed_os_syms.add(reloc.symbol_name)
                     elif (
@@ -1727,6 +1772,36 @@ class NativeObjectLinker:
         tls_symbol_offsets: Dict[Tuple[int, str], int] = {}
         global_tls_offsets: Dict[str, int] = {}
 
+        _BIND_RANK = {"weak": 0, "comdat_any": 1, "comdat_largest": 2, "global": 3}
+        winning_def: Dict[str, Tuple[int, SymbolDef]] = {}
+        weak_comdat_resolved: List[str] = []
+        superseded_symbols: set = set()
+        for idx_m, mod_m in enumerate(work_modules):
+            for s_n, s_d in mod_m.symbols.items():
+                if s_n.startswith(("__elf_sec_", "__coff_sym_", "__macho_sec_")):
+                    continue
+                if s_n not in winning_def:
+                    winning_def[s_n] = (idx_m, s_d)
+                    continue
+                w_idx, w_d = winning_def[s_n]
+                w_bind = getattr(w_d, "binding", "global")
+                c_bind = getattr(s_d, "binding", "global")
+                if w_bind == "global" and c_bind == "global":
+                    continue
+                r_w = _BIND_RANK.get(w_bind, 3)
+                r_c = _BIND_RANK.get(c_bind, 3)
+                take_cur = False
+                if r_c > r_w:
+                    take_cur = True
+                elif r_c == r_w and c_bind == "comdat_largest" and s_d.size > w_d.size:
+                    take_cur = True
+                if take_cur:
+                    superseded_symbols.add((w_idx, s_n))
+                    winning_def[s_n] = (idx_m, s_d)
+                else:
+                    superseded_symbols.add((idx_m, s_n))
+                weak_comdat_resolved.append(s_n)
+
         for idx, mod in enumerate(work_modules):
             t_off = module_text_offsets[idx]
             d_off = module_data_offsets[idx]
@@ -1734,6 +1809,8 @@ class NativeObjectLinker:
             td_off = module_tdata_offsets[idx]
             tb_off = module_tbss_offsets[idx]
             for sym_name, sym in mod.symbols.items():
+                if (idx, sym_name) in superseded_symbols:
+                    continue
                 if sym.section in (".tdata", ".tbss"):
                     tls_off = (td_off + sym.offset) if sym.section == ".tdata" else (total_tdata_size + tb_off + sym.offset)
                     tls_symbol_offsets[(idx, sym_name)] = tls_off
@@ -1976,6 +2053,8 @@ class NativeObjectLinker:
             raise LinkerError(f"Unresolved external symbols during link: {unresolved_symbols}")
 
         resolved_os_import_table = dict(OS_C_ABI_IMPORT_TABLE)
+        for imp_s, imp_dll in archive_import_hints.items():
+            resolved_os_import_table[imp_s] = (imp_dll, imp_dll)
         for ext_s in external_os_imports:
             if ext_s not in resolved_os_import_table:
                 resolved_os_import_table[ext_s] = _infer_dynamic_lib_pair(ext_s, self.external_lib_hints)
@@ -1988,6 +2067,7 @@ class NativeObjectLinker:
             "total_bss_size": total_bss_size,
             "global_symbols": global_symbol_table,
             "exported_symbols": exported_symbols,
+            "weak_comdat_resolved": sorted(set(weak_comdat_resolved)),
             "layout_order": sorted(
                 (s for s in exported_symbols if not s.startswith(("__elf_sec_", "__coff_sec_", "__macho_sec_"))),
                 key=lambda s: global_symbol_table[s],

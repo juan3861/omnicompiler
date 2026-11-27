@@ -105,6 +105,15 @@ jobs:
         python run_c115_tests.py
         python -c "import os, tempfile, json, pathlib; from omnicc_cli import main; d = tempfile.mkdtemp(); r = os.path.join(d, 'r'); os.makedirs(r); pathlib.Path(r, 'm.py').write_text('def omni_main(x: int) -> int:\n    return (x // 2) + 1\n', encoding='utf-8'); out = os.path.join(d, 'o'); sp = os.path.join(d, 'o.sarif'); assert main(['build', '--repos', r, '--output', out, '--sanitize', 'ubsan', '--no-provenance', '--sarif', sp, '--json']) == 0; doc = json.loads(pathlib.Path(sp).read_text(encoding='utf-8')); assert doc['version'] == '2.1.0'"
 
+    - name: 14. Verify C117-C121 COFF Implib/COMDAT/GNU_HASH, Cross-Shard ThinLTO, Bazel/Ninja/TS, Dataclasses/Try & DEFLATE Torture
+      run: |
+        python benchmarks/oss_torture_suite.py
+        python run_c117_tests.py
+        python run_c118_tests.py
+        python run_c119_tests.py
+        python run_c120_tests.py
+        python run_c121_tests.py
+
   verify-macos-arm64:
     name: Apple Silicon ARM64 Mach-O & Native Execution (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

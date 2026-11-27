@@ -79,15 +79,15 @@ class ToolchainRegistry:
                     "wsl", "python3", "-c",
                     "import json, shutil; print(json.dumps({k: shutil.which(k) for k in ('clang','clang++','gcc','g++','rustc','cargo','go')}))",
                 ],
-                capture_output=True, text=True, timeout=12, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL,
             )
             if probe.returncode == 0 and probe.stdout.strip():
                 parsed = json.loads(probe.stdout.strip().splitlines()[-1])
                 if isinstance(parsed, dict):
                     res.update({str(k): (str(v) if v else None) for k, v in parsed.items()})
+                    cls._WSL_CACHE = res
         except Exception:
             pass
-        cls._WSL_CACHE = res
         return dict(res)
 
 
@@ -196,7 +196,7 @@ class FederatedBuildAdapter:
                 cmd = ["wsl", cc, *wsl_flags, "-emit-llvm", "-c", _to_wsl_path(src_path), "-o", _to_wsl_path(out_bc)]
             else:
                 cmd = [cc, *flags, "-emit-llvm", "-c", src_path, "-o", out_bc]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
             if proc.returncode != 0 or not os.path.exists(out_bc):
                 return None
             with open(out_bc, "rb") as f:
@@ -280,7 +280,7 @@ class FederatedBuildAdapter:
                 cmd = ["wsl", cc, *wsl_flags, *pic_flags, "-c", _to_wsl_path(src_path), "-o", _to_wsl_path(out_obj)]
             else:
                 cmd = [cc, *flags, *pic_flags, "-c", src_path, "-o", out_obj]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
             if proc.returncode != 0 or not os.path.exists(out_obj):
                 return None
             with open(out_obj, "rb") as f:
@@ -306,7 +306,7 @@ class FederatedBuildAdapter:
         with tempfile.TemporaryDirectory() as td:
             out_bc = os.path.join(td, "rust_unit.bc")
             cmd = [rustc, "--crate-type", "lib", "--emit=llvm-bc", "-C", "opt-level=3", src_path, "-o", out_bc]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
             if proc.returncode != 0 or not os.path.exists(out_bc):
                 return None
             with open(out_bc, "rb") as f:
@@ -650,7 +650,7 @@ class FederatedBuildAdapter:
                     cmd = ["wsl", "bash", "-lc", f"cd '{_to_wsl_path(repo_path)}' && '{cargo_bin}' metadata --format-version 1{off_s}"]
                 else:
                     cmd = [cargo_bin, "metadata", "--format-version", "1", *offline_flag, "--manifest-path", os.path.join(repo_path, "Cargo.toml")]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
                 if proc.returncode == 0 and proc.stdout.strip().startswith("{"):
                     meta_json = json.loads(proc.stdout)
                     if not packages:
@@ -1194,6 +1194,246 @@ class FederatedBuildAdapter:
                 src_units.append((full_s, list(flags)))
         return bool(src_units), src_units
 
+    def _collect_bazel_units(self, repo_path: str) -> Tuple[bool, List[Tuple[str, List[str]]]]:
+        """
+        Discovers and parses Bazel monorepo trees (`MODULE.bazel`/`WORKSPACE`/`BUILD`/`BUILD.bazel`),
+        evaluating Starlark `cc_library` / `cc_binary` / `cc_test` targets, `glob(...)`, `includes`,
+        `copts`, `defines`, `linkopts`, and DAG dependencies (`//pkg:target`, `:target`).
+        """
+        import ast as _ast
+        import glob as _glob
+
+        root_abs = os.path.abspath(repo_path)
+        build_files: List[Tuple[str, str]] = []
+        skip_dirs = {".git", ".venv", "venv", "node_modules", "target", "build"}
+        for cur_root, dirs, files in os.walk(root_abs):
+            dirs[:] = [d for d in sorted(dirs) if d not in skip_dirs and not d.startswith("bazel-")]
+            for bname in ("BUILD.bazel", "BUILD"):
+                bp = os.path.join(cur_root, bname)
+                if os.path.isfile(bp):
+                    rel_pkg = os.path.relpath(cur_root, root_abs).replace("\\", "/")
+                    pkg_label = "" if rel_pkg == "." else rel_pkg
+                    build_files.append((pkg_label, bp))
+                    break
+
+        if not build_files:
+            return False, []
+
+        targets: Dict[str, Dict[str, Any]] = {}
+        target_order: List[str] = []
+        src_exts = (".c", ".cc", ".cpp", ".cxx")
+
+        def _eval_starlark(node: _ast.AST, pkg_dir: str, env: Dict[str, Any]) -> Any:
+            if isinstance(node, _ast.Constant):
+                return node.value
+            if isinstance(node, _ast.Name):
+                return env.get(node.id, [])
+            if isinstance(node, (_ast.List, _ast.Tuple)):
+                return [_eval_starlark(el, pkg_dir, env) for el in node.elts]
+            if isinstance(node, _ast.BinOp) and isinstance(node.op, _ast.Add):
+                lv = _eval_starlark(node.left, pkg_dir, env)
+                rv = _eval_starlark(node.right, pkg_dir, env)
+                if isinstance(lv, list) and isinstance(rv, list):
+                    return lv + rv
+                if isinstance(lv, str) and isinstance(rv, str):
+                    return lv + rv
+            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) and node.func.id == "glob":
+                pats = _eval_starlark(node.args[0], pkg_dir, env) if node.args else []
+                excl: set = set()
+                for kw in node.keywords:
+                    if kw.arg == "exclude":
+                        for ep in _eval_starlark(kw.value, pkg_dir, env) or []:
+                            for hit in _glob.glob(os.path.join(pkg_dir, str(ep)), recursive=True):
+                                excl.add(os.path.abspath(hit))
+                matched: List[str] = []
+                for p in (pats if isinstance(pats, list) else [pats]):
+                    for hit in sorted(_glob.glob(os.path.join(pkg_dir, str(p)), recursive=True)):
+                        ah = os.path.abspath(hit)
+                        if os.path.isfile(ah) and ah not in excl:
+                            matched.append(os.path.relpath(ah, pkg_dir).replace("\\", "/"))
+                return matched
+            return []
+
+        for pkg_label, bp in build_files:
+            pkg_dir = os.path.dirname(bp)
+            try:
+                with open(bp, "r", encoding="utf-8", errors="ignore") as f:
+                    b_src = f.read()
+                tree = _ast.parse(b_src, filename=bp)
+            except Exception:
+                continue
+            star_env: Dict[str, Any] = {}
+            for stmt in tree.body:
+                if isinstance(stmt, _ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], _ast.Name):
+                    star_env[stmt.targets[0].id] = _eval_starlark(stmt.value, pkg_dir, star_env)
+                elif isinstance(stmt, _ast.Expr) and isinstance(stmt.value, _ast.Call) and isinstance(stmt.value.func, _ast.Name):
+                    rule_name = stmt.value.func.id
+                    if rule_name not in ("cc_library", "cc_binary", "cc_test", "objc_library"):
+                        continue
+                    kw_map: Dict[str, Any] = {}
+                    for kw in stmt.value.keywords:
+                        if kw.arg:
+                            kw_map[kw.arg] = _eval_starlark(kw.value, pkg_dir, star_env)
+                    tname = str(kw_map.get("name") or "").strip()
+                    if not tname:
+                        continue
+                    canonical = f"//{pkg_label}:{tname}" if pkg_label else f"//:{tname}"
+                    targets[canonical] = {
+                        "pkg_label": pkg_label,
+                        "pkg_dir": pkg_dir,
+                        "srcs": [str(s) for s in (kw_map.get("srcs") or []) if isinstance(s, str)],
+                        "includes": [str(s) for s in (kw_map.get("includes") or []) if isinstance(s, str)],
+                        "copts": [str(s) for s in (kw_map.get("copts") or []) if isinstance(s, str)],
+                        "defines": [str(s) for s in (kw_map.get("defines") or []) if isinstance(s, str)],
+                        "local_defines": [str(s) for s in (kw_map.get("local_defines") or []) if isinstance(s, str)],
+                        "linkopts": [str(s) for s in (kw_map.get("linkopts") or []) if isinstance(s, str)],
+                        "deps": [str(s) for s in (kw_map.get("deps") or []) if isinstance(s, str)],
+                    }
+                    target_order.append(canonical)
+
+        def _norm_dep(dep: str, cur_pkg: str) -> str:
+            d = dep.lstrip("@").strip()
+            if d.startswith(":"):
+                return f"//{cur_pkg}{d}" if cur_pkg else f"//{d}"
+            if d.startswith("//"):
+                if ":" in d:
+                    return d
+                pkg_part = d[2:]
+                short = pkg_part.rsplit("/", 1)[-1]
+                return f"//{pkg_part}:{short}"
+            return d
+
+        def _collect_exported_flags(tkey: str, seen_t: set) -> Tuple[List[str], List[str]]:
+            if tkey in seen_t or tkey not in targets:
+                return [], []
+            seen_t.add(tkey)
+            tmeta = targets[tkey]
+            inc_def: List[str] = []
+            lopts: List[str] = []
+            for inc_r in tmeta["includes"]:
+                inc_a = os.path.abspath(os.path.join(tmeta["pkg_dir"], inc_r))
+                if os.path.isdir(inc_a):
+                    inc_def.append(f"-I{inc_a}")
+            for df in tmeta["defines"]:
+                inc_def.append(df if df.startswith("-D") else f"-D{df}")
+            for lo in tmeta["linkopts"]:
+                lopts.append(lo)
+            for dep in tmeta["deps"]:
+                dkey = _norm_dep(dep, tmeta["pkg_label"])
+                di, dl = _collect_exported_flags(dkey, seen_t)
+                inc_def.extend(di)
+                lopts.extend(dl)
+            return inc_def, lopts
+
+        units: List[Tuple[str, List[str]]] = []
+        seen_src: set = set()
+        for tkey in target_order:
+            tmeta = targets[tkey]
+            exp_flags, exp_link = _collect_exported_flags(tkey, set())
+            tflags: List[str] = [f"-I{root_abs}"]
+            if tmeta["pkg_dir"] != root_abs:
+                tflags.append(f"-I{tmeta['pkg_dir']}")
+            for df in tmeta["local_defines"]:
+                tflags.append(df if df.startswith("-D") else f"-D{df}")
+            for fl in [*tmeta["copts"], *exp_flags]:
+                if fl not in tflags:
+                    tflags.append(fl)
+            for lo in [*tmeta["linkopts"], *exp_link]:
+                if lo.startswith("-l") and len(lo) > 2:
+                    lname = lo[2:]
+                    if lname not in self.discovered_external_libs:
+                        self.discovered_external_libs.append(lname)
+            for srel in tmeta["srcs"]:
+                if os.path.splitext(srel)[1].lower() not in src_exts:
+                    continue
+                sabs = os.path.abspath(os.path.join(tmeta["pkg_dir"], srel))
+                if os.path.isfile(sabs) and sabs not in seen_src:
+                    seen_src.add(sabs)
+                    units.append((sabs, list(tflags)))
+        return bool(units), units
+
+    def _collect_ninja_units(self, repo_path: str) -> Tuple[bool, List[Tuple[str, List[str]]]]:
+        """Parses standalone `build.ninja` files extracting per-target C/C++ sources & flags."""
+        ninja_p = os.path.join(repo_path, "build.ninja")
+        if not os.path.isfile(ninja_p):
+            return False, []
+        with open(ninja_p, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read().replace("$\r\n", " ").replace("$\n", " ")
+
+        global_vars: Dict[str, str] = {}
+        edges: List[Tuple[str, List[str], Dict[str, str]]] = []
+        cur_edge: Optional[Tuple[str, List[str], Dict[str, str]]] = None
+
+        def _subst(val: str, local_v: Optional[Dict[str, str]] = None) -> str:
+            merged = dict(global_vars)
+            if local_v:
+                merged.update(local_v)
+            prev = None
+            out_v = val
+            for _ in range(5):
+                if out_v == prev:
+                    break
+                prev = out_v
+                out_v = re.sub(
+                    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                    lambda m: merged.get(m.group(1) or m.group(2), ""),
+                    out_v,
+                )
+            return out_v
+
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if line[0].isspace() and cur_edge is not None and "=" in s:
+                k, v = s.split("=", 1)
+                cur_edge[2][k.strip()] = v.strip()
+                continue
+            cur_edge = None
+            if s.startswith("build ") and ":" in s:
+                lhs, rhs = s[6:].split(":", 1)
+                rhs_clean = rhs.split("|", 1)[0].strip()
+                toks = rhs_clean.split()
+                if toks:
+                    rule_n = toks[0]
+                    ins = toks[1:]
+                    cur_edge = (rule_n, ins, {"out": lhs.strip(), "in": " ".join(ins)})
+                    edges.append(cur_edge)
+            elif not s.startswith(("rule ", "pool ", "default ", "subninja ", "include ")) and "=" in s:
+                k, v = s.split("=", 1)
+                global_vars[k.strip()] = v.strip()
+
+        src_exts = (".c", ".cc", ".cpp", ".cxx")
+        units: List[Tuple[str, List[str]]] = []
+        seen_src: set = set()
+        for _rule_n, ins, lvars in edges:
+            flag_blob = " ".join(
+                _subst(v, lvars)
+                for k, v in (list(global_vars.items()) + list(lvars.items()))
+                if k in ("cflags", "cxxflags", "flags", "defines", "includes", "ldflags", "libs")
+            )
+            eflags: List[str] = []
+            for tok in flag_blob.split():
+                if tok.startswith(("-I", "-D", "-std=", "-O", "-f")):
+                    if tok.startswith("-I") and len(tok) > 2:
+                        ip = tok[2:]
+                        tok = "-I" + (ip if os.path.isabs(ip) else os.path.abspath(os.path.join(repo_path, ip)))
+                    if tok not in eflags:
+                        eflags.append(tok)
+                elif tok.startswith("-l") and len(tok) > 2:
+                    ln = tok[2:]
+                    if ln not in self.discovered_external_libs:
+                        self.discovered_external_libs.append(ln)
+            for in_tok in ins:
+                in_sub = _subst(in_tok, lvars)
+                if os.path.splitext(in_sub)[1].lower() not in src_exts:
+                    continue
+                abs_in = in_sub if os.path.isabs(in_sub) else os.path.abspath(os.path.join(repo_path, in_sub))
+                if os.path.isfile(abs_in) and abs_in not in seen_src:
+                    seen_src.add(abs_in)
+                    units.append((abs_in, list(eflags)))
+        return bool(units), units
+
     def collect_federated_artifacts(
         self,
         manifests: Sequence[Any],
@@ -1264,6 +1504,35 @@ class FederatedBuildAdapter:
             if any(os.path.isfile(os.path.join(repo_dir, fn)) for fn in ("GNUmakefile", "Makefile", "makefile")):
                 _mk_ok, mk_units = self._collect_makefile_units(repo_dir)
                 for fpath, flags in mk_units:
+                    norm_p = os.path.abspath(fpath)
+                    if norm_p in seen_paths:
+                        continue
+                    seen_paths.add(norm_p)
+                    eff_flags = self._normalize_flags(flags, norm_p, repo_dir=repo_dir)
+                    art = self._compile_c_cpp_to_bitcode(norm_p, repo_name, extra_flags=eff_flags)
+                    if art is None:
+                        art = self._compile_c_cpp_to_object(norm_p, repo_name, extra_flags=eff_flags)
+                    if art is not None:
+                        artifacts.append(art)
+
+            # 1b-3. Bazel (`BUILD` / `BUILD.bazel` / `MODULE.bazel`) & pure Ninja (`build.ninja`)
+            if any(os.path.isfile(os.path.join(repo_dir, fn)) for fn in ("MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel", "BUILD.bazel", "BUILD")):
+                _bz_ok, bz_units = self._collect_bazel_units(repo_dir)
+                for fpath, flags in bz_units:
+                    norm_p = os.path.abspath(fpath)
+                    if norm_p in seen_paths:
+                        continue
+                    seen_paths.add(norm_p)
+                    eff_flags = self._normalize_flags(flags, norm_p, repo_dir=repo_dir)
+                    art = self._compile_c_cpp_to_bitcode(norm_p, repo_name, extra_flags=eff_flags)
+                    if art is None:
+                        art = self._compile_c_cpp_to_object(norm_p, repo_name, extra_flags=eff_flags)
+                    if art is not None:
+                        artifacts.append(art)
+
+            if os.path.isfile(os.path.join(repo_dir, "build.ninja")):
+                _nj_ok, nj_units = self._collect_ninja_units(repo_dir)
+                for fpath, flags in nj_units:
                     norm_p = os.path.abspath(fpath)
                     if norm_p in seen_paths:
                         continue

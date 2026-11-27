@@ -84,11 +84,17 @@ class ContentAddressableStore:
                 try:
                     with os.fdopen(fd, "wb") as f:
                         f.write(data)
-                    os.replace(tmp_path, dst)
-                except BaseException:
+                    try:
+                        os.replace(tmp_path, dst)
+                    except (PermissionError, FileExistsError):
+                        if not os.path.exists(dst):
+                            raise
+                finally:
                     if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                    raise
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
         return digest
 
     def get_blob(self, digest: str) -> bytes:
@@ -125,15 +131,23 @@ class ContentAddressableStore:
             "metadata": metadata,
         }
         with self._lock:
+            if os.path.exists(path):
+                return
             fd, tmp_path = tempfile.mkstemp(dir=self.actions_dir, prefix=".tmp_act_")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(record, f, sort_keys=True)
-                os.replace(tmp_path, path)
-            except BaseException:
+                try:
+                    os.replace(tmp_path, path)
+                except (PermissionError, FileExistsError):
+                    if not os.path.exists(path):
+                        raise
+            finally:
                 if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
 
     def put_merkle_tree(self, root_dir: str) -> Dict[str, Any]:
         """
@@ -236,7 +250,38 @@ class HermeticSandboxExecutor:
     def register_default_handlers(self):
         self.handlers.setdefault("emit_standalone_binary", self._handle_emit_standalone_binary)
         self.handlers.setdefault("compile_ir_unit", self._handle_compile_ir_unit)
+        self.handlers.setdefault("compile_llvm_shard", self._handle_compile_llvm_shard)
         self.handlers.setdefault("run_sandboxed_tool", self._handle_run_sandboxed_tool)
+
+    def _handle_compile_llvm_shard(self, payload: Dict[str, Any], sandbox_dir: str, env: Dict[str, str]) -> Dict[str, Any]:
+        import llvmlite.binding as llvm
+        llvm.initialize_native_target()
+        llvm.initialize_native_asmprinter()
+        try:
+            llvm.initialize_all_targets()
+            llvm.initialize_all_asmprinters()
+        except Exception:
+            pass
+        bc_path = os.path.join(sandbox_dir, "shard.bc")
+        with open(bc_path, "rb") as bf:
+            bc_bytes = bf.read()
+        mod = llvm.parse_bitcode(bc_bytes)
+        triple = str(payload.get("target_triple") or llvm.get_default_triple())
+        opt_lvl = int(payload.get("opt_level", 3))
+        mod.triple = triple
+        target = llvm.Target.from_triple(triple)
+        tm = target.create_target_machine(opt=opt_lvl, reloc="pic", codemodel="small")
+        pto = llvm.create_pipeline_tuning_options(speed_level=opt_lvl)
+        pto.loop_vectorization = True
+        pto.slp_vectorization = True
+        pto.loop_unrolling = True
+        pb = llvm.create_pass_builder(tm, pto)
+        pb.getModulePassManager().run(mod, pb)
+        obj_bytes = tm.emit_object(mod)
+        out_name = "shard.obj"
+        with open(os.path.join(sandbox_dir, out_name), "wb") as of:
+            of.write(obj_bytes)
+        return {"outputs": [out_name], "metadata": {"obj_bytes_len": len(obj_bytes), "triple": triple}}
 
     def _handle_run_sandboxed_tool(self, payload: Dict[str, Any], sandbox_dir: str, env: Dict[str, str]) -> Dict[str, Any]:
         import sys

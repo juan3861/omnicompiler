@@ -176,9 +176,16 @@ class RepoManifestIngestor:
 
     def _detect_repo_type(self, path: str) -> str:
         has_py = os.path.exists(os.path.join(path, "pyproject.toml")) or os.path.exists(os.path.join(path, "setup.py"))
-        has_c = os.path.exists(os.path.join(path, "CMakeLists.txt")) or os.path.exists(os.path.join(path, "Makefile"))
+        has_c = (
+            os.path.exists(os.path.join(path, "CMakeLists.txt"))
+            or os.path.exists(os.path.join(path, "Makefile"))
+            or os.path.exists(os.path.join(path, "BUILD.bazel"))
+            or os.path.exists(os.path.join(path, "BUILD"))
+            or os.path.exists(os.path.join(path, "build.ninja"))
+            or os.path.exists(os.path.join(path, "meson.build"))
+        )
         has_rs = os.path.exists(os.path.join(path, "Cargo.toml"))
-        has_js = os.path.exists(os.path.join(path, "package.json"))
+        has_js = os.path.exists(os.path.join(path, "package.json")) or os.path.exists(os.path.join(path, "tsconfig.json"))
         has_go = os.path.exists(os.path.join(path, "go.mod"))
 
         kinds = [k for flag, k in ((has_py, "python"), (has_c, "c_cpp"), (has_rs, "rust"), (has_js, "typescript"), (has_go, "go")) if flag]
@@ -284,6 +291,22 @@ class RepoManifestIngestor:
                         language="python",
                         source_file=rel_path
                     ))
+                elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                    from compiler.ssa_ir import AstToSsaLowering as _StructCheck
+                    _st_chk = _StructCheck()
+                    _st_chk.register_structs_from_statements([n for n in tree.body if isinstance(n, ast.ClassDef)])
+                    if node.name in _st_chk.struct_layouts:
+                        for m_node in node.body:
+                            if isinstance(m_node, ast.FunctionDef) and not m_node.name.startswith("_"):
+                                exports.append(SymbolSignature(
+                                    name=f"{node.name}__{m_node.name}",
+                                    params=[arg.arg for arg in m_node.args.args],
+                                    return_type="any",
+                                    doc=ast.get_docstring(m_node) or "",
+                                    visibility="public",
+                                    language="python",
+                                    source_file=rel_path,
+                                ))
                 elif isinstance(node, (ast.Import, ast.ImportFrom)):
                     if isinstance(node, ast.Import):
                         for alias in node.names:
@@ -378,9 +401,12 @@ class RepoManifestIngestor:
             with open(path, "rb") as f:
                 content = f.read()
             text = content.decode("utf-8", errors="ignore")
-            from frontends.polyglot_ssa_lowering import parse_polyglot_file_to_ast
-
-            parsed = parse_polyglot_file_to_ast(path, source_text=text, strict=False)
+            if path.lower().endswith(".ts"):
+                from frontends.typescript_frontend import TypeScriptFrontend
+                parsed = TypeScriptFrontend().compile_ts_source(text, file_path=path)
+            else:
+                from frontends.polyglot_ssa_lowering import parse_polyglot_file_to_ast
+                parsed = parse_polyglot_file_to_ast(path, source_text=text, strict=False)
             for fn in parsed.functions:
                 exports.append(SymbolSignature(
                     name=fn.name,

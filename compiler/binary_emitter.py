@@ -16,7 +16,7 @@ import hashlib
 import os
 import struct
 import sys
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 
 class MiniAssembler:
@@ -389,23 +389,43 @@ class StandaloneBinaryEmitter:
         s1_info = struct.pack("<III16sI", 20000404, 0x6F6D6E69, age, pdb_guid, 0)
         # Stream 2: TPI minimal 56-byte header (Version 20040203)
         s2_tpi = struct.pack("<IIIIIIIIIIIIII", 20040203, 56, 0x1000, 0x1000, 0, 0xFFFFFFFF, 0, 0, 0, 0, 0, 0, 0, 0)
-        # Stream 3: DBI header (64B) + encoded public export table payload
+        # Stream 5: CodeView SymRecord Stream (`S_PUB32 = 0x110E` with section-relative offsets & 4B pad)
         sym_recs = bytearray()
         for sym_name, sym_off in sorted(exports_map.items(), key=lambda kv: kv[0]):
             name_b = sym_name.encode("utf-8") + b"\x00"
-            rec_len = 14 + len(name_b)
-            sym_recs.extend(struct.pack("<HHIIH", rec_len, 0x110E, 2, base_fn_rva + int(sym_off), 1) + name_b)
-            while len(sym_recs) % 4:
-                sym_recs.append(0)
-        s3_dbi = struct.pack("<IiiiHHIiiHIIHHII", 0xFFFFFFFF, 19990903, age, -1, 0, 0, 0, len(sym_recs), 0, 0, 0, 0, 0, 0, 0, 0)[:64]
-        s3_full = s3_dbi + bytes(sym_recs)
+            sec_rel_off = max(0, (int(base_fn_rva) - 0x1000) + int(sym_off))
+            body_len = 2 + 4 + 4 + 2 + len(name_b)
+            pad_len = (4 - ((2 + body_len) % 4)) % 4
+            cv_reclen = body_len + pad_len
+            sym_recs.extend(struct.pack("<HHIIH", cv_reclen, 0x110E, 2, sec_rel_off, 1) + name_b + (b"\x00" * pad_len))
+        # Stream 3: Exact 64-byte DBI Header pointing SymRecordStreamIndex -> Stream 5
+        s3_dbi = struct.pack(
+            "<iIIHHHHHHiiiiiiiiHHI",
+            -1,                     # VersionSignature (0xFFFFFFFF)
+            19990903,               # VersionHeader (V70)
+            age,                    # Age
+            0xFFFF,                 # GlobalSymbolStreamIndex
+            (1 << 15) | 1400,       # BuildNumber
+            0xFFFF,                 # PublicSymbolStreamIndex
+            0,                      # PdbDllVersion
+            5,                      # SymRecordStreamIndex (Stream 5)
+            0,                      # PdbDllRbld
+            0, 0, 0, 0, 0, 0, 0, 0, # ModInfo..ECSubstreamSize (32 bytes)
+            0,                      # Flags
+            0x8664,                 # Machine (AMD64)
+            0,                      # Reserved
+        )
+        # Stream 4: IPI minimal 56-byte header (Version 20040203)
         s4_ipi = struct.pack("<IIIIIIIIIIIIII", 20040203, 56, 0x1000, 0x1000, 0, 0xFFFFFFFF, 0, 0, 0, 0, 0, 0, 0, 0)
+        streams = [b"", s1_info, s2_tpi, s3_dbi, s4_ipi, bytes(sym_recs)]
 
-        streams = [b"", s1_info, s2_tpi, s3_full, s4_ipi]
+        dir_block_counts = [(len(st) + block_size - 1) // block_size if st else 0 for st in streams]
+        dir_raw_len = 4 + 4 * len(streams) + 4 * sum(dir_block_counts)
+        num_dir_blocks = max(1, (dir_raw_len + block_size - 1) // block_size)
+
         stream_blocks: List[List[int]] = []
-        next_blk = 5  # Blocks: 0=Super, 1=FPM0, 2=FPM1, 3=DirMap, 4=Dir
-        for st in streams:
-            n_b = (len(st) + block_size - 1) // block_size if st else 0
+        next_blk = 4 + num_dir_blocks  # 0=Super, 1=FPM0, 2=FPM1, 3=DirMap, 4..4+k-1=Dir
+        for n_b in dir_block_counts:
             blks = list(range(next_blk, next_blk + n_b))
             stream_blocks.append(blks)
             next_blk += n_b
@@ -418,31 +438,28 @@ class StandaloneBinaryEmitter:
             for b in blks:
                 dir_bytes.extend(struct.pack("<I", b))
 
-        num_dir_blocks = (len(dir_bytes) + block_size - 1) // block_size
-        # Reserve block 4..4+num_dir_blocks-1 if needed (stream sizes fit comfortably in 1 block < 4096)
-        assert num_dir_blocks == 1, "Stream directory overflowed 1 block"
         num_blocks = next_blk
-
         msf = bytearray(num_blocks * block_size)
         magic = b"Microsoft C/C++ MSF 7.00\r\n\x1a\x44\x53\x00\x00\x00"
         super_blk = struct.pack("<32sIIIIII", magic, block_size, 1, num_blocks, len(dir_bytes), 0, 3)
         msf[0:len(super_blk)] = super_blk
 
-        # Free Page Maps (Block 1 and Block 2)
         fpm = bytearray(b"\xff" * block_size)
         for b_idx in range(num_blocks):
             fpm[b_idx // 8] &= ~(1 << (b_idx % 8))
         msf[1 * block_size:2 * block_size] = fpm
         msf[2 * block_size:3 * block_size] = fpm
 
-        # Block 3: Directory Block Map -> [4]
-        msf[3 * block_size:3 * block_size + 4] = struct.pack("<I", 4)
-        # Block 4: Stream Directory
-        msf[4 * block_size:4 * block_size + len(dir_bytes)] = dir_bytes
-        # Blocks 5..: Stream data
+        for d_i in range(num_dir_blocks):
+            blk_id = 4 + d_i
+            msf[3 * block_size + d_i * 4:3 * block_size + (d_i + 1) * 4] = struct.pack("<I", blk_id)
+            chunk = dir_bytes[d_i * block_size:(d_i + 1) * block_size]
+            msf[blk_id * block_size:blk_id * block_size + len(chunk)] = chunk
+
         for st, blks in zip(streams, stream_blocks):
-            if st and blks:
-                msf[blks[0] * block_size:blks[0] * block_size + len(st)] = st
+            for c_i, blk_id in enumerate(blks):
+                chunk = st[c_i * block_size:(c_i + 1) * block_size]
+                msf[blk_id * block_size:blk_id * block_size + len(chunk)] = chunk
 
         return rsds_record, bytes(msf), pdb_guid
 
@@ -971,6 +988,106 @@ class StandaloneBinaryEmitter:
             out.extend(struct.pack("<ii", init_loc_rel, fde_rel))
         return bytes(out)
 
+    @staticmethod
+    def _elf_gnu_hash(name_bytes: bytes) -> int:
+        h = 5381
+        for b in name_bytes:
+            h = (h * 33 + b) & 0xFFFFFFFF
+        return h
+
+    @classmethod
+    def _build_elf_gnu_hash_table(
+        cls,
+        export_names: Sequence[str],
+        symoffset: int,
+    ) -> Tuple[List[str], bytes]:
+        nbuckets = max(1, len(export_names))
+        bloom_words = 1
+        bloom_shift = 6
+        grouped: List[Tuple[int, int, str]] = []
+        for sym_n in export_names:
+            hv = cls._elf_gnu_hash(sym_n.encode("ascii"))
+            grouped.append((hv % nbuckets, hv, sym_n))
+        grouped.sort(key=lambda t: (t[0], t[2]))
+
+        bloom_mask = 0
+        buckets = [0] * nbuckets
+        chains: List[int] = []
+        for idx, (b_idx, hv, _sym_n) in enumerate(grouped):
+            bit1 = 1 << (hv % 64)
+            bit2 = 1 << ((hv >> bloom_shift) % 64)
+            bloom_mask |= (bit1 | bit2)
+            if buckets[b_idx] == 0:
+                buckets[b_idx] = symoffset + idx
+            is_last = (idx + 1 == len(grouped)) or (grouped[idx + 1][0] != b_idx)
+            chains.append((hv & ~1) | (1 if is_last else 0))
+
+        ordered_names = [sym_n for _, _, sym_n in grouped]
+        blob = (
+            struct.pack("<IIIIQ", nbuckets, symoffset, bloom_words, bloom_shift, bloom_mask)
+            + struct.pack(f"<{nbuckets}I", *buckets)
+            + (struct.pack(f"<{len(chains)}I", *chains) if chains else b"")
+        )
+        return ordered_names, blob
+
+    @staticmethod
+    def build_coff_import_lib(
+        dll_name: str,
+        export_names: Sequence[str],
+        machine: int = 0x8664,
+    ) -> bytes:
+        """Emits a Microsoft COFF Short-Import `.lib` (`Sig1=0, Sig2=0xFFFF`) for linking against `dll_name`."""
+        syms = sorted(set(str(s) for s in export_names if s))
+        dll_b = os.path.basename(dll_name).encode("ascii") + b"\x00"
+        members: List[Tuple[str, bytes]] = []
+        for ord_idx, sym in enumerate(syms):
+            sym_b = sym.encode("ascii") + b"\x00"
+            str_pair = sym_b + dll_b
+            imp_hdr = struct.pack("<HHHHIIHH", 0x0000, 0xFFFF, 0, machine, 0, len(str_pair), ord_idx, 0x0000)
+            members.append((sym, imp_hdr + str_pair))
+
+        def _ar_hdr(label: str, size: int) -> bytes:
+            name_f = label[:16].encode("ascii", errors="replace").ljust(16, b" ")
+            meta = f"0           0     0     100644  {size:<10}".encode("ascii")[:42]
+            return name_f + meta + b"`\n"
+
+        # Compute first linker member '/' directory offsets
+        idx_names: List[bytes] = []
+        for sym, _ in members:
+            idx_names.append(sym.encode("ascii") + b"\x00")
+            idx_names.append(f"__imp_{sym}".encode("ascii") + b"\x00")
+        dir_str_blob = b"".join(idx_names)
+        dir_payload_len = 4 + 4 * len(idx_names) + len(dir_str_blob)
+        dir_pad_len = dir_payload_len + (1 if (dir_payload_len % 2) == 1 else 0)
+
+        cur_off = 8 + 60 + dir_pad_len
+        member_offsets: List[int] = []
+        for sym, payload in members:
+            member_offsets.append(cur_off)
+            p_len = len(payload) + (1 if (len(payload) % 2) == 1 else 0)
+            cur_off += 60 + p_len
+
+        dir_offsets: List[int] = []
+        for m_off in member_offsets:
+            dir_offsets.append(m_off)
+            dir_offsets.append(m_off)
+
+        dir_payload = struct.pack(">I", len(idx_names)) + (
+            struct.pack(f">{len(dir_offsets)}I", *dir_offsets) if dir_offsets else b""
+        ) + dir_str_blob
+        out = bytearray(b"!<arch>\n")
+        out.extend(_ar_hdr("/", len(dir_payload)))
+        out.extend(dir_payload)
+        if len(dir_payload) % 2:
+            out.extend(b"\n")
+        for sym, payload in members:
+            lbl = (dll_name[:12] + "/")[:16]
+            out.extend(_ar_hdr(lbl, len(payload)))
+            out.extend(payload)
+            if len(payload) % 2:
+                out.extend(b"\n")
+        return bytes(out)
+
     def build_elf64_so(
         self,
         func_code: bytes,
@@ -993,6 +1110,9 @@ class StandaloneBinaryEmitter:
         eh_frame_offset_in_code: int = 0,
         eh_frame_size: int = 0,
         external_dyn_relocs: Optional[List[Tuple[int, str, int, int]]] = None,
+        soname: Optional[str] = None,
+        runpath: str = "$ORIGIN",
+        emit_symtab: bool = True,
     ) -> bytes:
         """
         Builds a compliant Linux ELF64 Shared Object (ET_DYN) with
@@ -1015,36 +1135,49 @@ class StandaloneBinaryEmitter:
         if not exports_map:
             exports_map["omni_compute"] = 0
 
-        sorted_exports = sorted(exports_map.items(), key=lambda kv: kv[0])
+        raw_sorted_exports = sorted(exports_map.items(), key=lambda kv: kv[0])
         plt_imports = sorted(set(imported_funcs or (os_import_stubs.keys() if os_import_stubs else [])))
         ext_reloc_list = list(external_dyn_relocs or [])
         dynsym_imports = sorted(set(plt_imports) | {sym for _, sym, _, _ in ext_reloc_list})
         ordered_libs = list(needed_libs or [])
+        symoffset = 1 + len(dynsym_imports)
+        gnu_order_names, gnu_hash_table = self._build_elf_gnu_hash_table(
+            [s for s, _ in raw_sorted_exports],
+            symoffset=symoffset,
+        )
+        sorted_exports = [(s, exports_map[s]) for s in gnu_order_names]
+        eff_soname = soname or f"lib{export_name}.so"
+        eff_runpath = runpath or "$ORIGIN"
 
         dynstr = bytearray(b"\x00")
         lib_str_offs: List[int] = []
         for lib_s in ordered_libs:
             lib_str_offs.append(len(dynstr))
             dynstr.extend(lib_s.encode("ascii") + b"\x00")
+        soname_str_off = len(dynstr)
+        dynstr.extend(eff_soname.encode("ascii") + b"\x00")
+        runpath_str_off = len(dynstr)
+        dynstr.extend(eff_runpath.encode("ascii") + b"\x00")
 
         dynsym = bytearray(b"\x00" * 24)  # STN_UNDEF null symbol
-
-        for sym_name, sym_off in sorted_exports:
-            st_name = len(dynstr)
-            dynstr.extend(sym_name.encode("ascii") + b"\x00")
-            next_offs = [o for _, o in sorted_exports if o > sym_off]
-            st_size = (min(next_offs) - sym_off) if next_offs else max(1, len(code) - sym_off)
-            dynsym.extend(struct.pack(
-                "<IBBHQQ",
-                st_name, 0x12, 0, 1, code_vaddr + int(sym_off), max(1, st_size),
-            ))
 
         imp_sym_indices: Dict[str, int] = {}
         for idx_i, imp_sym in enumerate(dynsym_imports):
             st_name = len(dynstr)
             dynstr.extend(imp_sym.encode("ascii") + b"\x00")
-            imp_sym_indices[imp_sym] = 1 + len(sorted_exports) + idx_i
+            imp_sym_indices[imp_sym] = 1 + idx_i
             dynsym.extend(struct.pack("<IBBHQQ", st_name, 0x12, 0, 0, 0, 0))
+
+        all_off_sorted = sorted(exports_map.items(), key=lambda kv: kv[0])
+        for sym_name, sym_off in sorted_exports:
+            st_name = len(dynstr)
+            dynstr.extend(sym_name.encode("ascii") + b"\x00")
+            next_offs = [o for _, o in all_off_sorted if o > sym_off]
+            st_size = (min(next_offs) - sym_off) if next_offs else max(1, len(code) - sym_off)
+            dynsym.extend(struct.pack(
+                "<IBBHQQ",
+                st_name, 0x12, 0, 1, code_vaddr + int(sym_off), max(1, st_size),
+            ))
 
         # Align dynsym to 8 bytes
         dynstr_offset = code_offset + len(code)
@@ -1062,18 +1195,19 @@ class StandaloneBinaryEmitter:
             return h & 0xFFFFFFFF
 
         nbucket = max(1, len(sorted_exports))
-        nchain = 1 + len(sorted_exports) + len(dynsym_imports)
+        nchain = 1 + len(dynsym_imports) + len(sorted_exports)
         buckets = [0] * nbucket
         chains = [0] * nchain
         for idx, (sym_name, _sym_off) in enumerate(sorted_exports):
-            sym_idx = idx + 1
+            sym_idx = symoffset + idx
             b_idx = _elf_sysv_hash(sym_name.encode("ascii")) % nbucket
             chains[sym_idx] = buckets[b_idx]
             buckets[b_idx] = sym_idx
         hash_table = struct.pack(f"<II{nbucket}I{nchain}I", nbucket, nchain, *buckets, *chains)
 
         hash_offset = self._align_up(dynsym_offset + len(dynsym), 8)
-        got_plt_offset = self._align_up(hash_offset + len(hash_table), 8)
+        gnu_hash_offset = self._align_up(hash_offset + len(hash_table), 8)
+        got_plt_offset = self._align_up(gnu_hash_offset + len(gnu_hash_table), 8)
         got_plt_len = (3 + len(plt_imports)) * 8 if plt_imports else 0
         rela_plt_offset = self._align_up(got_plt_offset + got_plt_len, 8)
         rela_plt = bytearray()
@@ -1101,7 +1235,7 @@ class StandaloneBinaryEmitter:
             # Preliminary dynamic size to locate rw_vaddr if needed for inspecting addends inside data_bytes
             n_dyn_tags = (
                 len(lib_str_offs)
-                + 5
+                + 8
                 + (5 if plt_imports else 0)
                 + 3
                 + (2 if init_array_size > 0 else 0)
@@ -1125,7 +1259,7 @@ class StandaloneBinaryEmitter:
         dynamic_offset = self._align_up(rela_dyn_offset + len(rela_dyn), 8)
         pre_n_tags = (
             len(lib_str_offs)
-            + 5
+            + 8
             + (5 if plt_imports else 0)
             + (3 if rela_dyn else 0)
             + (2 if init_array_size > 0 else 0)
@@ -1145,11 +1279,14 @@ class StandaloneBinaryEmitter:
 
         dyn_entries: List[Tuple[int, int]] = [(1, l_off) for l_off in lib_str_offs]
         dyn_entries.extend([
-            (4, vaddr + hash_offset),       # DT_HASH
-            (5, vaddr + dynstr_offset),     # DT_STRTAB
-            (6, vaddr + dynsym_offset),     # DT_SYMTAB
-            (10, len(dynstr)),              # DT_STRSZ
-            (11, 24),                       # DT_SYMENT
+            (14, soname_str_off),               # DT_SONAME
+            (29, runpath_str_off),              # DT_RUNPATH
+            (4, vaddr + hash_offset),           # DT_HASH
+            (0x6FFFFEF5, vaddr + gnu_hash_offset),  # DT_GNU_HASH
+            (5, vaddr + dynstr_offset),         # DT_STRTAB
+            (6, vaddr + dynsym_offset),         # DT_SYMTAB
+            (10, len(dynstr)),                  # DT_STRSZ
+            (11, 24),                           # DT_SYMENT
         ])
         if plt_imports:
             dyn_entries.extend([
@@ -1275,6 +1412,7 @@ class StandaloneBinaryEmitter:
         file_bytes[dynstr_offset:dynstr_offset + len(dynstr)] = dynstr
         file_bytes[dynsym_offset:dynsym_offset + len(dynsym)] = dynsym
         file_bytes[hash_offset:hash_offset + len(hash_table)] = hash_table
+        file_bytes[gnu_hash_offset:gnu_hash_offset + len(gnu_hash_table)] = gnu_hash_table
         if plt_imports:
             file_bytes[got_plt_offset:got_plt_offset + 8] = struct.pack("<Q", vaddr + dynamic_offset)
             file_bytes[rela_plt_offset:rela_plt_offset + len(rela_plt)] = rela_plt
@@ -1288,50 +1426,99 @@ class StandaloneBinaryEmitter:
         if has_tls_seg and tls_init:
             file_bytes[tls_file_off:tls_file_off + len(tls_init)] = tls_init
 
-        if dwarf_sections:
-            valid_dwarf = [(k, v) for k, v in dwarf_sections.items() if v]
-            if valid_dwarf:
-                shstrtab = bytearray(b"\x00")
-                shstr_name = b".shstrtab\x00"
-                shstr_off_in_tab = len(shstrtab)
-                shstrtab.extend(shstr_name)
-                sec_name_offs = []
-                for sname, _ in valid_dwarf:
-                    sec_name_offs.append(len(shstrtab))
-                    shstrtab.extend(sname.encode("ascii") + b"\x00")
+        if emit_symtab or dwarf_sections:
+            valid_dwarf = [(k, v) for k, v in (dwarf_sections or {}).items() if v]
+            strtab_s = bytearray(b"\x00")
+            symtab_s = bytearray(b"\x00" * 24)  # STN_UNDEF
+            if emit_symtab:
+                for sym_name, sym_off in sorted(exports_map.items(), key=lambda kv: kv[0]):
+                    st_name_off = len(strtab_s)
+                    strtab_s.extend(sym_name.encode("ascii") + b"\x00")
+                    next_offs = [o for o in exports_map.values() if o > sym_off]
+                    st_sz = (min(next_offs) - sym_off) if next_offs else max(1, len(code) - sym_off)
+                    symtab_s.extend(struct.pack("<IBBHQQ", st_name_off, 0x12, 0, 2, code_vaddr + int(sym_off), max(1, st_sz)))
 
-                shstrtab_file_off = len(file_bytes)
-                file_bytes.extend(shstrtab)
+            shstrtab = bytearray(b"\x00")
+            shstr_off_in_tab = len(shstrtab)
+            shstrtab.extend(b".shstrtab\x00")
+            sec_defs: List[Tuple[int, int, int, int, int, int, int, int, int, int]] = []
+            extra_blobs: List[Tuple[int, bytes, int, int, int, int, int]] = []  # (name_off, data, shtype, shflags, vaddr, link, info, entsize)
 
-                sec_file_offs = []
-                for _, sdata in valid_dwarf:
-                    pad = (8 - (len(file_bytes) % 8)) % 8
-                    if pad:
-                        file_bytes.extend(b"\x00" * pad)
-                    sec_file_offs.append((len(file_bytes), len(sdata)))
-                    file_bytes.extend(sdata)
+            # Section 2: .text (alloc/exec mapping code_offset..code_offset+len(code))
+            if emit_symtab:
+                t_name_off = len(shstrtab)
+                shstrtab.extend(b".text\x00")
+                str_name_off = len(shstrtab)
+                shstrtab.extend(b".strtab\x00")
+                sym_name_off = len(shstrtab)
+                shstrtab.extend(b".symtab\x00")
 
-                pad_sh = (8 - (len(file_bytes) % 8)) % 8
-                if pad_sh:
-                    file_bytes.extend(b"\x00" * pad_sh)
-                shoff = len(file_bytes)
-                shnum = 2 + len(valid_dwarf)  # SHT_NULL + .shstrtab + dwarf sections
-                # 0: SHT_NULL
-                file_bytes.extend(struct.pack("<IIQQQQIIQQ", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-                # 1: .shstrtab (SHT_STRTAB = 3)
+            dwarf_name_offs: List[int] = []
+            for sname, _ in valid_dwarf:
+                dwarf_name_offs.append(len(shstrtab))
+                shstrtab.extend(sname.encode("ascii") + b"\x00")
+
+            shstrtab_file_off = len(file_bytes)
+            file_bytes.extend(shstrtab)
+
+            strtab_file_off = 0
+            symtab_file_off = 0
+            if emit_symtab:
+                pad_s = (8 - (len(file_bytes) % 8)) % 8
+                if pad_s:
+                    file_bytes.extend(b"\x00" * pad_s)
+                strtab_file_off = len(file_bytes)
+                file_bytes.extend(strtab_s)
+                pad_sym = (8 - (len(file_bytes) % 8)) % 8
+                if pad_sym:
+                    file_bytes.extend(b"\x00" * pad_sym)
+                symtab_file_off = len(file_bytes)
+                file_bytes.extend(symtab_s)
+
+            sec_file_offs = []
+            for _, sdata in valid_dwarf:
+                pad = (8 - (len(file_bytes) % 8)) % 8
+                if pad:
+                    file_bytes.extend(b"\x00" * pad)
+                sec_file_offs.append((len(file_bytes), len(sdata)))
+                file_bytes.extend(sdata)
+
+            pad_sh = (8 - (len(file_bytes) % 8)) % 8
+            if pad_sh:
+                file_bytes.extend(b"\x00" * pad_sh)
+            shoff = len(file_bytes)
+            shnum = 2 + (3 if emit_symtab else 0) + len(valid_dwarf)
+            # 0: SHT_NULL
+            file_bytes.extend(struct.pack("<IIQQQQIIQQ", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            # 1: .shstrtab (SHT_STRTAB = 3)
+            file_bytes.extend(struct.pack(
+                "<IIQQQQIIQQ",
+                shstr_off_in_tab, 3, 0, 0, shstrtab_file_off, len(shstrtab), 0, 0, 1, 0
+            ))
+            if emit_symtab:
+                # 2: .text (SHT_PROGBITS = 1, SHF_ALLOC | SHF_EXECINSTR = 6)
                 file_bytes.extend(struct.pack(
                     "<IIQQQQIIQQ",
-                    shstr_off_in_tab, 3, 0, 0, shstrtab_file_off, len(shstrtab), 0, 0, 1, 0
+                    t_name_off, 1, 6, code_vaddr, code_offset, len(code), 0, 0, 16, 0
                 ))
-                # 2..N: DWARF sections (SHT_PROGBITS = 1)
-                for (sname, _), n_off, (f_off, f_sz) in zip(valid_dwarf, sec_name_offs, sec_file_offs):
-                    file_bytes.extend(struct.pack(
-                        "<IIQQQQIIQQ",
-                        n_off, 1, 0, 0, f_off, f_sz, 0, 0, 1, 0
-                    ))
-                # Patch e_shoff (offset 40), e_shnum (offset 60), e_shstrndx (offset 62)
-                struct.pack_into("<Q", file_bytes, 40, shoff)
-                struct.pack_into("<HH", file_bytes, 60, shnum, 1)
+                # 3: .strtab (SHT_STRTAB = 3)
+                file_bytes.extend(struct.pack(
+                    "<IIQQQQIIQQ",
+                    str_name_off, 3, 0, 0, strtab_file_off, len(strtab_s), 0, 0, 1, 0
+                ))
+                # 4: .symtab (SHT_SYMTAB = 2, sh_link=3, sh_info=1, entsize=24)
+                file_bytes.extend(struct.pack(
+                    "<IIQQQQIIQQ",
+                    sym_name_off, 2, 0, 0, symtab_file_off, len(symtab_s), 3, 1, 8, 24
+                ))
+            # Remaining: DWARF sections (SHT_PROGBITS = 1)
+            for (sname, _), n_off, (f_off, f_sz) in zip(valid_dwarf, dwarf_name_offs, sec_file_offs):
+                file_bytes.extend(struct.pack(
+                    "<IIQQQQIIQQ",
+                    n_off, 1, 0, 0, f_off, f_sz, 0, 0, 1, 0
+                ))
+            struct.pack_into("<Q", file_bytes, 40, shoff)
+            struct.pack_into("<HH", file_bytes, 60, shnum, 1)
 
         return bytes(file_bytes)
 
@@ -2324,7 +2511,17 @@ class StandaloneBinaryEmitter:
                 so_name = imp_tbl[sym][1] if sym in imp_tbl else "libc.so.6"
                 if so_name not in needed_libs:
                     needed_libs.append(so_name)
+            eff_soname = (
+                os.path.basename(output_path if output_path.endswith(".so") else output_path + ".so")
+                if output_path
+                else f"lib{export_name}.so"
+            )
+            _ordered_gnu, gnu_hash_blob = self._build_elf_gnu_hash_table(
+                [s for s, _ in sorted_exports],
+                symoffset=1 + len(dynsym_imports),
+            )
             dynstr_len = 1 + sum(len(lb.encode("ascii")) + 1 for lb in needed_libs)
+            dynstr_len += len(eff_soname.encode("ascii")) + 1 + len(b"$ORIGIN\x00")
             dynstr_len += sum(len(s.encode("ascii")) + 1 for s, _ in sorted_exports)
             dynstr_len += sum(len(s.encode("ascii")) + 1 for s in dynsym_imports)
             dynsym_len = (1 + len(sorted_exports) + len(dynsym_imports)) * 24
@@ -2335,7 +2532,8 @@ class StandaloneBinaryEmitter:
             dynstr_offset = 0x200 + eff_code_len
             dynsym_offset = self._align_up(dynstr_offset + dynstr_len, 8)
             hash_offset = self._align_up(dynsym_offset + dynsym_len, 8)
-            got_plt_offset = self._align_up(hash_offset + hash_len, 8)
+            gnu_hash_offset = self._align_up(hash_offset + hash_len, 8)
+            got_plt_offset = self._align_up(gnu_hash_offset + len(gnu_hash_blob), 8)
             got_plt_len = (3 + len(plt_imports)) * 8 if plt_imports else 0
             rela_plt_offset = self._align_up(got_plt_offset + got_plt_len, 8)
             rela_plt_len = len(plt_imports) * 24
@@ -2344,7 +2542,7 @@ class StandaloneBinaryEmitter:
             dynamic_offset = self._align_up(rela_dyn_offset + rela_dyn_len, 8)
             n_dyn_tags = (
                 len(needed_libs)
-                + 5
+                + 8
                 + (5 if plt_imports else 0)
                 + (3 if rela_dyn_len > 0 else 0)
                 + (2 if has_init_array else 0)
@@ -2433,6 +2631,13 @@ class StandaloneBinaryEmitter:
                 emit_pdb_path=pdb_out,
                 emit_debug_dir=True,
             )
+            lib_exp_names = sorted(set((extra_exports or {}).keys()) | ({export_name} if export_name else set()) | {"omni_compute"})
+            if extra_exports:
+                lib_exp_names = sorted(set(extra_exports.keys()) | ({export_name} if export_name else set()))
+            else:
+                lib_exp_names = [export_name or "omni_compute"]
+            lib_out = os.path.splitext(output_path)[0] + ".lib"
+            self._write_file(lib_out, self.build_coff_import_lib(os.path.basename(output_path), lib_exp_names))
         elif target_format in ("elf_so", "arm64_elf_so"):
             if not output_path.endswith(".so"):
                 output_path += ".so"
@@ -2464,6 +2669,7 @@ class StandaloneBinaryEmitter:
                 eh_frame_offset_in_code=eh_frame_offset_in_code,
                 eh_frame_size=eh_frame_size,
                 external_dyn_relocs=external_dyn_relocs,
+                soname=os.path.basename(output_path),
             )
         elif target_format in ("macho_dylib", "dylib"):
             if not output_path.endswith(".dylib"):

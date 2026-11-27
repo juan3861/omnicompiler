@@ -196,11 +196,15 @@ class LLVMBackend:
         self,
         units: Sequence[Union[bytes, str, Any]],
         num_shards: int = 2,
+        inline_inst_threshold: int = 64,
+        hot_weights: Optional[Dict[str, int]] = None,
+        rbe_pool: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
-        Builds a ThinLTO combined module summary index (defined exports & external imports),
-        partitions bitcode/IR units across `num_shards`, and optimizes/emits relocatable objects
-        concurrently across shards for multi-worker builds.
+        Builds a ThinLTO combined module summary index (defined exports, external imports & IR
+        instruction cost), performs Cross-Shard Function Importing (`Linkage.available_externally`)
+        into importing shards for cross-module `-O3` inlining, and compiles shards in parallel
+        either via `RBEClusterPool` multi-process CAS workers or local threads.
         """
         from concurrent.futures import ThreadPoolExecutor
 
@@ -214,6 +218,8 @@ class LLVMBackend:
         exports_by_unit: List[List[str]] = []
         imports_by_unit: List[List[str]] = []
         owner_of_sym: Dict[str, int] = {}
+        inst_counts: Dict[str, int] = {}
+        importable_syms: set = set()
         bc_bytes_list: List[bytes] = []
 
         for u_idx, item in enumerate(units):
@@ -233,42 +239,122 @@ class LLVMBackend:
                 else:
                     defs.append(fn.name)
                     owner_of_sym.setdefault(fn.name, u_idx)
+                    icount = sum(len(list(blk.instructions)) for blk in fn.blocks)
+                    inst_counts[fn.name] = icount
+                    if fn.linkage in (
+                        llvm.Linkage.external,
+                        llvm.Linkage.weak_odr,
+                        llvm.Linkage.linkonce_odr,
+                    ):
+                        importable_syms.add(fn.name)
             exports_by_unit.append(sorted(set(defs)))
             imports_by_unit.append(sorted(set(decls)))
 
+        n_shards = min(len(bc_bytes_list), max(1, int(num_shards)))
+        shard_import_donors: List[set] = [set() for _ in range(n_shards)]
+        imported_records: List[Dict[str, Any]] = []
+        seen_imports: set = set()
+
         cross_edges: List[Tuple[int, int, str]] = []
         for src_idx, decls in enumerate(imports_by_unit):
+            src_shard = src_idx % n_shards
             for sym in decls:
                 tgt_idx = owner_of_sym.get(sym)
                 if tgt_idx is not None and tgt_idx != src_idx:
                     cross_edges.append((src_idx, tgt_idx, sym))
+                    tgt_shard = tgt_idx % n_shards
+                    if tgt_shard != src_shard and sym in importable_syms:
+                        eff_limit = int(inline_inst_threshold) * (
+                            2 if (hot_weights and hot_weights.get(sym, 0) > 0) else 1
+                        )
+                        icost = inst_counts.get(sym, eff_limit + 1)
+                        if icost <= eff_limit:
+                            shard_import_donors[src_shard].add(tgt_idx)
+                            rec_k = (sym, tgt_idx, src_shard)
+                            if rec_k not in seen_imports:
+                                seen_imports.add(rec_k)
+                                imported_records.append({
+                                    "symbol": sym,
+                                    "from_unit": tgt_idx,
+                                    "to_shard": src_shard,
+                                    "inst_count": icost,
+                                })
 
-        n_shards = min(len(bc_bytes_list), max(1, int(num_shards)))
         shard_buckets: List[List[bytes]] = [[] for _ in range(n_shards)]
         for u_idx, bc_b in enumerate(bc_bytes_list):
             shard_buckets[u_idx % n_shards].append(bc_b)
 
-        def _compile_shard(bucket: List[bytes]) -> bytes:
-            shard_tm = self._target.create_target_machine(
-                cpu=self._cpu, opt=self.opt_level, reloc="pic", codemodel="small"
-            )
+        def _prepare_shard_bitcode(shard_idx: int) -> bytes:
+            bucket = shard_buckets[shard_idx]
             base_m = llvm.parse_bitcode(bucket[0])
             base_m.triple = eff_triple
             for extra_b in bucket[1:]:
                 sub_m = llvm.parse_bitcode(extra_b)
                 sub_m.triple = eff_triple
                 base_m.link_in(sub_m, preserve=False)
+            for donor_u in sorted(shard_import_donors[shard_idx]):
+                donor_m = llvm.parse_bitcode(bc_bytes_list[donor_u])
+                donor_m.triple = eff_triple
+                for df in donor_m.functions:
+                    if not df.is_declaration and not df.name.startswith("llvm."):
+                        if df.linkage in (
+                            llvm.Linkage.external,
+                            llvm.Linkage.weak_odr,
+                            llvm.Linkage.linkonce_odr,
+                        ):
+                            df.linkage = llvm.Linkage.available_externally
+                for gv in donor_m.global_variables:
+                    if not gv.is_declaration and gv.linkage in (
+                        llvm.Linkage.external,
+                        llvm.Linkage.weak_odr,
+                        llvm.Linkage.linkonce_odr,
+                    ):
+                        gv.linkage = llvm.Linkage.available_externally
+                base_m.link_in(donor_m, preserve=False)
             base_m.verify()
-            pto = llvm.create_pipeline_tuning_options(speed_level=self.opt_level)
-            pto.loop_vectorization = True
-            pto.slp_vectorization = True
-            pto.loop_unrolling = True
-            pb = llvm.create_pass_builder(shard_tm, pto)
-            pb.getModulePassManager().run(base_m, pb)
-            return shard_tm.emit_object(base_m)
+            return base_m.as_bitcode()
 
-        with ThreadPoolExecutor(max_workers=n_shards) as pool:
-            shard_objects = list(pool.map(_compile_shard, shard_buckets))
+        prepared_bcs = [_prepare_shard_bitcode(s_i) for s_i in range(n_shards)]
+        rbe_cache_hits = 0
+
+        if rbe_pool is not None:
+            from orchestrator.rbe_cas import ActionSpec
+
+            shard_actions: List[ActionSpec] = []
+            for s_i, s_bc in enumerate(prepared_bcs):
+                bc_dig = rbe_pool.cas.put_blob(s_bc)
+                shard_actions.append(
+                    ActionSpec(
+                        action_id=f"thinlto_shard_{s_i}",
+                        kind="compile_llvm_shard",
+                        payload={"target_triple": eff_triple, "opt_level": self.opt_level, "shard_index": s_i},
+                        input_blobs={"shard.bc": bc_dig},
+                        target_triple=eff_triple,
+                    )
+                )
+            rbe_run = rbe_pool.execute_dag(shard_actions)
+            rbe_cache_hits = int(rbe_run.get("cache_hits", 0))
+            shard_objects = [
+                rbe_pool.cas.get_blob(rbe_run["results"][f"thinlto_shard_{s_i}"].output_blobs["shard.obj"])
+                for s_i in range(n_shards)
+            ]
+        else:
+            def _compile_shard_bc(s_bc: bytes) -> bytes:
+                shard_tm = self._target.create_target_machine(
+                    cpu=self._cpu, opt=self.opt_level, reloc="pic", codemodel="small"
+                )
+                base_m = llvm.parse_bitcode(s_bc)
+                base_m.triple = eff_triple
+                pto = llvm.create_pipeline_tuning_options(speed_level=self.opt_level)
+                pto.loop_vectorization = True
+                pto.slp_vectorization = True
+                pto.loop_unrolling = True
+                pb = llvm.create_pass_builder(shard_tm, pto)
+                pb.getModulePassManager().run(base_m, pb)
+                return shard_tm.emit_object(base_m)
+
+            with ThreadPoolExecutor(max_workers=n_shards) as pool:
+                shard_objects = list(pool.map(_compile_shard_bc, prepared_bcs))
 
         return {
             "num_shards": n_shards,
@@ -276,6 +362,9 @@ class LLVMBackend:
             "exports_by_unit": exports_by_unit,
             "imports_by_unit": imports_by_unit,
             "cross_module_edges": cross_edges,
+            "imported_functions": imported_records,
+            "imported_functions_count": len(imported_records),
+            "rbe_cache_hits": rbe_cache_hits,
             "shard_objects": shard_objects,
         }
 

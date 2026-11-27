@@ -75,11 +75,15 @@ def _extract_called_names(fn_def: ast.FunctionDef) -> Set[str]:
     return callees
 
 
-def _has_only_numeric_cfg_syntax(fn_def: ast.FunctionDef) -> bool:
+def _has_only_numeric_cfg_syntax(
+    fn_def: ast.FunctionDef,
+    struct_method_attrs: Optional[Set[str]] = None,
+) -> bool:
     """
-    Returns True if `fn_def` uses numeric/integer/pointer/CFG and native composite collections (list/dict)
-    that compile cleanly to native x86-64/ARM64 machine code via OmniCompiler Native Heap.
+    Returns True if `fn_def` uses numeric/integer/pointer/CFG, dataclasses, closures, try/except,
+    and native composite collections (list/dict) that compile cleanly to native x86-64/ARM64 machine code.
     """
+    allowed_attrs = {"append", "get", "startswith"} | (struct_method_attrs or set())
     for node in ast.walk(fn_def):
         if isinstance(
             node,
@@ -101,9 +105,9 @@ def _has_only_numeric_cfg_syntax(fn_def: ast.FunctionDef) -> bool:
             return False
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute):
-                if node.func.attr not in ("append", "get"):
+                if node.func.attr not in allowed_attrs:
                     return False
-            elif not isinstance(node.func, ast.Name):
+            elif not isinstance(node.func, (ast.Name, ast.Lambda)):
                 return False
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes, float)):
             # Ignore module/function docstring
@@ -116,12 +120,19 @@ def _has_only_numeric_cfg_syntax(fn_def: ast.FunctionDef) -> bool:
 def _compute_native_compilable_set(
     all_ast_funcs: Dict[str, ast.FunctionDef],
     external_defined_syms: Optional[Set[str]] = None,
+    struct_names: Optional[Set[str]] = None,
 ) -> Set[str]:
     """Fixed-point closure of functions whose body and transitive callees are 100% native-compilable."""
     ext_syms = external_defined_syms or set()
+    s_names = struct_names or set()
+    struct_method_attrs = {
+        fn_n.split("__", 1)[1]
+        for fn_n in all_ast_funcs
+        if "__" in fn_n and fn_n.split("__", 1)[0] in s_names
+    }
     candidates = {
         fname for fname, fdef in all_ast_funcs.items()
-        if _has_only_numeric_cfg_syntax(fdef)
+        if _has_only_numeric_cfg_syntax(fdef, struct_method_attrs=struct_method_attrs)
     }
     changed = True
     while changed:
@@ -138,7 +149,14 @@ def _compute_native_compilable_set(
                             local_closures.add(tgt.id)
             callees = _extract_called_names(fdef)
             for c in callees:
-                if c not in NATIVE_BUILTIN_CALLS and c not in OS_C_ABI_IMPORT_TABLE and c not in candidates and c not in local_closures and c not in ext_syms:
+                if (
+                    c not in NATIVE_BUILTIN_CALLS
+                    and c not in OS_C_ABI_IMPORT_TABLE
+                    and c not in candidates
+                    and c not in local_closures
+                    and c not in ext_syms
+                    and c not in s_names
+                ):
                     candidates.discard(fname)
                     changed = True
                     break
@@ -280,6 +298,24 @@ class OmniRepoCompiler:
                 for node in tree.body:
                     if isinstance(node, ast.FunctionDef):
                         funcs[node.name] = (norm_path, node)
+                    elif isinstance(node, ast.ClassDef):
+                        import copy as _copy
+                        from compiler.ssa_ir import AstToSsaLowering as _StructCheck
+                        _st_chk = _StructCheck()
+                        _st_chk.register_structs_from_statements([n for n in tree.body if isinstance(n, ast.ClassDef)])
+                        if node.name in _st_chk.struct_layouts:
+                            for m_node in node.body:
+                                if isinstance(m_node, ast.FunctionDef) and not (
+                                    m_node.name.startswith("__") and m_node.name.endswith("__")
+                                ):
+                                    m_fn = _copy.deepcopy(m_node)
+                                    m_fn.name = f"{node.name}__{m_node.name}"
+                                    if m_fn.args.args and m_fn.args.args[0].arg == "self" and m_fn.args.args[0].annotation is None:
+                                        m_fn.args.args[0].annotation = ast.Name(
+                                            id=node.name, ctx=ast.Load(), lineno=getattr(m_fn, "lineno", 1)
+                                        )
+                                    ast.fix_missing_locations(m_fn)
+                                    funcs[m_fn.name] = (norm_path, m_fn)
                     elif (
                         isinstance(node, ast.Assign)
                         and len(node.targets) == 1
@@ -291,8 +327,12 @@ class OmniRepoCompiler:
             except Exception:
                 return None
         try:
-            from frontends.polyglot_ssa_lowering import parse_polyglot_file_to_ast
-            parsed = parse_polyglot_file_to_ast(norm_path, strict=False)
+            if norm_path.lower().endswith(".ts"):
+                from frontends.typescript_frontend import TypeScriptFrontend
+                parsed = TypeScriptFrontend().compile_ts_source(raw_src, file_path=norm_path)
+            else:
+                from frontends.polyglot_ssa_lowering import parse_polyglot_file_to_ast
+                parsed = parse_polyglot_file_to_ast(norm_path, source_text=raw_src, strict=False)
             if parsed.functions:
                 for fn_node in parsed.functions:
                     funcs[fn_node.name] = (norm_path, fn_node)
@@ -557,6 +597,12 @@ class OmniRepoCompiler:
         call_map: Dict[str, List[str]] = {}
         for fname, fdef in all_ast_funcs.items():
             callees = sorted(c for c in _extract_called_names(fdef) if c not in NATIVE_BUILTIN_CALLS)
+            for nd in ast.walk(fdef):
+                if isinstance(nd, ast.Call) and isinstance(nd.func, ast.Attribute):
+                    attr_s = f"__{nd.func.attr}"
+                    for cand_m in all_ast_funcs:
+                        if cand_m.endswith(attr_s) and cand_m not in callees:
+                            callees.append(cand_m)
             if callees:
                 call_map[fname] = callees
 
@@ -682,7 +728,9 @@ class OmniRepoCompiler:
             k: v for k, v in all_ast_funcs.items() if k in retained_export_names
         }
         native_compilable_syms = _compute_native_compilable_set(
-            compilable_ast_pool, external_defined_syms=federated_defined_syms
+            compilable_ast_pool,
+            external_defined_syms=federated_defined_syms,
+            struct_names=set(global_struct_layouts.keys()),
         )
         from compiler.native_codegen import detect_host_simd_features
         host_os_name = "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "linux")
@@ -1745,14 +1793,24 @@ class OmniRepoCompiler:
             if fed_llvm is not None:
                 use_thin_shards = (distributed_workers >= 2 and len(federated_bc_units) >= 2)
                 if use_thin_shards:
-                    thin_res = fed_llvm.thin_lto_partition(
-                        [u.payload for u in federated_bc_units],
-                        num_shards=min(distributed_workers, len(federated_bc_units)),
-                    )
+                    import tempfile
+                    from orchestrator.rbe_cas import ContentAddressableStore, RBEClusterPool
+
+                    with tempfile.TemporaryDirectory() as rbe_thin_td:
+                        thin_cas = ContentAddressableStore(os.path.join(rbe_thin_td, "cas"))
+                        with RBEClusterPool(thin_cas, num_workers=min(distributed_workers, len(federated_bc_units)), prefer_grpc=True) as thin_pool:
+                            thin_res = fed_llvm.thin_lto_partition(
+                                [u.payload for u in federated_bc_units],
+                                num_shards=min(distributed_workers, len(federated_bc_units)),
+                                hot_weights=self.linker.hot_weights or None,
+                                rbe_pool=thin_pool,
+                            )
                     obj_blobs = thin_res["shard_objects"]
                     results["stages"]["federation"]["thin_lto_shards"] = thin_res["num_shards"]
                     results["stages"]["federation"]["thin_lto_summary_symbols"] = len(thin_res["summary_symbols"])
                     results["stages"]["federation"]["thin_lto_cross_edges"] = len(thin_res["cross_module_edges"])
+                    results["stages"]["federation"]["thin_lto_imported_functions"] = thin_res.get("imported_functions_count", 0)
+                    results["stages"]["federation"]["thin_lto_rbe_cache_hits"] = thin_res.get("rbe_cache_hits", 0)
                 else:
                     fused_bc_mod = fed_llvm.link_bitcode_modules(
                         [u.payload for u in federated_bc_units], optimize=True
